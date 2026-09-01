@@ -8,7 +8,6 @@ use crate::{
         PublicErrorCode, PublicErrorStage, RuntimeStatus,
     },
     domain::DefaultRoute,
-    subscription_fetch::SubscriptionFetchTransport,
 };
 
 #[tauri::command]
@@ -29,15 +28,12 @@ pub async fn preview_import_content(
 pub async fn preview_import_url(
     controller: State<'_, Arc<ApplicationController>>,
     url: String,
-    transport: SubscriptionFetchTransport,
 ) -> Result<ImportPreview, PublicError> {
     let controller = Arc::clone(controller.inner());
     let slot = controller.reserve_preview_slot()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        controller.preview_import_url_reserved(url, transport, slot)
-    })
-    .await
-    .map_err(command_join_error)?
+    tauri::async_runtime::spawn_blocking(move || controller.preview_import_url_reserved(url, slot))
+        .await
+        .map_err(command_join_error)?
 }
 
 #[tauri::command]
