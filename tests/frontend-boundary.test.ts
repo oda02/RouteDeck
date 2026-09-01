@@ -78,29 +78,21 @@ test("URL input is masked and cleared before the async preview action", () => {
   assert.doesNotMatch(source, /subscriptionSource|setSubscriptionSource|value=\{subscriptionSource\}/);
   const secretRead = source.indexOf("let subscriptionUrl = subscriptionInputRef.current?.value");
   const secretClear = source.indexOf("clearSubscriptionUrl();", secretRead);
-  const ipcCall = source.indexOf("controller.previewSubscription({ type: \"url\", value: subscriptionUrl, transport: subscriptionTransport })", secretClear);
+  const ipcCall = source.indexOf("controller.previewSubscription({ type: \"url\", value: subscriptionUrl })", secretClear);
   const localClear = source.indexOf('subscriptionUrl = "";', ipcCall);
   const asyncAction = source.indexOf("void runAsyncAction({", localClear);
   assert.ok(secretRead >= 0 && secretRead < secretClear && secretClear < ipcCall && ipcCall < localClear && localClear < asyncAction);
   assert.match(source, /retry: sourceType === "url" \? undefined : previewImport/);
 });
 
-test("subscription transport choice is closed, accessible, and responsive", () => {
+test("URL import delegates transport selection to the backend without a renderer selector", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const model = readFileSync(new URL("../src/model.ts", import.meta.url), "utf8");
   const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
-  assert.match(source, /useState<SubscriptionFetchTransport>\("direct"\)/);
-  assert.match(source, /aria-describedby=\{describedBy\}/);
-  assert.match(source, /label="Транспорт HTTPS-загрузки"/);
-  assert.match(source, /describedBy="subscription-transport-help"/);
-  assert.match(source, /value: "direct", label: "Напрямую"/);
-  assert.match(source, /value: "current_loopback_system_proxy", label: "Через текущий локальный системный прокси"/);
-  assert.match(source, /не меняет настройку Windows, не переключается автоматически и не отправляет URL повторно/);
-  assert.match(source, /Прокси видит этот IP и может видеть имя сервера через TLS SNI/);
-  assert.match(source, /Секретные path, query\/token, HTTP-заголовки и содержимое скрыты TLS только без перехвата сертификатом из доверенного хранилища Windows/);
-  assert.match(source, /не может распознать намеренно доверенный локальный корневой сертификат как враждебный/);
-  assert.doesNotMatch(source, /содержимое подписки остаются зашифрованы TLS/);
-  assert.doesNotMatch(source, /URL и путь остаются внутри TLS/);
-  assert.match(styles, /@media \(max-width: 399px\)[\s\S]*\.subscription-transport \.segmented-control\s*{\s*grid-template-columns: minmax\(0, 1fr\)/);
+  assert.doesNotMatch(source, /SubscriptionFetchTransport|subscriptionTransport|Транспорт HTTPS-загрузки|subscription-transport-help|current_loopback_system_proxy/);
+  assert.doesNotMatch(model, /SubscriptionFetchTransport|current_loopback_system_proxy/);
+  assert.doesNotMatch(styles, /subscription-transport/);
+  assert.match(source, /загрузит подписку по HTTPS через текущий сетевой путь Windows/);
 });
 
 test("local-only readiness never maps to global Connected", () => {
@@ -307,7 +299,7 @@ test("cancelled import waiting for transport never sends secret-bearing IPC", as
     },
   };
   const controller = new TauriController(async () => loader);
-  const pending = controller.previewSubscription({ type: "url", value: secret, transport: "direct" });
+  const pending = controller.previewSubscription({ type: "url", value: secret });
   controller.cancelImportPreview();
   resolveLoader(transport);
 
@@ -337,8 +329,8 @@ test("HTTPS URL preview uses the exact typed command and retains no secret", asy
   };
   const controller = new TauriController(async () => transport);
   await controller.ready();
-  const preview = await controller.previewSubscription({ type: "url", value: secret, transport: "direct" });
-  assert.deepEqual(calls[1], { command: "preview_import_url", arguments_: { url: secret, transport: "direct" } });
+  const preview = await controller.previewSubscription({ type: "url", value: secret });
+  assert.deepEqual(calls[1], { command: "preview_import_url", arguments_: { url: secret } });
   assert.equal(preview.sourceLabel, "HTTPS-подписка · адрес скрыт");
   assert.ok(!JSON.stringify(preview).includes(secret));
   assert.ok(!JSON.stringify(controller.getSnapshot()).includes(secret));
@@ -347,57 +339,33 @@ test("HTTPS URL preview uses the exact typed command and retains no secret", asy
   controller.dispose();
 });
 
-test("both URL transports are explicit and a direct failure never auto-falls back", async () => {
-  const proxySecret = "https://provider.example/subscription?token=proxy-choice";
-  const directSecret = "https://provider.example/subscription?token=direct-no-fallback";
-  let directFails = false;
+test("automatic URL fetch failure sends the secret once without renderer fallback", async () => {
+  const secret = "https://provider.example/subscription?token=automatic-no-fallback";
   const calls: Array<{ command: string; arguments_?: Record<string, unknown> }> = [];
   const transport: TauriTransport = {
     listen: async () => () => undefined,
     invoke: async (command, arguments_) => {
       calls.push({ command, arguments_ });
       if (command === "runtime_status") return runtimeStatus(1, "disconnected");
-      if (command === "discard_import_preview") return null;
       if (command === "preview_import_url") {
-        if (directFails) {
-          throw { code: "subscription_fetch_failed", stage: "subscription_fetch", message: "subscription.fetch_failed", detail: null };
-        }
-        return {
-          previewId: "preview-proxy-choice",
-          nodes: [{ id: "node-proxy-choice", displayName: "Fetched", protocol: "vless", insecureTls: false }],
-          rejected: [],
-          warnings: [],
-        };
+        throw { code: "subscription_fetch_failed", stage: "subscription_fetch", message: "subscription.fetch_failed", detail: null };
       }
       throw new Error("unexpected command");
     },
   };
   const controller = new TauriController(async () => transport);
   await controller.ready();
-  await controller.previewSubscription({
-    type: "url",
-    value: proxySecret,
-    transport: "current_loopback_system_proxy",
-  });
-  controller.cancelImportPreview();
-  await Promise.resolve();
-
-  directFails = true;
   await assert.rejects(
-    controller.previewSubscription({ type: "url", value: directSecret, transport: "direct" }),
+    controller.previewSubscription({ type: "url", value: secret }),
     (error: unknown) => {
       assert.ok(error instanceof RouteDeckError);
       assert.equal(error.code, "subscription-fetch-failed");
-      assert.match(toPublicActionError(error).message, /явно выберите «Через текущий локальный системный прокси»/);
+      assert.match(toPublicActionError(error).message, /текущий сетевой путь Windows/);
       return true;
     },
   );
   const previewCalls = calls.filter((call) => call.command === "preview_import_url");
-  assert.deepEqual(previewCalls, [
-    { command: "preview_import_url", arguments_: { url: proxySecret, transport: "current_loopback_system_proxy" } },
-    { command: "preview_import_url", arguments_: { url: directSecret, transport: "direct" } },
-  ]);
-  assert.equal(previewCalls.filter((call) => call.arguments_?.url === directSecret).length, 1);
+  assert.deepEqual(previewCalls, [{ command: "preview_import_url", arguments_: { url: secret } }]);
   controller.dispose();
 });
 
@@ -425,7 +393,7 @@ test("stale HTTPS URL preview is discarded without publishing its secret", async
   };
   const controller = new TauriController(async () => transport);
   await controller.ready();
-  const pending = controller.previewSubscription({ type: "url", value: secret, transport: "direct" });
+  const pending = controller.previewSubscription({ type: "url", value: secret });
   await previewInvoked;
   controller.cancelImportPreview();
   resolvePreview({
@@ -468,7 +436,7 @@ test("HTTPS fetch failures map to finite localized errors without backend detail
     const secret = `https://provider.example/${code}?token=never-display`;
     backendError = { code, stage, message, detail: null };
     await assert.rejects(
-      controller.previewSubscription({ type: "url", value: secret, transport: "direct" }),
+      controller.previewSubscription({ type: "url", value: secret }),
       (error: unknown) => {
         assert.ok(error instanceof RouteDeckError);
         assert.equal(error.code, expectedCode);
@@ -504,7 +472,7 @@ test("known import rejection is localized instead of masked as a runtime failure
   await controller.ready();
 
   await assert.rejects(
-    controller.previewSubscription({ type: "url", value: secret, transport: "current_loopback_system_proxy" }),
+    controller.previewSubscription({ type: "url", value: secret }),
     (error: unknown) => {
       assert.ok(error instanceof RouteDeckError);
       assert.equal(error.code, "subscription-import-rejected");
@@ -538,7 +506,7 @@ test("malformed backend error closes the renderer boundary", async () => {
   await controller.ready();
 
   await assert.rejects(
-    controller.previewSubscription({ type: "url", value: secret, transport: "direct" }),
+    controller.previewSubscription({ type: "url", value: secret }),
     { code: "backend-response-invalid" },
   );
   const snapshot = controller.getSnapshot();

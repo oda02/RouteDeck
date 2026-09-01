@@ -124,10 +124,8 @@ export interface ControllerSnapshot {
   subscriptionUpdatedAt: string;
 }
 
-export type SubscriptionFetchTransport = "direct" | "current_loopback_system_proxy";
-
 export type SubscriptionImportSource =
-  | { type: "url"; value: string; transport: SubscriptionFetchTransport }
+  | { type: "url"; value: string }
   | { type: "clipboard"; value: string };
 
 export interface SubscriptionPreview {

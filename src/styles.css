@@ -1585,9 +1585,6 @@ select,
     font-size: 11px;
   }
 
-  .subscription-transport .segmented-control {
-    grid-template-columns: minmax(0, 1fr);
-  }
 }
 
 @media (min-width: 560px) {

@@ -482,7 +482,7 @@ export class TauriController implements RouteDeckController {
     let raw: unknown;
     try {
       const pending = sourceType === "url"
-        ? transport.invoke("preview_import_url", { url: source.value, transport: source.transport })
+        ? transport.invoke("preview_import_url", { url: source.value })
         : transport.invoke("preview_import_content", { content: source.value });
       // Drop the controller stack's reference as soon as IPC owns the request.
       // Neither URL nor raw share content is retained in controller state.
