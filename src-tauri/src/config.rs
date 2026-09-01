@@ -593,6 +593,55 @@ mod tests {
     }
 
     #[test]
+    fn preserves_all_vless_reality_client_fields_from_share_link() {
+        let public_key = "abcdefghijklmnopqrstuvwxyzABCDEFGH123456789";
+        let link = format!(
+            "vless://11111111-2222-3333-4444-555555555555@example.test:443?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision&sni=cover.test&fp=chrome&pbk={public_key}&sid=a1b2&spx=%2Fprivate#Reality"
+        );
+        let node = node(&link);
+        let policy = policy(DefaultRoute::Vpn);
+        let value: Value =
+            serde_json::from_str(generate_config(request(&node, &policy)).unwrap().as_str())
+                .unwrap();
+
+        assert_eq!(
+            value.pointer("/outbounds/0/type").and_then(Value::as_str),
+            Some("vless")
+        );
+        assert_eq!(
+            value.pointer("/outbounds/0/flow").and_then(Value::as_str),
+            Some("xtls-rprx-vision")
+        );
+        assert_eq!(
+            value
+                .pointer("/outbounds/0/tls/server_name")
+                .and_then(Value::as_str),
+            Some("cover.test")
+        );
+        assert_eq!(
+            value
+                .pointer("/outbounds/0/tls/utls/fingerprint")
+                .and_then(Value::as_str),
+            Some("chrome")
+        );
+        assert_eq!(
+            value
+                .pointer("/outbounds/0/tls/reality/public_key")
+                .and_then(Value::as_str),
+            Some(public_key)
+        );
+        assert_eq!(
+            value
+                .pointer("/outbounds/0/tls/reality/short_id")
+                .and_then(Value::as_str),
+            Some("a1b2")
+        );
+        assert!(value.pointer("/outbounds/0/transport").is_none());
+        assert!(!value.to_string().contains("spx"));
+        assert!(!value.to_string().contains("private"));
+    }
+
+    #[test]
     fn local_proxy_rejects_renderer_routing_drafts() {
         let node = node("hysteria2://fixture-password@example.test:443?sni=example.test#fixture");
         let direct = policy(DefaultRoute::Direct);
