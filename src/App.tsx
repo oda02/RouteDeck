@@ -777,7 +777,6 @@ export default function App() {
   }, []);
 
   const showToast = useCallback((message: string, kind: ToastKind = "success") => {
-    setToastPaused(false);
     setToast({ message, kind });
   }, []);
 
