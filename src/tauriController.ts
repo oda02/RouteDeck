@@ -23,6 +23,7 @@ import {
   parseImportPreview,
   parsePublicError,
   parseRuntimeStatus,
+  parseUnitResponse,
   type ImportPreviewDto,
   type ProofStateDto,
   type PublicErrorDto,
@@ -295,6 +296,7 @@ export class TauriController implements RouteDeckController {
   private runtime?: RuntimeStatusDto;
   private pendingImport?: { dto: ImportPreviewDto; projected: SubscriptionPreview };
   private importGeneration = 0;
+  private confirmingImport = false;
   private beforeUnload?: () => void;
 
   constructor(loader: TauriTransportLoader = loadTauriTransport) {
@@ -442,8 +444,8 @@ export class TauriController implements RouteDeckController {
   };
 
   previewSubscription = async (source: SubscriptionImportSource): Promise<SubscriptionPreview> => {
-    const generation = ++this.importGeneration;
-    this.pendingImport = undefined;
+    if (this.confirmingImport) throw new RouteDeckError("stale-subscription-preview");
+    const generation = this.invalidatePendingImport();
     const content = source.value;
     if (!content.trim()) throw new RouteDeckError("empty-subscription-source");
     if (source.type === "url" && /^https:\/\//i.test(content.trim())) {
@@ -463,7 +465,10 @@ export class TauriController implements RouteDeckController {
       this.failBoundary("backend-response-invalid");
       throw new RouteDeckError("backend-response-invalid");
     }
-    if (generation !== this.importGeneration) throw new RouteDeckError("stale-subscription-preview");
+    if (generation !== this.importGeneration) {
+      await this.discardPreviewToken(dto.previewId);
+      throw new RouteDeckError("stale-subscription-preview");
+    }
     const counts = new Map<Protocol, number>();
     dto.nodes.forEach((node) => {
       const protocol = protocolName(node.protocol);
@@ -482,54 +487,81 @@ export class TauriController implements RouteDeckController {
     return projected;
   };
 
-  cancelImportPreview = (): void => {
+  private invalidatePendingImport(): number {
+    const previewId = this.pendingImport?.dto.previewId;
     this.importGeneration += 1;
     this.pendingImport = undefined;
+    if (previewId) void this.discardPreviewToken(previewId);
+    return this.importGeneration;
+  }
+
+  private async discardPreviewToken(previewId: string): Promise<void> {
+    const transport = this.transport;
+    if (!transport || this.disposed) return;
+    try {
+      parseUnitResponse(await transport.invoke("discard_import_preview", { previewId }));
+    } catch (error) {
+      // Cleanup is best-effort: an already consumed/expired token is harmless.
+      // A malformed successful response is still a trust-boundary failure.
+      if (error instanceof ContractViolation && !this.disposed) this.failBoundary("backend-response-invalid");
+    }
+  }
+
+  cancelImportPreview = (): void => {
+    // confirm_import consumes the token and updates the backend atomically. Once
+    // it has started, cancellation would only hide an outcome we must reconcile.
+    if (this.confirmingImport) return;
+    this.invalidatePendingImport();
   };
 
   commitSubscription = async (preview: SubscriptionPreview): Promise<void> => {
     const pending = this.pendingImport;
-    if (!pending || preview.token !== pending.projected.token) throw new RouteDeckError("stale-subscription-preview");
+    if (this.confirmingImport || !pending || preview.token !== pending.projected.token) throw new RouteDeckError("stale-subscription-preview");
     const generation = ++this.importGeneration;
-    const transport = await this.requireTransport();
-    let raw: unknown;
+    this.confirmingImport = true;
     try {
-      raw = await transport.invoke("confirm_import", { previewId: preview.token });
-    } catch (error) {
-      throw safeInvokeError(error);
+      const transport = await this.requireTransport();
+      let raw: unknown;
+      try {
+        raw = await transport.invoke("confirm_import", { previewId: preview.token });
+      } catch (error) {
+        throw safeInvokeError(error);
+      }
+      let confirmed;
+      try {
+        confirmed = parseConfirmedImport(raw);
+      } catch {
+        this.failBoundary("backend-response-invalid");
+        throw new RouteDeckError("backend-response-invalid");
+      }
+      const previewIds = new Set(pending.dto.nodes.map((node) => node.id));
+      if (confirmed.nodeIds.some((id) => !previewIds.has(id))) {
+        this.failBoundary("backend-response-invalid");
+        throw new RouteDeckError("backend-response-invalid");
+      }
+      if (generation !== this.importGeneration) throw new RouteDeckError("stale-subscription-preview");
+      const confirmedIds = new Set(confirmed.nodeIds);
+      const servers: Server[] = pending.dto.nodes
+        .filter((node) => confirmedIds.has(node.id))
+        .map((node) => ({
+          id: node.id,
+          name: node.displayName,
+          country: "—",
+          protocol: protocolName(node.protocol),
+          detail: node.insecureTls ? "Требует отдельного подтверждения небезопасного TLS" : "Проверено строгим импортом",
+          source: "Локальный импорт",
+          latencyState: "unavailable",
+        }));
+      this.pendingImport = undefined;
+      this.publish({
+        servers,
+        selectedServerId: servers[0]?.id ?? "",
+        subscriptionName: "Локальный импорт",
+        subscriptionUpdatedAt: "только что",
+      });
+    } finally {
+      this.confirmingImport = false;
     }
-    let confirmed;
-    try {
-      confirmed = parseConfirmedImport(raw);
-    } catch {
-      this.failBoundary("backend-response-invalid");
-      throw new RouteDeckError("backend-response-invalid");
-    }
-    const previewIds = new Set(pending.dto.nodes.map((node) => node.id));
-    if (confirmed.nodeIds.some((id) => !previewIds.has(id))) {
-      this.failBoundary("backend-response-invalid");
-      throw new RouteDeckError("backend-response-invalid");
-    }
-    if (generation !== this.importGeneration) throw new RouteDeckError("stale-subscription-preview");
-    const confirmedIds = new Set(confirmed.nodeIds);
-    const servers: Server[] = pending.dto.nodes
-      .filter((node) => confirmedIds.has(node.id))
-      .map((node) => ({
-        id: node.id,
-        name: node.displayName,
-        country: "—",
-        protocol: protocolName(node.protocol),
-        detail: node.insecureTls ? "Требует отдельного подтверждения небезопасного TLS" : "Проверено строгим импортом",
-        source: "Локальный импорт",
-        latencyState: "unavailable",
-      }));
-    this.pendingImport = undefined;
-    this.publish({
-      servers,
-      selectedServerId: servers[0]?.id ?? "",
-      subscriptionName: "Локальный импорт",
-      subscriptionUpdatedAt: "только что",
-    });
   };
 
   applyRouting = async (_routing: RoutingConfig): Promise<void> => {
@@ -555,7 +587,7 @@ export class TauriController implements RouteDeckController {
       this.publish({
         diagnostics: {
           running: false,
-          lastRunAt: new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date()),
+          snapshotReceivedAt: new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date()),
           steps: projectRuntimeProofs(diagnostics.status),
           sanitizedLog: diagnostics.lines,
         },
@@ -573,7 +605,7 @@ export class TauriController implements RouteDeckController {
 
   resetLocalState = async (): Promise<void> => {
     if (this.runtime && this.runtime.phase !== "disconnected") await this.disconnect();
-    this.pendingImport = undefined;
+    this.cancelImportPreview();
     this.publish({
       phase: "disconnected",
       selectedServerId: "",
@@ -600,6 +632,10 @@ export class TauriController implements RouteDeckController {
 
   dispose = (): void => {
     if (this.disposed) return;
+    const previewId = this.pendingImport?.dto.previewId;
+    this.pendingImport = undefined;
+    this.importGeneration += 1;
+    if (previewId && !this.confirmingImport) void this.discardPreviewToken(previewId);
     this.disposed = true;
     this.unlisten?.();
     this.unlisten = undefined;

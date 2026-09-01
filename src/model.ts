@@ -101,8 +101,7 @@ export type TunPathChoice =
 
 export interface DiagnosticsState {
   running: boolean;
-  lastRunAt?: string;
-  durationMs?: number;
+  snapshotReceivedAt?: string;
   steps: ConnectionProof[];
   sanitizedLog: string[];
 }

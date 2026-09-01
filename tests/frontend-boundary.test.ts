@@ -6,6 +6,7 @@ import {
   ContractViolation,
   RuntimeRevisionGate,
   parseRuntimeStatus,
+  parseUnitResponse,
   type RuntimeStatusDto,
 } from "../src/tauriContract.ts";
 import {
@@ -109,6 +110,12 @@ test("schema validator rejects duplicate proofs and invalid enum values", () => 
   );
 });
 
+test("unit command responses accept only Rust null", () => {
+  assert.doesNotThrow(() => parseUnitResponse(null));
+  assert.throws(() => parseUnitResponse(undefined), ContractViolation);
+  assert.throws(() => parseUnitResponse({}), ContractViolation);
+});
+
 test("ready status requires complete proof, identity, latency, and distinct ports", () => {
   const ready = runtimeStatus(4, "local_proxy_ready");
   assert.doesNotThrow(() => parseRuntimeStatus(ready));
@@ -129,12 +136,17 @@ test("ready status requires complete proof, identity, latency, and distinct port
 
 test("cancelled import cannot retain or publish a late preview", async () => {
   let resolvePreview!: (value: unknown) => void;
+  const discarded: Array<{ command: string; arguments_?: Record<string, unknown> }> = [];
   const previewResult = new Promise<unknown>((resolve) => { resolvePreview = resolve; });
   const transport: TauriTransport = {
     listen: async () => () => undefined,
-    invoke: async (command) => {
+    invoke: async (command, arguments_) => {
       if (command === "runtime_status") return runtimeStatus(1, "disconnected");
       if (command === "preview_import_content") return previewResult;
+      if (command === "discard_import_preview") {
+        discarded.push({ command, arguments_ });
+        return null;
+      }
       throw new Error("unexpected command");
     },
   };
@@ -149,7 +161,69 @@ test("cancelled import cannot retain or publish a late preview", async () => {
     warnings: [],
   });
   await assert.rejects(pending, { code: "stale-subscription-preview" });
+  assert.deepEqual(discarded, [{ command: "discard_import_preview", arguments_: { previewId: "preview-fixture" } }]);
   assert.equal(controller.getSnapshot().servers.length, 0);
+  controller.dispose();
+});
+
+test("closing a known preview discards its opaque token with exact arguments", async () => {
+  const calls: Array<{ command: string; arguments_?: Record<string, unknown> }> = [];
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command, arguments_) => {
+      calls.push({ command, arguments_ });
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "preview_import_content") return {
+        previewId: "preview-known",
+        nodes: [{ id: "node-known", displayName: "Known", protocol: "vless", insecureTls: false }],
+        rejected: [],
+        warnings: [],
+      };
+      if (command === "discard_import_preview") return null;
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+  await controller.previewSubscription({ type: "clipboard", value: "vless://hidden-fixture" });
+  controller.cancelImportPreview();
+  await Promise.resolve();
+  assert.deepEqual(calls.at(-1), {
+    command: "discard_import_preview",
+    arguments_: { previewId: "preview-known" },
+  });
+  controller.dispose();
+});
+
+test("cancel during confirm cannot hide the reconciled import result", async () => {
+  let resolveConfirm!: (value: unknown) => void;
+  const confirmResult = new Promise<unknown>((resolve) => { resolveConfirm = resolve; });
+  const calls: string[] = [];
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command) => {
+      calls.push(command);
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "preview_import_content") return {
+        previewId: "preview-confirm",
+        nodes: [{ id: "node-confirm", displayName: "Confirmed", protocol: "hysteria2", insecureTls: false }],
+        rejected: [],
+        warnings: [],
+      };
+      if (command === "confirm_import") return confirmResult;
+      if (command === "discard_import_preview") return null;
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+  const preview = await controller.previewSubscription({ type: "clipboard", value: "hysteria2://hidden-fixture" });
+  const confirming = controller.commitSubscription(preview);
+  controller.cancelImportPreview();
+  resolveConfirm({ imported: 1, nodeIds: ["node-confirm"] });
+  await confirming;
+  assert.equal(controller.getSnapshot().servers[0]?.id, "node-confirm");
+  assert.equal(calls.filter((command) => command === "discard_import_preview").length, 0);
   controller.dispose();
 });
 
@@ -178,5 +252,23 @@ test("malformed diagnostics always clears the running flag and fails closed", as
   await assert.rejects(controller.runDiagnostics(), { code: "backend-response-invalid" });
   assert.equal(controller.getSnapshot().diagnostics.running, false);
   assert.equal(controller.getSnapshot().backendAvailable, false);
+  controller.dispose();
+});
+
+test("runtime diagnostics is labelled as a received snapshot, not a fresh proof run", async () => {
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command) => command === "runtime_status"
+      ? runtimeStatus(1, "disconnected")
+      : { status: runtimeStatus(2, "disconnected"), lines: ["sanitized"] },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+  await controller.runDiagnostics();
+  const diagnostics = controller.getSnapshot().diagnostics;
+  assert.equal(typeof diagnostics.snapshotReceivedAt, "string");
+  assert.equal(diagnostics.running, false);
+  assert.ok(diagnostics.steps.every((proof) => proof.checkedAt === undefined));
+  assert.deepEqual(diagnostics.sanitizedLog, ["sanitized"]);
   controller.dispose();
 });

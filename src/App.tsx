@@ -668,7 +668,7 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
   const run = () => {
     void runAsyncAction({
       page: "diagnostics",
-      title: "Не удалось запустить диагностику",
+      title: "Не удалось обновить снимок состояния",
       setBusy: setChecking,
       action: controller.runDiagnostics,
       retry: run,
@@ -693,19 +693,20 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
   };
   return (
     <div className="page">
-      <div className="page-title-row"><div><p className="overline">Проверка без догадок</p><h1 ref={headingRef} tabIndex={-1}>Диагностика</h1></div>{snapshot.diagnostics.lastRunAt ? <span className="quiet-badge">{snapshot.diagnostics.lastRunAt}</span> : null}</div>
+      <div className="page-title-row"><div><p className="overline">Безопасный снимок контроллера</p><h1 ref={headingRef} tabIndex={-1}>Диагностика</h1></div>{snapshot.diagnostics.snapshotReceivedAt ? <span className="quiet-badge">Получен {snapshot.diagnostics.snapshotReceivedAt}</span> : null}</div>
       <ActionFailureNotice failure={actionFailure} page="diagnostics" onClear={onClearFailure} />
-      <button className="primary-button" type="button" disabled={checking || snapshot.diagnostics.running} aria-busy={checking || snapshot.diagnostics.running} onClick={run}>{checking || snapshot.diagnostics.running ? <LoaderIcon size={20} /> : <ActivityIcon size={20} />}{checking || snapshot.diagnostics.running ? "Проверяем все этапы…" : "Запустить полную проверку"}</button>
-      {snapshot.environment.otherVpnDetected ? <OpaqueNotice notice={externalNotice} primaryAction={{ label: "Повторить после изменения", onClick: run }} /> : null}
-      <ProofCard proofs={snapshot.diagnostics.steps} title="Цепочка доказательств" historical={!snapshot.diagnostics.lastRunAt} />
-      {snapshot.diagnostics.lastRunAt ? <p className="diagnostic-duration">Полная проверка: {snapshot.diagnostics.durationMs} мс · {snapshot.diagnostics.lastRunAt}</p> : null}
+      <p className="field-help">Кнопка получает уже сохранённое состояние контроллера. Она не запускает новую проверку локальных портов или HTTPS-маршрута.</p>
+      <button className="primary-button" type="button" disabled={checking || snapshot.diagnostics.running} aria-busy={checking || snapshot.diagnostics.running} onClick={run}>{checking || snapshot.diagnostics.running ? <LoaderIcon size={20} /> : <ActivityIcon size={20} />}{checking || snapshot.diagnostics.running ? "Обновляем снимок…" : "Обновить снимок состояния"}</button>
+      {snapshot.environment.otherVpnDetected ? <OpaqueNotice notice={externalNotice} primaryAction={{ label: "Обновить снимок", onClick: run }} /> : null}
+      <ProofCard proofs={snapshot.diagnostics.steps} title="Снимок доказательств" />
+      {snapshot.diagnostics.snapshotReceivedAt ? <p className="diagnostic-duration">Снимок получен в {snapshot.diagnostics.snapshotReceivedAt}; время отдельных этапов отображается только когда его сообщает контроллер.</p> : null}
       <button className="secondary-button full-width" type="button" disabled={copying} aria-busy={copying} onClick={copyReport}>{copying ? <LoaderIcon size={19} /> : <CopyIcon size={19} />}{copying ? "Копируем…" : "Копировать безопасный отчёт"}</button>
       <details className="card log-viewer"><summary>Технический журнал</summary><div className="details-body"><p className="field-help">Секреты и адрес подписки удаляются до отображения и копирования.</p><pre>{snapshot.diagnostics.sanitizedLog.join("\n")}</pre></div></details>
     </div>
   );
 }
 
-function Dialog({ title, description, focusKey, onClose, children, actions }: { title: string; description?: string; focusKey?: string; onClose: () => void; children: ReactNode; actions: ReactNode }) {
+function Dialog({ title, description, focusKey, onClose, closeDisabled = false, children, actions }: { title: string; description?: string; focusKey?: string; onClose: () => void; closeDisabled?: boolean; children: ReactNode; actions: ReactNode }) {
   const dialogRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -716,7 +717,7 @@ function Dialog({ title, description, focusKey, onClose, children, actions }: { 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        onClose();
+        if (!closeDisabled) onClose();
         return;
       }
       if (event.key !== "Tab" || !dialog) return;
@@ -732,12 +733,12 @@ function Dialog({ title, description, focusKey, onClose, children, actions }: { 
       document.removeEventListener("keydown", onKeyDown);
       previouslyFocused?.focus({ preventScroll: true });
     };
-  }, [focusKey, onClose]);
+  }, [closeDisabled, focusKey, onClose]);
 
   return (
     <div className="dialog-scrim" role="presentation">
       <div className="dialog" ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby={description ? "dialog-description" : undefined}>
-        <div className="dialog-header"><div><h2 id="dialog-title">{title}</h2>{description ? <p id="dialog-description">{description}</p> : null}</div><button className="icon-button" type="button" aria-label="Закрыть окно" title="Закрыть" onClick={onClose}><XIcon size={19} /></button></div>
+        <div className="dialog-header"><div><h2 id="dialog-title">{title}</h2>{description ? <p id="dialog-description">{description}</p> : null}</div><button className="icon-button" type="button" aria-label="Закрыть окно" title={closeDisabled ? "Дождитесь завершения импорта" : "Закрыть"} disabled={closeDisabled} onClick={onClose}><XIcon size={19} /></button></div>
         <div className="dialog-content">{children}</div>
         <div className="dialog-actions">{actions}</div>
       </div>
@@ -787,6 +788,7 @@ export default function App() {
   const [importError, setImportError] = useState("");
   const [importing, setImporting] = useState(false);
   const [subscriptionPreview, setSubscriptionPreview] = useState<SubscriptionPreview | null>(null);
+  const confirmingImport = importing && subscriptionPreview !== null;
   const mainRef = useRef<HTMLElement>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const subscriptionInputRef = useRef<HTMLInputElement>(null);
@@ -1097,8 +1099,9 @@ export default function App() {
           description="RouteDeck импортирует только поддерживаемые узлы и не выполняет чужие команды или настройки."
           focusKey={subscriptionPreview ? "preview" : "source"}
           onClose={closeDialog}
+          closeDisabled={confirmingImport}
           actions={subscriptionPreview ? <>
-            <button className="secondary-button" type="button" data-autofocus onClick={() => { invalidateImport(); setSubscriptionPreview(null); setImportError(""); }}>Назад</button>
+            <button className="secondary-button" type="button" data-autofocus disabled={confirmingImport} onClick={() => { invalidateImport(); setSubscriptionPreview(null); setImportError(""); }}>Назад</button>
             <button className="primary-button dialog-primary" type="button" disabled={importing} aria-busy={importing} onClick={commitImport}>{importing ? <LoaderIcon size={19} /> : <ImportIcon size={19} />}{importing ? "Импортируем…" : "Подтвердить импорт"}</button>
           </> : <>
             <button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Отмена</button>
@@ -1108,6 +1111,7 @@ export default function App() {
           {subscriptionPreview ? (
             <section className="import-preview" aria-live="polite">
               {importError ? <p id="import-error" className="field-error" role="alert">{importError}</p> : null}
+              {confirmingImport ? <p className="persistent-hint" role="status"><InfoIcon size={17} />Импорт подтверждается локальным контроллером. Дождитесь результата — окно закроется только после согласования списка серверов.</p> : null}
               <p className="overline">Предпросмотр · данные ещё не сохранены</p>
               <h3>Найдено поддерживаемых узлов</h3>
               <p className="preview-source">Источник: {subscriptionPreview.sourceLabel}</p>

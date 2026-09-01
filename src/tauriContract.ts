@@ -332,6 +332,11 @@ export function parseDiagnostics(value: unknown): DiagnosticsDto {
   };
 }
 
+/** Rust unit responses serialize as JSON null. */
+export function parseUnitResponse(value: unknown): void {
+  if (value !== null) throw new ContractViolation();
+}
+
 /** Accepts only strictly newer snapshots, preventing the initial invoke result from overwriting an event. */
 export class RuntimeRevisionGate {
   private revision = -1;

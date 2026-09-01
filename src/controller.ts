@@ -361,8 +361,7 @@ class DevelopmentDemoController implements RouteDeckController {
       diagnostics: {
         ...this.snapshot.diagnostics,
         running: false,
-        lastRunAt: now(),
-        durationMs: 1019,
+        snapshotReceivedAt: now(),
         steps,
       },
     });
