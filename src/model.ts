@@ -108,7 +108,7 @@ export interface DiagnosticsState {
 
 export interface ControllerSnapshot {
   isDemo: boolean;
-  runtimeScope: "demo" | "local-only" | "unavailable";
+  runtimeScope: "demo" | "system-proxy" | "local-only" | "unavailable";
   backendAvailable: boolean;
   phase: ConnectionPhase;
   mode: ConnectionMode;

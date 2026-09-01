@@ -20,15 +20,17 @@ import {
 } from "../src/tauriController.ts";
 
 function runtimeStatus(revision: number, phase: RuntimeStatusDto["phase"]): RuntimeStatusDto {
+  const ready = phase === "local_proxy_ready" || phase === "system_proxy_ready";
+  const systemProxy = phase === "system_proxy_ready";
   return {
     revision,
     sessionId: phase === "disconnected" ? undefined : "fixture-session",
-    scope: "local_only",
-    mode: "local_only",
+    scope: systemProxy ? "system_proxy" : "local_only",
+    mode: systemProxy ? "system_proxy" : "local_only",
     phase,
     nodeId: phase === "disconnected" ? undefined : "fixture-node",
     ports: phase === "disconnected" ? undefined : { http: 24080, socks: 24081, health: 24082 },
-    routeCheckMs: phase === "local_proxy_ready" ? 84 : undefined,
+    routeCheckMs: ready ? 84 : undefined,
     engineVersion: phase === "disconnected" ? undefined : "1.13.19",
     proofs: [
       { kind: "engine_config", state: phase === "disconnected" ? "not_run" : "passed" },
@@ -36,8 +38,9 @@ function runtimeStatus(revision: number, phase: RuntimeStatusDto["phase"]): Runt
       { kind: "http_listener", state: phase === "disconnected" ? "not_run" : "passed" },
       { kind: "socks_listener", state: phase === "disconnected" ? "not_run" : "passed" },
       { kind: "health_listener", state: phase === "disconnected" ? "not_run" : "passed" },
-      { kind: "selected_outbound_https", state: phase === "local_proxy_ready" ? "passed" : "not_run", latencyMs: phase === "local_proxy_ready" ? 84 : undefined },
+      { kind: "selected_outbound_https", state: ready ? "passed" : "not_run", latencyMs: ready ? 84 : undefined },
       { kind: "local_scope_ownership", state: phase === "disconnected" ? "not_run" : "passed" },
+      { kind: "system_proxy_ownership", state: systemProxy ? "passed" : "not_run" },
     ],
   };
 }
@@ -100,6 +103,21 @@ test("local-only readiness never maps to global Connected", () => {
   assert.equal(runtimePhaseToConnectionPhase("outbound_verified"), "verifying-outbound");
   assert.equal(runtimePhaseToConnectionPhase("local_proxy_ready"), "degraded");
   assert.notEqual(runtimePhaseToConnectionPhase("local_proxy_ready"), "connected");
+});
+
+test("verified System Proxy readiness maps to Connected", () => {
+  assert.equal(runtimePhaseToConnectionPhase("applying_system_proxy"), "applying-windows-mode");
+  assert.equal(runtimePhaseToConnectionPhase("system_proxy_ready"), "connected");
+  assert.equal(runtimePhaseToConnectionPhase("blocked_by_conflict"), "blocked-by-conflict");
+  assert.doesNotThrow(() => parseRuntimeStatus(runtimeStatus(3, "system_proxy_ready")));
+  assert.throws(
+    () => parseRuntimeStatus({ ...runtimeStatus(4, "system_proxy_ready"), scope: "local_only", mode: "local_only" }),
+    ContractViolation,
+  );
+  assert.throws(
+    () => parseRuntimeStatus({ ...runtimeStatus(5, "local_proxy_ready"), phase: "blocked_by_conflict" }),
+    ContractViolation,
+  );
 });
 
 test("revision gate rejects a stale initial snapshot after a newer event", () => {
@@ -563,16 +581,62 @@ test("cancel during confirm cannot hide the reconciled import result", async () 
   controller.dispose();
 });
 
-test("local-only routing and settings actions fail instead of claiming success", async () => {
+test("System Proxy routing is saved for the next connection while unsupported settings still fail", async () => {
   const transport: TauriTransport = {
     listen: async () => () => undefined,
     invoke: async () => runtimeStatus(1, "disconnected"),
   };
   const controller = new TauriController(async () => transport);
   await controller.ready();
-  assert.equal(controller.getSnapshot().runtimeScope, "local-only");
-  await assert.rejects(controller.applyRouting({ defaultRoute: "vpn", apps: [] }), { code: "capability-unavailable" });
+  assert.equal(controller.getSnapshot().runtimeScope, "system-proxy");
+  await controller.applyRouting({ defaultRoute: "vpn", apps: [] });
+  assert.equal(controller.getSnapshot().routing.defaultRoute, "vpn");
   await assert.rejects(controller.saveSettings(controller.getSnapshot().settings), { code: "capability-unavailable" });
+  controller.dispose();
+});
+
+test("connect and disconnect use the typed System Proxy commands and routing draft", async () => {
+  const calls: Array<{ command: string; arguments_?: Record<string, unknown> }> = [];
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command, arguments_) => {
+      calls.push({ command, arguments_ });
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "preview_import_content") return {
+        previewId: "preview-system-proxy",
+        nodes: [{ id: "fixture-node", displayName: "Fixture", protocol: "vless", insecureTls: false }],
+        rejected: [],
+        warnings: [],
+      };
+      if (command === "confirm_import") return { imported: 1, nodeIds: ["fixture-node"] };
+      if (command === "start_system_proxy") return runtimeStatus(2, "system_proxy_ready");
+      if (command === "stop_system_proxy") return runtimeStatus(3, "disconnected");
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+  const preview = await controller.previewSubscription({ type: "clipboard", value: "fixture" });
+  await controller.commitSubscription(preview);
+  await controller.applyRouting({
+    defaultRoute: "direct",
+    apps: [{ id: "browser", name: "Browser", path: "C:\\Apps\\browser.exe", route: "vpn" }],
+  });
+  await controller.connect();
+  await controller.disconnect();
+  assert.deepEqual(calls.slice(-2), [
+    {
+      command: "start_system_proxy",
+      arguments_: {
+        nodeId: "fixture-node",
+        routing: {
+          defaultRoute: "direct",
+          apps: [{ processPath: "C:\\Apps\\browser.exe", processName: "browser.exe", route: "vpn" }],
+        },
+      },
+    },
+    { command: "stop_system_proxy", arguments_: undefined },
+  ]);
   controller.dispose();
 });
 

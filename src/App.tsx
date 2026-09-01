@@ -270,22 +270,22 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
   actionFailure: ActionFailure | null;
   onClearFailure: () => void;
 }) {
-  const localOnly = snapshot.runtimeScope === "local-only";
+  const localDiagnostic = snapshot.runtimeScope === "local-only";
   const server = snapshot.servers.find((item) => item.id === snapshot.selectedServerId);
   const pending = pendingPhases.includes(snapshot.phase);
   const hasLiveCore = ["connected", "degraded", "blocked-by-conflict"].includes(snapshot.phase);
   const buttonLabel = pending
     ? phaseLabels[snapshot.phase]
     : hasLiveCore
-      ? localOnly || snapshot.phase === "blocked-by-conflict" ? "Остановить локальный прокси" : "Отключить"
-      : snapshot.phase === "failed" ? "Повторить" : localOnly ? "Запустить локальный прокси" : "Подключить";
+      ? localDiagnostic ? "Остановить локальный прокси" : "Отключить"
+      : snapshot.phase === "failed" ? "Повторить" : "Подключить";
   const visibleProofs = snapshot.proofs.filter((proof) => proof.id !== "config");
   const boundaryNotice = snapshot.notice?.id === "backend-unavailable" || snapshot.notice?.id === "backend-response-invalid";
   const vpnApps = snapshot.routing.apps.filter((app) => app.route === "vpn");
   const directApps = snapshot.routing.apps.filter((app) => app.route === "direct");
   const routeSummary = snapshot.routing.defaultRoute === "direct"
-    ? `По умолчанию напрямую · ${vpnApps.length} ${vpnApps.length === 1 ? "приложение" : "приложения"} через VPN`
-    : `По умолчанию через VPN · ${directApps.length} исключений напрямую`;
+    ? `Прокси Windows: напрямую · ${vpnApps.length} ${vpnApps.length === 1 ? "исключение" : "исключений"} через VPN`
+    : `Прокси Windows: через VPN · ${directApps.length} исключений напрямую`;
 
   return (
     <div className="page home-page">
@@ -294,7 +294,7 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
           <p className="overline">Управление соединением</p>
           <h1 ref={headingRef} tabIndex={-1}>Главная</h1>
         </div>
-        <span className="mode-readout">{localOnly ? "Локальный прокси" : snapshot.mode === "proxy" ? "System Proxy" : "TUN"}</span>
+        <span className="mode-readout">{localDiagnostic ? "Локальная диагностика" : snapshot.mode === "proxy" ? "System Proxy" : "TUN"}</span>
       </div>
 
       <ActionFailureNotice failure={actionFailure} page="home" onClear={onClearFailure} />
@@ -319,20 +319,16 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
         <SegmentedControl
           label="Режим подключения"
           value={snapshot.mode}
-          options={localOnly
-            ? [{ value: "proxy", label: "Локальный прокси" }, { value: "tun", label: "TUN · недоступен", disabled: true }]
-            : [{ value: "proxy", label: "Системный прокси" }, { value: "tun", label: "TUN" }]}
+          options={[{ value: "proxy", label: "Системный прокси" }, { value: "tun", label: "TUN · скоро", disabled: true }]}
           onChange={onModeChange}
-          disabled={pending || localOnly}
+          disabled={pending || localDiagnostic}
         />
         <div className="persistent-hint" data-kind={snapshot.mode === "tun" ? "warning" : "info"}>
           {snapshot.mode === "proxy" ? <InfoIcon size={18} /> : <ShieldIcon size={18} />}
           <p>
-            {localOnly
-              ? "Запускает только отдельные HTTP/SOCKS-порты RouteDeck и проверяет выбранный сервер. Настройки прокси Windows, TUN и трафик приложений не изменяются."
-              : snapshot.mode === "proxy"
-              ? "Работает только в приложениях, которые используют прокси Windows. Для надёжных правил по приложениям выберите TUN."
-              : "Перехватывает системный трафик, может запросить UAC и проверит маршрут перед зелёным статусом."}
+            {localDiagnostic
+              ? "Диагностическая сессия проверяет локальные HTTP/SOCKS-порты и не меняет настройки Windows."
+              : "Подключает трафик приложений, которые используют прокси Windows. Общий маршрут и исключения задаются в разделе «Правила»."}
           </p>
         </div>
       </section>
@@ -362,9 +358,9 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
       <button className="summary-card" type="button" onClick={() => onNavigate("routing")}>
         <span className="summary-icon"><RoutingIcon size={20} /></span>
         <span className="selection-copy">
-          <span className="selection-label">{localOnly ? "Черновик маршрутизации" : "Маршрутизация"}</span>
-          <strong>{localOnly ? "Правила не применяются" : routeSummary}</strong>
-          <span>{localOnly ? "Не применяется: Windows-routing backend ещё не подключён" : snapshot.mode === "tun" ? "Правила применяются через TUN" : "В System Proxy правила best effort"}</span>
+          <span className="selection-label">Маршрутизация</span>
+          <strong>{routeSummary}</strong>
+          <span>Для приложений, которые используют прокси Windows</span>
         </span>
         <ChevronRightIcon size={20} />
       </button>
@@ -464,11 +460,11 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
   onClearFailure: () => void;
 }) {
   const [applying, setApplying] = useState(false);
-  const localOnly = snapshot.runtimeScope === "local-only";
+  const connectionActive = snapshot.phase !== "disconnected" && snapshot.phase !== "failed";
   const dirty = JSON.stringify(draft) !== JSON.stringify(snapshot.routing);
   const summary = draft.defaultRoute === "direct"
-    ? `Весь остальной трафик напрямую · ${draft.apps.filter((app) => app.route === "vpn").length} правила через VPN`
-    : `Весь остальной трафик через VPN · ${draft.apps.filter((app) => app.route === "direct").length} исключений напрямую`;
+    ? `Трафик прокси Windows по умолчанию напрямую · ${draft.apps.filter((app) => app.route === "vpn").length} исключений через VPN`
+    : `Трафик прокси Windows по умолчанию через VPN · ${draft.apps.filter((app) => app.route === "direct").length} исключений напрямую`;
 
   const updateApp = (id: string, route: AppRouteChoice) => onDraftChange({
     ...draft,
@@ -491,9 +487,7 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
     <div className="page">
       <div className="page-title-row">
         <div><p className="overline">Политика трафика</p><h1 ref={headingRef} tabIndex={-1}>Маршрутизация</h1></div>
-        {localOnly
-          ? <span className="quiet-badge warning-badge">Только черновик</span>
-          : dirty ? <span className="quiet-badge warning-badge">Не сохранено</span> : <span className="quiet-badge">Применено</span>}
+        {dirty ? <span className="quiet-badge warning-badge">Не сохранено</span> : <span className="quiet-badge">Готово</span>}
       </div>
       <ActionFailureNotice failure={actionFailure} page="routing" onClear={onClearFailure} />
       <section className="card">
@@ -503,15 +497,12 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
           value={draft.defaultRoute}
           options={[{ value: "direct", label: "Напрямую" }, { value: "vpn", label: "Через VPN" }]}
           onChange={(defaultRoute) => onDraftChange({ ...draft, defaultRoute })}
+          disabled={connectionActive}
         />
-        <p className="effective-summary"><RoutingIcon size={18} />{localOnly ? `Черновик: ${summary}` : summary}</p>
+        <p className="effective-summary"><RoutingIcon size={18} />{summary}</p>
       </section>
 
-      {localOnly ? (
-        <OpaqueNotice notice={{ id: "local-routing-unavailable", kind: "warning", title: "Маршрутизация пока не применяется", body: "Можно подготовить черновик правил, но текущий backend запускает только локальный прокси. Он не изменяет System Proxy, TUN или маршруты приложений." }} />
-      ) : snapshot.mode === "proxy" ? (
-        <OpaqueNotice notice={{ id: "proxy-routing-limit", kind: "info", title: "Правила в System Proxy работают best effort", body: "Они применяются к трафику proxy-aware приложений, который вошёл в локальный прокси. Для надёжного перехвата по приложениям нужен TUN." }} />
-      ) : null}
+      <OpaqueNotice notice={{ id: "proxy-routing-scope", kind: "info", title: "Правила готовы для следующего подключения", body: "Они управляют только трафиком приложений, которые используют прокси Windows. Правила отдельных приложений применяются по возможности; остальные приложения могут продолжить работать напрямую. Выбор из запущенных приложений появится позже." }} />
 
       <section className="card app-rules-card">
         <div className="section-heading">
@@ -519,32 +510,35 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
           <button className="secondary-button compact-button" type="button" disabled title="Выбор приложения появится с Tauri dialog adapter"><PlusIcon size={18} />Добавить · скоро</button>
         </div>
         <div className="app-rule-list">
-          {draft.apps.map((app) => (
+          {draft.apps.length > 0 ? draft.apps.map((app) => (
             <div className="app-rule" key={app.id}>
               <div className="app-rule-heading">
                 <span className="app-monogram" aria-hidden="true">{app.name.slice(0, 1).toUpperCase()}</span>
                 <span className="app-copy"><strong>{app.name}</strong><span title={app.path}>{app.path}</span></span>
-                <button className="icon-button" type="button" aria-label={`Удалить правило ${app.name}`} title="Удалить правило" onClick={() => onDraftChange({ ...draft, apps: draft.apps.filter((item) => item.id !== app.id) })}><TrashIcon size={18} /></button>
+                <button className="icon-button" type="button" disabled={connectionActive} aria-label={`Удалить правило ${app.name}`} title="Удалить правило" onClick={() => onDraftChange({ ...draft, apps: draft.apps.filter((item) => item.id !== app.id) })}><TrashIcon size={18} /></button>
               </div>
               <SegmentedControl
                 label={`Маршрут для ${app.name}`}
                 value={app.route}
-                options={[{ value: "inherit", label: "Наследовать" }, { value: "direct", label: "Напрямую" }, { value: "vpn", label: "VPN" }]}
+                options={[{ value: "direct", label: "Напрямую" }, { value: "vpn", label: "Через VPN" }]}
                 onChange={(route) => updateApp(app.id, route)}
+                disabled={connectionActive}
               />
               <p className="rule-effective">
-                {localOnly
-                  ? "Только черновик · правило не применяется к трафику"
-                  : snapshot.mode === "proxy"
-                  ? "Best effort в proxy-aware приложениях · гарантия требует TUN"
-                  : app.route === "inherit" ? `Эффективно: ${draft.defaultRoute === "direct" ? "напрямую" : "VPN"}` : `Эффективно: ${app.route === "direct" ? "напрямую" : "VPN"}`}
+                {app.route === "direct" ? "По возможности: прокси-трафик приложения напрямую" : app.route === "vpn" ? "По возможности: прокси-трафик приложения через VPN" : `Использует общий маршрут: ${draft.defaultRoute === "direct" ? "напрямую" : "VPN"}`}
               </p>
             </div>
-          ))}
+          )) : (
+            <div className="empty-state">
+              <RoutingIcon size={24} />
+              <strong>Исключений пока нет</strong>
+              <span>Трафик, дошедший до прокси Windows, использует общий маршрут. Выбор приложений появится в следующем обновлении.</span>
+            </div>
+          )}
         </div>
       </section>
-      <button className="primary-button" type="button" disabled={localOnly || !dirty || applying} aria-busy={applying} onClick={apply} title={localOnly ? "Windows-routing backend ещё не подключён" : undefined}>
-        {applying ? <LoaderIcon size={20} /> : <CheckIcon size={20} />}{applying ? "Применяем…" : localOnly ? "Применение недоступно" : "Применить изменения"}
+      <button className="primary-button" type="button" disabled={connectionActive || !dirty || applying} aria-busy={applying} onClick={apply} title={connectionActive ? "Сначала отключитесь, чтобы изменить правила" : undefined}>
+        {applying ? <LoaderIcon size={20} /> : <CheckIcon size={20} />}{applying ? "Сохраняем…" : "Сохранить правила"}
       </button>
     </div>
   );
@@ -563,7 +557,7 @@ function SettingsPage({ headingRef, snapshot, draft, onDraftChange, onSave, onRe
   onClearFailure: () => void;
 }) {
   const [saving, setSaving] = useState(false);
-  const localOnly = snapshot.runtimeScope === "local-only";
+  const settingsUnavailable = !snapshot.isDemo;
   const dirty = JSON.stringify(draft) !== JSON.stringify(snapshot.settings);
   const portsValid = draft.httpPort >= 1024 && draft.httpPort <= 65535 && draft.socksPort >= 1024 && draft.socksPort <= 65535 && draft.httpPort !== draft.socksPort;
   const save = () => {
@@ -585,32 +579,32 @@ function SettingsPage({ headingRef, snapshot, draft, onDraftChange, onSave, onRe
       </div>
       <ActionFailureNotice failure={actionFailure} page="settings" onClear={onClearFailure} />
 
-      {localOnly ? <OpaqueNotice notice={{ id: "local-settings-unavailable", kind: "warning", title: "Настройки пока остаются черновиком", body: "Текущий backend выбирает временные локальные порты сам и не применяет настройки System Proxy, TUN, трея или автозапуска. Элементы ниже можно осмотреть, но сохранить их пока нельзя." }} /> : null}
+      {settingsUnavailable ? <OpaqueNotice notice={{ id: "settings-unavailable", kind: "info", title: "Эти настройки появятся позже", body: "RouteDeck пока выбирает свободные локальные порты автоматически. Настройки трея и автозапуска ещё не подключены." }} /> : null}
 
       <section className="card settings-group">
         <div className="section-heading compact-heading"><div><p className="overline">Интерфейс</p><h2>Общие</h2></div></div>
-        <label className="check-row"><input type="checkbox" disabled={localOnly} checked={draft.startMinimized} onChange={(event) => onDraftChange({ ...draft, startMinimized: event.target.checked })} /><span><strong>Запускать свёрнутым</strong><small>Показывать RouteDeck только в трее после старта</small></span></label>
-        <label className="field-row"><span><strong>При закрытии окна</strong><small>Действие системной кнопки закрытия</small></span><select disabled={localOnly} value={draft.closeBehavior} onChange={(event) => onDraftChange({ ...draft, closeBehavior: event.target.value as SettingsConfig["closeBehavior"] })}><option value="tray">Скрыть в трей</option><option value="exit">Завершить работу</option></select></label>
-        <label className="field-row"><span><strong>Тема</strong><small>Dark-first, без внешних шрифтов</small></span><select disabled={localOnly} value={draft.theme} onChange={(event) => onDraftChange({ ...draft, theme: event.target.value as SettingsConfig["theme"] })}><option value="dark">Тёмная</option><option value="light">Светлая</option><option value="system">Как в Windows</option></select></label>
+        <label className="check-row"><input type="checkbox" disabled={settingsUnavailable} checked={draft.startMinimized} onChange={(event) => onDraftChange({ ...draft, startMinimized: event.target.checked })} /><span><strong>Запускать свёрнутым</strong><small>Показывать RouteDeck только в трее после старта</small></span></label>
+        <label className="field-row"><span><strong>При закрытии окна</strong><small>Действие системной кнопки закрытия</small></span><select disabled={settingsUnavailable} value={draft.closeBehavior} onChange={(event) => onDraftChange({ ...draft, closeBehavior: event.target.value as SettingsConfig["closeBehavior"] })}><option value="tray">Скрыть в трей</option><option value="exit">Завершить работу</option></select></label>
+        <label className="field-row"><span><strong>Тема</strong><small>Dark-first, без внешних шрифтов</small></span><select disabled={settingsUnavailable} value={draft.theme} onChange={(event) => onDraftChange({ ...draft, theme: event.target.value as SettingsConfig["theme"] })}><option value="dark">Тёмная</option><option value="light">Светлая</option><option value="system">Как в Windows</option></select></label>
       </section>
 
       <section className="card settings-group">
         <div className="section-heading compact-heading"><div><p className="overline">Локальные endpoints</p><h2>Подключение</h2></div></div>
-        <label className="number-field"><span>HTTP-порт</span><input type="number" disabled={localOnly} min="1024" max="65535" value={draft.httpPort} aria-describedby="port-help" onChange={(event) => onDraftChange({ ...draft, httpPort: Number(event.target.value) })} /></label>
-        <label className="number-field"><span>SOCKS-порт</span><input type="number" disabled={localOnly} min="1024" max="65535" value={draft.socksPort} aria-describedby="port-help" onChange={(event) => onDraftChange({ ...draft, socksPort: Number(event.target.value) })} /></label>
+        <label className="number-field"><span>HTTP-порт</span><input type="number" disabled={settingsUnavailable} min="1024" max="65535" value={draft.httpPort} aria-describedby="port-help" onChange={(event) => onDraftChange({ ...draft, httpPort: Number(event.target.value) })} /></label>
+        <label className="number-field"><span>SOCKS-порт</span><input type="number" disabled={settingsUnavailable} min="1024" max="65535" value={draft.socksPort} aria-describedby="port-help" onChange={(event) => onDraftChange({ ...draft, socksPort: Number(event.target.value) })} /></label>
         <p id="port-help" className={`field-help${portsValid ? "" : " field-error"}`}>{portsValid ? "Допустимо: 1024–65535. Порты должны отличаться." : "Укажите разные свободные порты от 1024 до 65535."}</p>
       </section>
 
       <section className="card settings-group">
         <div className="section-heading compact-heading"><div><p className="overline">Владение Windows</p><h2>Совместимость с другими VPN</h2></div></div>
-        <label className="radio-setting"><input type="radio" disabled={localOnly} name="proxy-policy" value="never-overwrite" checked={draft.proxyConflictPolicy === "never-overwrite"} onChange={() => onDraftChange({ ...draft, proxyConflictPolicy: "never-overwrite" })} /><span><strong>Никогда не перезаписывать чужой прокси</strong><small>Безопасный вариант: сохранить состояние и показать конфликт</small></span></label>
-        <label className="radio-setting"><input type="radio" disabled={localOnly} name="proxy-policy" value="ask" checked={draft.proxyConflictPolicy === "ask"} onChange={() => onDraftChange({ ...draft, proxyConflictPolicy: "ask" })} /><span><strong>Всегда спрашивать</strong><small>Показывать точные текущие и ожидаемые endpoints</small></span></label>
+        <label className="radio-setting"><input type="radio" disabled={settingsUnavailable} name="proxy-policy" value="never-overwrite" checked={draft.proxyConflictPolicy === "never-overwrite"} onChange={() => onDraftChange({ ...draft, proxyConflictPolicy: "never-overwrite" })} /><span><strong>Не заменять настройки другой программы</strong><small>При конфликте RouteDeck покажет ошибку</small></span></label>
+        <label className="radio-setting"><input type="radio" disabled={settingsUnavailable} name="proxy-policy" value="ask" checked={draft.proxyConflictPolicy === "ask"} onChange={() => onDraftChange({ ...draft, proxyConflictPolicy: "ask" })} /><span><strong>Спрашивать перед заменой</strong><small>Этот вариант появится позже</small></span></label>
         <div className="persistent-hint" data-kind="info"><InfoIcon size={18} /><p>Windows использует один эффективный системный прокси. Разные локальные порты не создают двух владельцев.</p></div>
       </section>
 
       <details className="card advanced-settings"><summary>Расширенные настройки</summary><div className="details-body"><p>Строгая маршрутизация TUN уменьшает утечки DNS, но может конфликтовать с виртуальными адаптерами. Диагностика покажет конкретную причину до UAC.</p><p>Сервис, драйвер и задача автозапуска в первой версии не устанавливаются.</p></div></details>
 
-      <button className="primary-button" type="button" disabled={localOnly || !dirty || !portsValid || saving} aria-busy={saving} onClick={save} title={localOnly ? "Сохранение настроек ещё не подключено" : undefined}>{saving ? <LoaderIcon size={20} /> : <CheckIcon size={20} />}{saving ? "Сохраняем…" : localOnly ? "Сохранение недоступно" : "Сохранить изменения"}</button>
+      <button className="primary-button" type="button" disabled={settingsUnavailable || !dirty || !portsValid || saving} aria-busy={saving} onClick={save} title={settingsUnavailable ? "Сохранение настроек ещё не подключено" : undefined}>{saving ? <LoaderIcon size={20} /> : <CheckIcon size={20} />}{saving ? "Сохраняем…" : settingsUnavailable ? "Сохранение недоступно" : "Сохранить изменения"}</button>
 
       <section className="danger-zone" aria-labelledby="danger-title"><div><h2 id="danger-title">Опасная зона</h2><p>Сбрасывает только локальные настройки и черновики RouteDeck. Чужой VPN и настройки Windows не изменяются.</p></div><button className="danger-button" type="button" onClick={onReset}>Сбросить локальное состояние…</button></section>
     </div>

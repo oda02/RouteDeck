@@ -6,7 +6,11 @@ const runtimePhases = [
   "verifying_listener",
   "proving_traffic",
   "outbound_verified",
+  "applying_system_proxy",
   "local_proxy_ready",
+  "system_proxy_ready",
+  "restoring_system_proxy",
+  "blocked_by_conflict",
   "degraded",
   "rolling_back",
   "stopping_core",
@@ -22,6 +26,7 @@ const proofKinds = [
   "health_listener",
   "selected_outbound_https",
   "local_scope_ownership",
+  "system_proxy_ownership",
 ] as const;
 
 const proofStates = ["not_run", "pending", "passed", "failed"] as const;
@@ -55,6 +60,9 @@ const publicErrorStages = [
   "prove_traffic",
   "engine_process",
   "stop_engine",
+  "system_proxy_publish",
+  "system_proxy_restore",
+  "system_proxy_ownership",
   "session_storage",
   "random",
   "monitor",
@@ -90,8 +98,8 @@ export interface RuntimeProofDto {
 export interface RuntimeStatusDto {
   revision: number;
   sessionId?: string;
-  scope: "local_only";
-  mode: "local_only";
+  scope: "local_only" | "system_proxy";
+  mode: "local_only" | "system_proxy";
   phase: RuntimePhaseDto;
   nodeId?: string;
   ports?: { http: number; socks: number; health: number };
@@ -239,8 +247,8 @@ export function parseRuntimeStatus(value: unknown): RuntimeStatusDto {
   const status: RuntimeStatusDto = {
     revision: finiteInteger(input.revision),
     sessionId: optionalIdentifier(input.sessionId, 256),
-    scope: member(input.scope, ["local_only"] as const),
-    mode: member(input.mode, ["local_only"] as const),
+    scope: member(input.scope, ["local_only", "system_proxy"] as const),
+    mode: member(input.mode, ["local_only", "system_proxy"] as const),
     phase: member(input.phase, runtimePhases),
     nodeId: optionalIdentifier(input.nodeId, 256),
     ports,
@@ -263,17 +271,28 @@ const readyProofKinds = [
   "local_scope_ownership",
 ] as const;
 
+const allProofKinds = [...readyProofKinds, "system_proxy_ownership"] as const;
+
 function validateRuntimeRelationships(status: RuntimeStatusDto): void {
+  if ((status.scope === "local_only") !== (status.mode === "local_only")) throw new ContractViolation();
+  const systemOnlyPhases: RuntimePhaseDto[] = [
+    "applying_system_proxy",
+    "system_proxy_ready",
+    "restoring_system_proxy",
+    "blocked_by_conflict",
+  ];
+  if (systemOnlyPhases.includes(status.phase) && status.scope !== "system_proxy") throw new ContractViolation();
   for (const proof of status.proofs) {
     if (proof.latencyMs !== undefined && proof.state !== "passed") throw new ContractViolation();
     if (proof.kind !== "selected_outbound_https" && proof.latencyMs !== undefined) throw new ContractViolation();
   }
 
   if (status.phase === "disconnected") {
+    if (status.scope !== "local_only" || status.mode !== "local_only") throw new ContractViolation();
     if (status.sessionId || status.nodeId || status.ports || status.routeCheckMs !== undefined || status.engineVersion || status.error) {
       throw new ContractViolation();
     }
-    if (status.proofs.length !== readyProofKinds.length || status.proofs.some((proof) => proof.state !== "not_run")) {
+    if (status.proofs.length !== allProofKinds.length || status.proofs.some((proof) => proof.state !== "not_run")) {
       throw new ContractViolation();
     }
   }
@@ -282,18 +301,72 @@ function validateRuntimeRelationships(status: RuntimeStatusDto): void {
     if (!status.sessionId || !status.nodeId || !status.ports || status.error || status.routeCheckMs === undefined) {
       throw new ContractViolation();
     }
-    if (status.proofs.length !== readyProofKinds.length) throw new ContractViolation();
+    if (status.scope !== "local_only" || status.mode !== "local_only" || status.proofs.length !== allProofKinds.length) {
+      throw new ContractViolation();
+    }
     for (const kind of readyProofKinds) {
       const proof = status.proofs.find((candidate) => candidate.kind === kind);
       if (!proof || proof.state !== "passed") throw new ContractViolation();
     }
     const outbound = status.proofs.find((proof) => proof.kind === "selected_outbound_https");
     if (outbound?.latencyMs === undefined || outbound.latencyMs !== status.routeCheckMs) throw new ContractViolation();
+    if (status.proofs.find((proof) => proof.kind === "system_proxy_ownership")?.state !== "not_run") {
+      throw new ContractViolation();
+    }
+  }
+
+  if (status.phase === "system_proxy_ready") {
+    if (status.scope !== "system_proxy" || status.mode !== "system_proxy" || !status.sessionId || !status.nodeId
+      || !status.ports || status.error || status.routeCheckMs === undefined || status.proofs.length !== allProofKinds.length) {
+      throw new ContractViolation();
+    }
+    for (const kind of allProofKinds) {
+      const proof = status.proofs.find((candidate) => candidate.kind === kind);
+      if (!proof || proof.state !== "passed") throw new ContractViolation();
+    }
+    const outbound = status.proofs.find((proof) => proof.kind === "selected_outbound_https");
+    if (outbound?.latencyMs === undefined || outbound.latencyMs !== status.routeCheckMs) throw new ContractViolation();
+  }
+
+  if (status.phase === "applying_system_proxy") {
+    if (!status.sessionId || !status.nodeId || !status.ports || status.error
+      || status.proofs.find((proof) => proof.kind === "system_proxy_ownership")?.state !== "pending") {
+      throw new ContractViolation();
+    }
+  }
+
+  if (status.phase === "restoring_system_proxy" && (!status.sessionId || !status.nodeId || !status.ports || status.error)) {
+    throw new ContractViolation();
+  }
+
+  if (status.phase === "blocked_by_conflict") {
+    if (!status.sessionId || !status.nodeId || !status.ports || status.error?.stage !== "system_proxy_ownership"
+      || status.proofs.find((proof) => proof.kind === "system_proxy_ownership")?.state !== "failed") {
+      throw new ContractViolation();
+    }
+  }
+
+  if (status.phase === "degraded" && (!status.sessionId || !status.nodeId || !status.ports || !status.error)) {
+    throw new ContractViolation();
+  }
+
+  if ((status.phase === "recovery_required" || status.phase === "disconnected_with_error") && !status.error) {
+    throw new ContractViolation();
   }
 }
 
 export function isVerifiedLocalReady(status: RuntimeStatusDto): boolean {
   if (status.phase !== "local_proxy_ready") return false;
+  try {
+    validateRuntimeRelationships(status);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function isVerifiedSystemProxyReady(status: RuntimeStatusDto): boolean {
+  if (status.phase !== "system_proxy_ready") return false;
   try {
     validateRuntimeRelationships(status);
     return true;

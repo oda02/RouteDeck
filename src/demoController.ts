@@ -121,7 +121,7 @@ const initialSnapshot: ControllerSnapshot = {
         id: "spotify",
         name: "Spotify",
         path: "C:\\Users\\User\\AppData\\Roaming\\Spotify\\Spotify.exe",
-        route: "inherit",
+        route: "direct",
       },
     ],
   },

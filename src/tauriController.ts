@@ -18,6 +18,7 @@ import {
   ContractViolation,
   RuntimeRevisionGate,
   isVerifiedLocalReady,
+  isVerifiedSystemProxyReady,
   parseConfirmedImport,
   parseDiagnostics,
   parseImportPreview,
@@ -33,6 +34,7 @@ import {
 } from "./tauriContract.ts";
 
 const RUNTIME_EVENT = "routedeck://runtime-phase";
+const ROUTING_STORAGE_KEY = "routedeck.routing.v1";
 
 export interface TauriTransport {
   invoke(command: string, arguments_?: Record<string, unknown>): Promise<unknown>;
@@ -56,7 +58,7 @@ const emptyProofs = (): ConnectionProof[] => [
   { id: "config", label: "Конфигурация", state: "idle", summary: "Не проверялась" },
   { id: "core", label: "Ядро", state: "idle", summary: "Не запущено" },
   { id: "local-ingress", label: "Локальный прокси", state: "idle", summary: "Не проверялся" },
-  { id: "windows-mode", label: "Режим Windows", state: "skipped", summary: "Не применён: доступен только локальный прокси" },
+  { id: "windows-mode", label: "Прокси Windows", state: "idle", summary: "Не включён" },
   { id: "outbound-proof", label: "VPN-маршрут", state: "idle", summary: "Не проверялся" },
   { id: "egress-ip", label: "VPN egress IP", state: "skipped", summary: "Backend пока не измеряет egress IP" },
 ];
@@ -70,9 +72,33 @@ const defaultSettings = (): SettingsConfig => ({
   theme: "dark",
 });
 
+function loadRouting(): RoutingConfig {
+  if (typeof window === "undefined") return { defaultRoute: "direct", apps: [] };
+  try {
+    const value: unknown = JSON.parse(window.localStorage.getItem(ROUTING_STORAGE_KEY) ?? "null");
+    if (!value || typeof value !== "object") return { defaultRoute: "direct", apps: [] };
+    const candidate = value as Partial<RoutingConfig>;
+    if ((candidate.defaultRoute !== "direct" && candidate.defaultRoute !== "vpn") || !Array.isArray(candidate.apps)) {
+      return { defaultRoute: "direct", apps: [] };
+    }
+    const apps = candidate.apps.filter((app): app is RoutingConfig["apps"][number] => Boolean(
+      app && typeof app.id === "string" && app.id.length > 0 && app.id.length <= 256
+      && typeof app.name === "string" && app.name.length > 0 && app.name.length <= 260
+      && typeof app.path === "string" && app.path.length > 0 && app.path.length <= 4096
+      && (app.route === "direct" || app.route === "vpn"),
+    ));
+    if (apps.length !== candidate.apps.length || apps.length > 256 || new Set(apps.map((app) => app.id)).size !== apps.length) {
+      return { defaultRoute: "direct", apps: [] };
+    }
+    return { defaultRoute: candidate.defaultRoute, apps };
+  } catch {
+    return { defaultRoute: "direct", apps: [] };
+  }
+}
+
 const initialTauriSnapshot = (): ControllerSnapshot => ({
   isDemo: false,
-  runtimeScope: "local-only",
+  runtimeScope: "system-proxy",
   backendAvailable: true,
   phase: "disconnected",
   mode: "proxy",
@@ -85,7 +111,7 @@ const initialTauriSnapshot = (): ControllerSnapshot => ({
     title: "Проверяем backend RouteDeck",
     body: "Подключаемся к локальному контроллеру и сверяем его состояние.",
   },
-  routing: { defaultRoute: "direct", apps: [] },
+  routing: loadRouting(),
   settings: defaultSettings(),
   environment: {
     otherVpnDetected: false,
@@ -116,14 +142,20 @@ export function runtimePhaseToConnectionPhase(phase: RuntimePhaseDto): Connectio
       return "verifying-outbound";
     case "outbound_verified":
       return "verifying-outbound";
+    case "applying_system_proxy":
+      return "applying-windows-mode";
     case "local_proxy_ready":
-    case "degraded":
-      // The backend has proved only its explicit local proxy. It has not applied
-      // or proved Windows System Proxy/TUN, so global Connected is forbidden.
       return "degraded";
+    case "system_proxy_ready":
+      return "connected";
+    case "degraded":
+      return "degraded";
+    case "restoring_system_proxy":
     case "rolling_back":
     case "stopping_core":
       return "disconnecting";
+    case "blocked_by_conflict":
+      return "blocked-by-conflict";
     case "disconnected_with_error":
     case "recovery_required":
       return "failed";
@@ -194,8 +226,8 @@ function projectIngressProof(status: RuntimeStatusDto): ConnectionProof {
 }
 
 export function projectRuntimeProofs(status: RuntimeStatusDto): ConnectionProof[] {
-  const config = projectSingleProof(status, "engine_config", "config", "Конфигурация", "sing-box принял конфигурацию");
-  const core = projectSingleProof(status, "engine_process", "core", "Ядро", "Процесс sing-box запущен", status.engineVersion);
+  const config = projectSingleProof(status, "engine_config", "config", "Конфигурация", "Ядро приняло конфигурацию");
+  const core = projectSingleProof(status, "engine_process", "core", "Ядро", "Прокси-ядро запущено", status.engineVersion);
   const ingress = projectIngressProof(status);
   const outbound = projectSingleProof(
     status,
@@ -205,16 +237,19 @@ export function projectRuntimeProofs(status: RuntimeStatusDto): ConnectionProof[
     "HTTPS через выбранный outbound подтверждён",
     status.routeCheckMs === undefined ? undefined : `${status.routeCheckMs} мс`,
   );
+  const windowsProxy = projectSingleProof(
+    status,
+    "system_proxy_ownership",
+    "windows-mode",
+    "Прокси Windows",
+    "Системный прокси включён",
+    status.scope === "system_proxy" && status.ports ? `127.0.0.1:${status.ports.http}` : undefined,
+  );
   return [
     config,
     core,
     ingress,
-    {
-      id: "windows-mode",
-      label: "Режим Windows",
-      state: "skipped",
-      summary: "Не применён: backend работает только локально",
-    },
+    windowsProxy,
     outbound,
     {
       id: "egress-ip",
@@ -226,6 +261,7 @@ export function projectRuntimeProofs(status: RuntimeStatusDto): ConnectionProof[
 }
 
 function runtimeNotice(status: RuntimeStatusDto): AppNotice | undefined {
+  if (isVerifiedSystemProxyReady(status)) return undefined;
   if (isVerifiedLocalReady(status)) {
     const endpoint = status.ports ? `127.0.0.1:${status.ports.http}` : "локальном порту";
     return {
@@ -236,21 +272,44 @@ function runtimeNotice(status: RuntimeStatusDto): AppNotice | undefined {
       redactedDetail: "Это локальная проверка outbound, а не подтверждение системной маршрутизации.",
     };
   }
+  if (status.phase === "blocked_by_conflict" || status.error?.stage === "system_proxy_ownership") {
+    return {
+      id: "system-proxy-conflict",
+      kind: "error",
+      title: "Прокси Windows изменён другой программой",
+      body: "RouteDeck сохранил её настройки. Остановите другой VPN или прокси, затем отключите RouteDeck и подключитесь снова.",
+    };
+  }
   if (status.phase === "recovery_required") {
+    if (status.error?.stage === "system_proxy_restore" && status.ports) {
+      return {
+        id: "system-proxy-recovery-required",
+        kind: "error",
+        title: "Не удалось вернуть настройки прокси Windows",
+        body: "Локальный прокси пока остаётся запущенным. Устраните конфликт с другой VPN-программой и нажмите «Повторить».",
+      };
+    }
+    if (status.error?.stage === "session_recovery") {
+      return {
+        id: "session-recovery-required",
+        kind: "error",
+        title: "Осталась незавершённая сессия",
+        body: "RouteDeck не запускает новое подключение, пока состояние предыдущей сессии не будет восстановлено. Нажмите «Повторить».",
+      };
+    }
     return {
       id: "session-recovery-required",
       kind: "error",
-      title: "Нужно проверить сохранённую сессию",
-      body: "Backend обнаружил незавершённое локальное состояние и безопасно заблокировал новый запуск.",
-      redactedDetail: "Технические пути и содержимое конфигурации скрыты.",
+      title: "Не удалось завершить предыдущую операцию",
+      body: "RouteDeck сохранил текущее состояние для повторной попытки. Нажмите «Повторить» или откройте диагностику.",
     };
   }
   if (status.error) {
     return {
       id: `runtime-${status.error.code}`,
       kind: "error",
-      title: "Локальный прокси требует внимания",
-      body: "Backend остановил или ограничил сессию. Секретные технические сведения скрыты; откройте безопасную диагностику.",
+      title: "Подключение требует внимания",
+      body: "RouteDeck не смог завершить операцию. Повторите попытку или откройте диагностику.",
     };
   }
   return undefined;
@@ -357,6 +416,11 @@ export class TauriController implements RouteDeckController {
     this.runtime = status;
     this.publish({
       backendAvailable: true,
+      runtimeScope: status.scope === "system_proxy"
+        ? "system-proxy"
+        : status.phase === "disconnected"
+          ? "system-proxy"
+          : "local-only",
       phase: runtimePhaseToConnectionPhase(status.phase),
       proofs: projectRuntimeProofs(status),
       notice: runtimeNotice(status),
@@ -437,13 +501,24 @@ export class TauriController implements RouteDeckController {
     await this.requireTransport();
     if (this.snapshot.mode === "tun") throw new RouteDeckError("capability-unavailable");
     if (!this.snapshot.selectedServerId) throw new RouteDeckError("node-not-selected");
-    await this.invokeStatus("start_local_proxy", {
+    await this.invokeStatus("start_system_proxy", {
       nodeId: this.snapshot.selectedServerId,
-      defaultRoute: this.snapshot.routing.defaultRoute,
+      routing: {
+        defaultRoute: this.snapshot.routing.defaultRoute,
+        apps: this.snapshot.routing.apps
+          .filter((app) => app.route !== "inherit")
+          .map((app) => ({
+            processPath: app.path,
+            processName: app.path.split(/[\\/]/).at(-1) || undefined,
+            route: app.route,
+          })),
+      },
     });
   };
 
-  disconnect = async (): Promise<void> => this.invokeStatus("stop_local_proxy");
+  disconnect = async (): Promise<void> => this.invokeStatus(
+    this.runtime?.mode === "local_only" ? "stop_local_proxy" : "stop_system_proxy",
+  );
 
   retry = async (): Promise<void> => {
     if (this.runtime?.phase === "recovery_required") {
@@ -592,8 +667,18 @@ export class TauriController implements RouteDeckController {
     }
   };
 
-  applyRouting = async (_routing: RoutingConfig): Promise<void> => {
-    throw new RouteDeckError("capability-unavailable");
+  applyRouting = async (routing: RoutingConfig): Promise<void> => {
+    if (this.snapshot.phase !== "disconnected" && this.snapshot.phase !== "failed") {
+      throw new RouteDeckError("runtime-failure");
+    }
+    if (routing.apps.some((app) => !app.path.trim())) throw new RouteDeckError("runtime-failure");
+    const saved = structuredClone(routing);
+    try {
+      if (typeof window !== "undefined") window.localStorage.setItem(ROUTING_STORAGE_KEY, JSON.stringify(saved));
+    } catch {
+      throw new RouteDeckError("runtime-failure");
+    }
+    this.publish({ routing: saved });
   };
 
   saveSettings = async (_settings: SettingsConfig): Promise<void> => {
@@ -634,6 +719,7 @@ export class TauriController implements RouteDeckController {
   resetLocalState = async (): Promise<void> => {
     if (this.runtime && this.runtime.phase !== "disconnected") await this.disconnect();
     this.cancelImportPreview();
+    if (typeof window !== "undefined") window.localStorage.removeItem(ROUTING_STORAGE_KEY);
     this.publish({
       phase: "disconnected",
       selectedServerId: "",
@@ -652,7 +738,7 @@ export class TauriController implements RouteDeckController {
     return [
       "RouteDeck diagnostic report (sanitized)",
       `phase=${this.snapshot.phase}`,
-      "runtimeScope=local_only",
+      `runtimeScope=${this.snapshot.runtimeScope}`,
       `serverProtocol=${selected?.protocol ?? "unknown"}`,
       ...this.snapshot.diagnostics.sanitizedLog,
     ].join("\n");
