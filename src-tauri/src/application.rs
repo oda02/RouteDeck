@@ -1,16 +1,20 @@
 use std::{
     collections::HashMap,
+    fmt,
     path::PathBuf,
     sync::{Arc, Mutex, Weak},
     thread,
     time::{Duration, Instant},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{generate_config, CaptureMode, ConfigRequest},
-    domain::{DefaultRoute, DnsPolicy, Ipv6Policy, LanPolicy, Node, ProtocolKind, RoutePolicy},
+    domain::{
+        AppRoute, AppRouteAction, DefaultRoute, DnsPolicy, Ipv6Policy, LanPolicy, Node,
+        ProtocolKind, RoutePolicy,
+    },
     engine_runtime::{
         random_hex, reconcile_stale_sessions, DiagnosticBuffer, EngineLauncher, ManagedChild,
         PortReservations, RuntimeError, SessionConfig, VerifiedEngineLauncher,
@@ -24,6 +28,7 @@ use crate::{
         HttpsSubscriptionFetcher, SubscriptionFetchError, SubscriptionFetchErrorKind,
         SubscriptionFetchStage, SubscriptionFetcher,
     },
+    system_proxy::{SystemProxyControl, SystemProxyManager, SystemProxyRestoreOutcome},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -36,7 +41,11 @@ pub enum RuntimePhase {
     VerifyingListener,
     ProvingTraffic,
     OutboundVerified,
+    ApplyingSystemProxy,
     LocalProxyReady,
+    SystemProxyReady,
+    RestoringSystemProxy,
+    BlockedByConflict,
     Degraded,
     RollingBack,
     StoppingCore,
@@ -48,12 +57,14 @@ pub enum RuntimePhase {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeScope {
     LocalOnly,
+    SystemProxy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeMode {
     LocalOnly,
+    SystemProxy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -66,6 +77,7 @@ pub enum ProofKind {
     HealthListener,
     SelectedOutboundHttps,
     LocalScopeOwnership,
+    SystemProxyOwnership,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -166,6 +178,9 @@ pub enum PublicErrorStage {
     ProveTraffic,
     EngineProcess,
     StopEngine,
+    SystemProxyPublish,
+    SystemProxyRestore,
+    SystemProxyOwnership,
     SessionStorage,
     Random,
     Monitor,
@@ -220,6 +235,53 @@ pub struct Diagnostics {
     pub lines: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SystemProxyRouting {
+    pub default_route: DefaultRoute,
+    #[serde(default)]
+    pub apps: Vec<SystemProxyAppRoute>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SystemProxyAppRoute {
+    pub process_path: String,
+    pub process_name: Option<String>,
+    pub route: AppRouteAction,
+}
+
+impl fmt::Debug for SystemProxyAppRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SystemProxyAppRoute")
+            .field("process_path", &"[REDACTED]")
+            .field("process_name", &self.process_name)
+            .field("route", &self.route)
+            .finish()
+    }
+}
+
+impl SystemProxyRouting {
+    fn into_policy(self) -> RoutePolicy {
+        RoutePolicy {
+            default: self.default_route,
+            apps: self
+                .apps
+                .into_iter()
+                .map(|app| AppRoute {
+                    process_path: app.process_path,
+                    process_name: app.process_name,
+                    action: app.route,
+                })
+                .collect(),
+            lan: LanPolicy::Direct,
+            ipv6: Ipv6Policy::Enabled,
+            dns: DnsPolicy::CurrentNetwork,
+        }
+    }
+}
+
 pub(crate) trait EngineProvider: Send + Sync {
     fn create(&self) -> Result<Box<dyn EngineLauncher>, RuntimeError>;
 }
@@ -237,6 +299,7 @@ struct RuntimeServices {
     listener: Arc<dyn ListenerVerifier>,
     prober: Arc<dyn TrafficProber>,
     subscription_fetcher: Arc<dyn SubscriptionFetcher>,
+    system_proxy: Arc<dyn SystemProxyControl>,
 }
 
 struct PendingImport {
@@ -314,7 +377,10 @@ struct ActiveSession {
     node_id: String,
     config_identity: String,
     session_id: String,
+    mode: RuntimeMode,
     default_route: DefaultRoute,
+    routing: RoutePolicy,
+    system_proxy_requires_restore: bool,
     ports: crate::config::LocalPorts,
     health_route: HealthRoute,
     engine_version: String,
@@ -351,16 +417,41 @@ impl ApplicationController {
         session_root: PathBuf,
         event_sink: EventSink,
     ) -> Result<Arc<Self>, RuntimeError> {
-        let recovery_error = reconcile_stale_sessions(&session_root).err();
-        let controller = Arc::new(Self::with_services(
+        let proxy_root = session_root
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| session_root.clone());
+        let system_proxy: Arc<dyn SystemProxyControl> =
+            Arc::new(SystemProxyManager::new(proxy_root));
+        Self::production_with_system_proxy(session_root, event_sink, system_proxy)
+    }
+
+    fn production_with_system_proxy(
+        session_root: PathBuf,
+        event_sink: EventSink,
+        system_proxy: Arc<dyn SystemProxyControl>,
+    ) -> Result<Arc<Self>, RuntimeError> {
+        let engine_recovery_error = reconcile_stale_sessions(&session_root).err();
+        let proxy_recovery_error = system_proxy.reconcile_stale_journal().err();
+        let controller = Arc::new(Self::with_services_and_controls(
             session_root,
             event_sink,
             Arc::new(FixedEngineProvider),
             Arc::new(TcpListenerVerifier),
             Arc::new(HttpsTrafficProber),
+            Arc::new(HttpsSubscriptionFetcher),
+            system_proxy,
         ));
-        if let Some(error) = recovery_error {
-            let public = public_runtime_error(error, &Redactor::default());
+        if engine_recovery_error.is_some() || proxy_recovery_error.is_some() {
+            let public = if let Some(error) = engine_recovery_error {
+                public_runtime_error(error, &Redactor::default())
+            } else {
+                PublicError::fixed(
+                    PublicErrorCode::RecoveryRequired,
+                    PublicErrorStage::SystemProxyRestore,
+                    "Windows System Proxy recovery requires attention",
+                )
+            };
             let mut state = controller.lock_state();
             state.recovery_required = true;
             controller.update_status(
@@ -389,6 +480,7 @@ impl ApplicationController {
             .map_err(|error| RuntimeError::new("monitor", error.to_string()))
     }
 
+    #[cfg(test)]
     fn with_services(
         session_root: PathBuf,
         event_sink: EventSink,
@@ -396,6 +488,10 @@ impl ApplicationController {
         listener: Arc<dyn ListenerVerifier>,
         prober: Arc<dyn TrafficProber>,
     ) -> Self {
+        let proxy_root = session_root
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| session_root.clone());
         Self::with_services_and_fetcher(
             session_root,
             event_sink,
@@ -403,9 +499,11 @@ impl ApplicationController {
             listener,
             prober,
             Arc::new(HttpsSubscriptionFetcher),
+            Arc::new(SystemProxyManager::new(proxy_root)),
         )
     }
 
+    #[cfg(test)]
     fn with_services_and_fetcher(
         session_root: PathBuf,
         event_sink: EventSink,
@@ -413,6 +511,27 @@ impl ApplicationController {
         listener: Arc<dyn ListenerVerifier>,
         prober: Arc<dyn TrafficProber>,
         subscription_fetcher: Arc<dyn SubscriptionFetcher>,
+        system_proxy: Arc<dyn SystemProxyControl>,
+    ) -> Self {
+        Self::with_services_and_controls(
+            session_root,
+            event_sink,
+            engine,
+            listener,
+            prober,
+            subscription_fetcher,
+            system_proxy,
+        )
+    }
+
+    fn with_services_and_controls(
+        session_root: PathBuf,
+        event_sink: EventSink,
+        engine: Arc<dyn EngineProvider>,
+        listener: Arc<dyn ListenerVerifier>,
+        prober: Arc<dyn TrafficProber>,
+        subscription_fetcher: Arc<dyn SubscriptionFetcher>,
+        system_proxy: Arc<dyn SystemProxyControl>,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(State::default())),
@@ -422,6 +541,7 @@ impl ApplicationController {
                 listener,
                 prober,
                 subscription_fetcher,
+                system_proxy,
             },
             session_root,
             diagnostics: Arc::new(Mutex::new(DiagnosticBuffer::default())),
@@ -601,7 +721,8 @@ impl ApplicationController {
         })?;
         if state.active.is_some() {
             let exact = state.active.as_ref().is_some_and(|active| {
-                active.node_id == node_id
+                active.mode == RuntimeMode::LocalOnly
+                    && active.node_id == node_id
                     && active.default_route == effective_route
                     && active.config_identity == stored.config_identity
             });
@@ -630,7 +751,8 @@ impl ApplicationController {
             state = self.lock_state();
             if let Some(Ok(proof)) = validation {
                 if !state.active.as_ref().is_some_and(|active| {
-                    active.node_id == node_id
+                    active.mode == RuntimeMode::LocalOnly
+                        && active.node_id == node_id
                         && active.default_route == effective_route
                         && active.config_identity == stored.config_identity
                 }) {
@@ -737,12 +859,20 @@ impl ApplicationController {
         let node = stored.node;
         let config_identity = stored.config_identity;
         let redactor = Redactor::from_nodes(std::slice::from_ref(&node)).with_secret(node.server());
+        let policy = RoutePolicy {
+            default: DefaultRoute::Vpn,
+            apps: Vec::new(),
+            lan: LanPolicy::FollowDefault,
+            ipv6: Ipv6Policy::Enabled,
+            dns: DnsPolicy::CurrentNetwork,
+        };
 
         let result = self.start_locked(
             &mut state,
             &node,
             config_identity,
-            effective_route,
+            policy,
+            RuntimeMode::LocalOnly,
             redactor.clone(),
         );
         if let Err(error) = result {
@@ -812,15 +942,243 @@ impl ApplicationController {
         Ok(state.status.clone())
     }
 
+    pub fn start_system_proxy(
+        &self,
+        node_id: &str,
+        routing: SystemProxyRouting,
+    ) -> Result<RuntimeStatus, PublicError> {
+        let policy = routing.into_policy();
+        policy.validate().map_err(|_| {
+            PublicError::fixed(
+                PublicErrorCode::RuntimeFailure,
+                PublicErrorStage::Start,
+                "Application routing rules are invalid",
+            )
+        })?;
+        let _operation = self
+            .operation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.lock_state();
+        if state.shutting_down {
+            return Err(PublicError::fixed(
+                PublicErrorCode::RuntimeFailure,
+                PublicErrorStage::Start,
+                "Application shutdown is in progress",
+            ));
+        }
+        if state.recovery_required {
+            return Err(PublicError::fixed(
+                PublicErrorCode::RecoveryRequired,
+                PublicErrorStage::SessionRecovery,
+                "Review preserved recovery data before reconnecting",
+            ));
+        }
+        if state.active.is_some() {
+            let exact = state.active.as_ref().is_some_and(|active| {
+                active.mode == RuntimeMode::SystemProxy
+                    && active.node_id == node_id
+                    && active.routing == policy
+                    && state
+                        .nodes
+                        .get(node_id)
+                        .is_some_and(|stored| active.config_identity == stored.config_identity)
+            });
+            if !exact {
+                return Err(PublicError::fixed(
+                    PublicErrorCode::ActiveSessionConflict,
+                    PublicErrorStage::Start,
+                    "Stop the active connection before changing System Proxy routing",
+                ));
+            }
+            let route = {
+                let active = state.active.as_mut().expect("active session disappeared");
+                active
+                    .child
+                    .is_alive()
+                    .unwrap_or(false)
+                    .then(|| active.health_route.clone())
+            };
+            drop(state);
+            let proof = route.and_then(|route| self.services.prober.prove(&route).ok());
+            state = self.lock_state();
+            let still_exact = state.active.as_ref().is_some_and(|active| {
+                active.mode == RuntimeMode::SystemProxy
+                    && active.node_id == node_id
+                    && active.routing == policy
+            });
+            if !still_exact {
+                return Err(PublicError::fixed(
+                    PublicErrorCode::SessionChanged,
+                    PublicErrorStage::Start,
+                    "Active session changed while traffic was being verified",
+                ));
+            }
+            let listener_owned = state.active.as_mut().is_some_and(|active| {
+                active.child.is_alive().unwrap_or(false)
+                    && self
+                        .services
+                        .listener
+                        .verify_owned_now(active.ports, active.child.as_mut())
+                        .is_ok()
+            });
+            let proxy_owned = self.services.system_proxy.is_owned().unwrap_or(false);
+            if let Some(proof) = proof.filter(|_| listener_owned && proxy_owned) {
+                state.status.route_check_ms = Some(proof.latency_ms);
+                Self::set_proof(
+                    &mut state,
+                    ProofKind::SelectedOutboundHttps,
+                    ProofState::Passed,
+                    Some(proof.latency_ms),
+                );
+                Self::set_proof(
+                    &mut state,
+                    ProofKind::LocalScopeOwnership,
+                    ProofState::Passed,
+                    None,
+                );
+                Self::set_proof(
+                    &mut state,
+                    ProofKind::SystemProxyOwnership,
+                    ProofState::Passed,
+                    None,
+                );
+                self.update_status(
+                    &mut state,
+                    RuntimePhase::SystemProxyReady,
+                    Some(node_id.to_owned()),
+                    None,
+                );
+                return Ok(state.status.clone());
+            }
+            let public = PublicError::fixed(
+                PublicErrorCode::RuntimeFailure,
+                if proxy_owned {
+                    PublicErrorStage::ProveTraffic
+                } else {
+                    PublicErrorStage::SystemProxyOwnership
+                },
+                "The active System Proxy connection could not be verified",
+            );
+            self.update_status(
+                &mut state,
+                if proxy_owned {
+                    RuntimePhase::Degraded
+                } else {
+                    RuntimePhase::BlockedByConflict
+                },
+                Some(node_id.to_owned()),
+                Some(public.clone()),
+            );
+            return Err(public);
+        }
+        let stored = state.nodes.get(node_id).cloned().ok_or_else(|| {
+            PublicError::fixed(
+                PublicErrorCode::NodeNotFound,
+                PublicErrorStage::Start,
+                "Selected node does not exist in the confirmed import",
+            )
+        })?;
+        let node = stored.node;
+        let redactor = Redactor::from_nodes(std::slice::from_ref(&node)).with_secret(node.server());
+        let result = self.start_locked(
+            &mut state,
+            &node,
+            stored.config_identity,
+            policy,
+            RuntimeMode::SystemProxy,
+            redactor.clone(),
+        );
+        let Err(error) = result else {
+            return Ok(state.status.clone());
+        };
+
+        let proxy_may_be_published = state.status.phase == RuntimePhase::ApplyingSystemProxy;
+        Self::mark_failed_proof(&mut state, error.stage());
+        self.update_status(
+            &mut state,
+            RuntimePhase::RollingBack,
+            Some(node_id.to_owned()),
+            None,
+        );
+        if proxy_may_be_published {
+            match self.services.system_proxy.restore_if_owned() {
+                Ok(SystemProxyRestoreOutcome::Restored)
+                | Ok(SystemProxyRestoreOutcome::ForeignPreserved) => {
+                    if let Some(active) = state.active.as_mut() {
+                        active.system_proxy_requires_restore = false;
+                    }
+                }
+                Ok(SystemProxyRestoreOutcome::NoJournal) | Err(_) => {
+                    state.recovery_required = true;
+                    let public = PublicError::fixed(
+                        PublicErrorCode::RecoveryRequired,
+                        PublicErrorStage::SystemProxyRestore,
+                        "Windows System Proxy could not be restored after startup failed",
+                    );
+                    self.update_status(
+                        &mut state,
+                        RuntimePhase::RecoveryRequired,
+                        Some(node_id.to_owned()),
+                        Some(public.clone()),
+                    );
+                    return Err(public);
+                }
+            }
+        }
+        if let Some(stop_error) = state
+            .active
+            .as_mut()
+            .and_then(|active| active.child.stop().err())
+        {
+            let public = public_runtime_error(stop_error, &redactor);
+            state.recovery_required = true;
+            self.update_status(
+                &mut state,
+                RuntimePhase::RecoveryRequired,
+                Some(node_id.to_owned()),
+                Some(public.clone()),
+            );
+            return Err(public);
+        }
+        let failed = state.active.take();
+        Self::clear_active_metadata(&mut state);
+        drop(failed);
+        let public = public_runtime_error(error, &redactor);
+        if reconcile_stale_sessions(&self.session_root).is_err() {
+            state.recovery_required = true;
+            self.update_status(
+                &mut state,
+                RuntimePhase::RecoveryRequired,
+                Some(node_id.to_owned()),
+                Some(public.clone()),
+            );
+        } else {
+            self.update_status(
+                &mut state,
+                RuntimePhase::DisconnectedWithError,
+                Some(node_id.to_owned()),
+                Some(public.clone()),
+            );
+        }
+        Err(public)
+    }
+
     fn start_locked(
         &self,
         state: &mut State,
         node: &Node,
         config_identity: String,
-        default_route: DefaultRoute,
+        policy: RoutePolicy,
+        mode: RuntimeMode,
         redactor: Redactor,
     ) -> Result<(), RuntimeError> {
         let session_id = random_hex(16)?;
+        state.status.scope = match mode {
+            RuntimeMode::LocalOnly => RuntimeScope::LocalOnly,
+            RuntimeMode::SystemProxy => RuntimeScope::SystemProxy,
+        };
+        state.status.mode = mode;
         state.status.session_id = Some(session_id.clone());
         state.status.proofs = default_proofs();
         self.update_status(
@@ -832,17 +1190,14 @@ impl ApplicationController {
         let reservations = PortReservations::reserve()?;
         let ports = reservations.ports();
         let password = random_hex(24)?;
-        let policy = RoutePolicy {
-            default: DefaultRoute::Vpn,
-            apps: Vec::new(),
-            lan: LanPolicy::FollowDefault,
-            ipv6: Ipv6Policy::Enabled,
-            dns: DnsPolicy::CurrentNetwork,
+        let capture_mode = match mode {
+            RuntimeMode::LocalOnly => CaptureMode::LocalProxy,
+            RuntimeMode::SystemProxy => CaptureMode::SystemProxy,
         };
         let generated = generate_config(ConfigRequest {
             node,
             policy: &policy,
-            mode: CaptureMode::LocalProxy,
+            mode: capture_mode,
             ports,
             health_password: password.clone(),
             vpn_dns: None,
@@ -881,7 +1236,10 @@ impl ApplicationController {
             node_id: node.id().to_owned(),
             config_identity,
             session_id,
-            default_route,
+            mode,
+            default_route: policy.default,
+            routing: policy,
+            system_proxy_requires_restore: false,
             ports,
             health_route: health_route.clone(),
             engine_version: engine_version.clone(),
@@ -932,11 +1290,15 @@ impl ApplicationController {
             Some(node.id().to_owned()),
             None,
         );
-        // The private authenticated health inbound must work first. The public proof row below
-        // is only passed after an ordinary request traverses the same selected outbound via the
-        // user-facing loopback HTTP inbound.
-        self.services.prober.prove(&health_route)?;
-        let proof = self.services.prober.prove_ordinary(ports.http)?;
+        // The authenticated health inbound is always forced through `selected`. In local-only
+        // mode the ordinary listener is also forced through it; System Proxy may intentionally
+        // default ordinary traffic to Direct, so its selected proof must remain private.
+        let health_proof = self.services.prober.prove(&health_route)?;
+        let proof = if mode == RuntimeMode::LocalOnly {
+            self.services.prober.prove_ordinary(ports.http)?
+        } else {
+            health_proof
+        };
         Self::set_proof(
             state,
             ProofKind::SelectedOutboundHttps,
@@ -975,12 +1337,59 @@ impl ApplicationController {
             Some(node.id().to_owned()),
             None,
         );
-        self.update_status(
-            state,
-            RuntimePhase::LocalProxyReady,
-            Some(node.id().to_owned()),
-            None,
-        );
+        if mode == RuntimeMode::SystemProxy {
+            Self::set_proof(
+                state,
+                ProofKind::SystemProxyOwnership,
+                ProofState::Pending,
+                None,
+            );
+            self.update_status(
+                state,
+                RuntimePhase::ApplyingSystemProxy,
+                Some(node.id().to_owned()),
+                None,
+            );
+            state
+                .active
+                .as_mut()
+                .expect("active session disappeared")
+                .system_proxy_requires_restore = true;
+            self.services
+                .system_proxy
+                .publish_loopback(ports.http)
+                .map_err(|error| RuntimeError::new("system_proxy_publish", error.to_string()))?;
+            if !self
+                .services
+                .system_proxy
+                .is_owned()
+                .map_err(|error| RuntimeError::new("system_proxy_ownership", error.to_string()))?
+            {
+                return Err(RuntimeError::new(
+                    "system_proxy_ownership",
+                    "Windows System Proxy changed before readiness could be confirmed",
+                ));
+            }
+            Self::set_proof(
+                state,
+                ProofKind::SystemProxyOwnership,
+                ProofState::Passed,
+                None,
+            );
+            self.update_status(
+                state,
+                RuntimePhase::SystemProxyReady,
+                Some(node.id().to_owned()),
+                None,
+            );
+        } else {
+            self.update_status(
+                state,
+                RuntimePhase::LocalProxyReady,
+                Some(node.id().to_owned()),
+                None,
+            );
+        }
         Ok(())
     }
 
@@ -998,6 +1407,67 @@ impl ApplicationController {
             return Ok(state.status.clone());
         }
         let node_id = state.status.node_id.clone();
+        let system_proxy_requires_restore = state
+            .active
+            .as_ref()
+            .is_some_and(|active| active.system_proxy_requires_restore);
+        let mut proxy_conflict = None;
+        if system_proxy_requires_restore {
+            self.update_status(
+                &mut state,
+                RuntimePhase::RestoringSystemProxy,
+                node_id.clone(),
+                None,
+            );
+            match self.services.system_proxy.restore_if_owned() {
+                Ok(SystemProxyRestoreOutcome::Restored) => {
+                    state
+                        .active
+                        .as_mut()
+                        .expect("active session disappeared")
+                        .system_proxy_requires_restore = false;
+                    Self::set_proof(
+                        &mut state,
+                        ProofKind::SystemProxyOwnership,
+                        ProofState::Passed,
+                        None,
+                    );
+                }
+                Ok(SystemProxyRestoreOutcome::ForeignPreserved) => {
+                    state
+                        .active
+                        .as_mut()
+                        .expect("active session disappeared")
+                        .system_proxy_requires_restore = false;
+                    Self::set_proof(
+                        &mut state,
+                        ProofKind::SystemProxyOwnership,
+                        ProofState::Failed,
+                        None,
+                    );
+                    proxy_conflict = Some(PublicError::fixed(
+                        PublicErrorCode::RuntimeFailure,
+                        PublicErrorStage::SystemProxyOwnership,
+                        "Windows System Proxy was changed by another application and was preserved",
+                    ));
+                }
+                Ok(SystemProxyRestoreOutcome::NoJournal) | Err(_) => {
+                    state.recovery_required = true;
+                    let public = PublicError::fixed(
+                        PublicErrorCode::RecoveryRequired,
+                        PublicErrorStage::SystemProxyRestore,
+                        "Windows System Proxy ownership could not be restored safely",
+                    );
+                    self.update_status(
+                        &mut state,
+                        RuntimePhase::RecoveryRequired,
+                        node_id,
+                        Some(public.clone()),
+                    );
+                    return Err(public);
+                }
+            }
+        }
         self.update_status(
             &mut state,
             RuntimePhase::StoppingCore,
@@ -1044,6 +1514,16 @@ impl ApplicationController {
             );
             return Err(public);
         }
+        if let Some(public) = proxy_conflict {
+            state.status.session_id = None;
+            self.update_status(
+                &mut state,
+                RuntimePhase::DisconnectedWithError,
+                node_id,
+                Some(public.clone()),
+            );
+            return Err(public);
+        }
         self.reset_disconnected(&mut state);
         Ok(state.status.clone())
     }
@@ -1061,6 +1541,27 @@ impl ApplicationController {
         }
         if let Err(error) = reconcile_stale_sessions(&self.session_root) {
             let public = public_runtime_error(error, &Redactor::default());
+            let mut state = self.lock_state();
+            state.recovery_required = true;
+            self.update_status(
+                &mut state,
+                RuntimePhase::RecoveryRequired,
+                None,
+                Some(public.clone()),
+            );
+            return Err(public);
+        }
+        if self
+            .services
+            .system_proxy
+            .reconcile_stale_journal()
+            .is_err()
+        {
+            let public = PublicError::fixed(
+                PublicErrorCode::RecoveryRequired,
+                PublicErrorStage::SystemProxyRestore,
+                "Windows System Proxy recovery still requires attention",
+            );
             let mut state = self.lock_state();
             state.recovery_required = true;
             self.update_status(
@@ -1092,32 +1593,38 @@ impl ApplicationController {
         }
     }
 
-    pub fn shutdown(&self) {
+    pub fn shutdown(&self) -> bool {
         {
             let mut state = self.lock_state();
             if state.shutting_down {
-                return;
+                return state.active.is_none();
             }
             state.shutting_down = true;
         }
         let _ = self.stop();
-        let abandoned = {
+        let safe_to_exit = {
             let mut state = self.lock_state();
-            let active = state.active.take();
-            Self::clear_active_metadata(&mut state);
-            active
+            let safe = state.active.is_none();
+            if !safe {
+                // Let a later ExitRequested event retry the restore-before-stop sequence.
+                state.shutting_down = false;
+            }
+            safe
         };
-        drop(abandoned);
-        self.event_sink
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+        if safe_to_exit {
+            self.event_sink
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+        }
+        safe_to_exit
     }
 
     fn monitor_tick(&self) {
         struct ProbeSnapshot {
             generation: String,
             session_id: String,
+            mode: RuntimeMode,
             route: HealthRoute,
             http_port: u16,
             redactor: Redactor,
@@ -1142,6 +1649,12 @@ impl ApplicationController {
         };
         if let Some(error) = process_error {
             let node_id = active.node_id.clone();
+            let mode = active.mode;
+            let proxy_recovery_failed = mode == RuntimeMode::SystemProxy
+                && matches!(
+                    self.services.system_proxy.restore_if_owned(),
+                    Ok(SystemProxyRestoreOutcome::NoJournal) | Err(_)
+                );
             let stale = state.active.take();
             Self::set_proof(
                 &mut state,
@@ -1151,7 +1664,7 @@ impl ApplicationController {
             );
             Self::clear_active_metadata(&mut state);
             drop(stale);
-            if reconcile_stale_sessions(&self.session_root).is_err() {
+            if proxy_recovery_failed || reconcile_stale_sessions(&self.session_root).is_err() {
                 state.recovery_required = true;
                 self.update_status(
                     &mut state,
@@ -1173,6 +1686,51 @@ impl ApplicationController {
             }
             return;
         }
+        if active.mode == RuntimeMode::SystemProxy {
+            match self.services.system_proxy.is_owned() {
+                Ok(true) => {}
+                Ok(false) => {
+                    let node_id = active.node_id.clone();
+                    Self::set_proof(
+                        &mut state,
+                        ProofKind::SystemProxyOwnership,
+                        ProofState::Failed,
+                        None,
+                    );
+                    self.update_status(
+                        &mut state,
+                        RuntimePhase::BlockedByConflict,
+                        Some(node_id),
+                        Some(PublicError::fixed(
+                            PublicErrorCode::RuntimeFailure,
+                            PublicErrorStage::SystemProxyOwnership,
+                            "Windows System Proxy was changed by another application",
+                        )),
+                    );
+                    return;
+                }
+                Err(_) => {
+                    let node_id = active.node_id.clone();
+                    Self::set_proof(
+                        &mut state,
+                        ProofKind::SystemProxyOwnership,
+                        ProofState::Failed,
+                        None,
+                    );
+                    self.update_status(
+                        &mut state,
+                        RuntimePhase::Degraded,
+                        Some(node_id),
+                        Some(PublicError::fixed(
+                            PublicErrorCode::RuntimeFailure,
+                            PublicErrorStage::SystemProxyOwnership,
+                            "Windows System Proxy ownership could not be checked",
+                        )),
+                    );
+                    return;
+                }
+            }
+        }
         if active.last_probe.elapsed() < Duration::from_secs(10) {
             return;
         }
@@ -1180,6 +1738,7 @@ impl ApplicationController {
         let snapshot = ProbeSnapshot {
             generation: active.generation.clone(),
             session_id: active.session_id.clone(),
+            mode: active.mode,
             route: active.health_route.clone(),
             http_port: active.ports.http,
             redactor: active.redactor.clone(),
@@ -1191,7 +1750,13 @@ impl ApplicationController {
             .services
             .prober
             .prove(&snapshot.route)
-            .and_then(|_| self.services.prober.prove_ordinary(snapshot.http_port));
+            .and_then(|proof| {
+                if snapshot.mode == RuntimeMode::LocalOnly {
+                    self.services.prober.prove_ordinary(snapshot.http_port)
+                } else {
+                    Ok(proof)
+                }
+            });
         state = self.lock_state();
         if state.recovery_required || state.status.phase == RuntimePhase::RecoveryRequired {
             return;
@@ -1213,6 +1778,11 @@ impl ApplicationController {
         };
         if let Err(error) = ownership {
             let public = public_runtime_error(error, &snapshot.redactor);
+            let proxy_recovery_failed = snapshot.mode == RuntimeMode::SystemProxy
+                && matches!(
+                    self.services.system_proxy.restore_if_owned(),
+                    Ok(SystemProxyRestoreOutcome::NoJournal) | Err(_)
+                );
             let stale = state.active.take();
             Self::set_proof(
                 &mut state,
@@ -1222,7 +1792,7 @@ impl ApplicationController {
             );
             Self::clear_active_metadata(&mut state);
             drop(stale);
-            if reconcile_stale_sessions(&self.session_root).is_err() {
+            if proxy_recovery_failed || reconcile_stale_sessions(&self.session_root).is_err() {
                 state.recovery_required = true;
                 self.update_status(
                     &mut state,
@@ -1260,6 +1830,14 @@ impl ApplicationController {
                     ProofState::Passed,
                     None,
                 );
+                if snapshot.mode == RuntimeMode::SystemProxy {
+                    Self::set_proof(
+                        &mut state,
+                        ProofKind::SystemProxyOwnership,
+                        ProofState::Passed,
+                        None,
+                    );
+                }
                 self.update_status(
                     &mut state,
                     RuntimePhase::OutboundVerified,
@@ -1268,7 +1846,11 @@ impl ApplicationController {
                 );
                 self.update_status(
                     &mut state,
-                    RuntimePhase::LocalProxyReady,
+                    if snapshot.mode == RuntimeMode::SystemProxy {
+                        RuntimePhase::SystemProxyReady
+                    } else {
+                        RuntimePhase::LocalProxyReady
+                    },
                     Some(snapshot.node_id),
                     None,
                 );
@@ -1309,7 +1891,10 @@ impl ApplicationController {
         state.status.error = error;
         if !matches!(
             phase,
-            RuntimePhase::OutboundVerified | RuntimePhase::LocalProxyReady | RuntimePhase::Degraded
+            RuntimePhase::OutboundVerified
+                | RuntimePhase::LocalProxyReady
+                | RuntimePhase::SystemProxyReady
+                | RuntimePhase::Degraded
         ) {
             state.status.route_check_ms = None;
         }
@@ -1325,6 +1910,8 @@ impl ApplicationController {
 
     fn reset_disconnected(&self, state: &mut State) {
         Self::clear_active_metadata(state);
+        state.status.scope = RuntimeScope::LocalOnly;
+        state.status.mode = RuntimeMode::LocalOnly;
         state.status.session_id = None;
         state.status.proofs = default_proofs();
         self.update_status(state, RuntimePhase::Disconnected, None, None);
@@ -1363,6 +1950,12 @@ impl ApplicationController {
             "prove_traffic" => Self::set_proof(
                 state,
                 ProofKind::SelectedOutboundHttps,
+                ProofState::Failed,
+                None,
+            ),
+            "system_proxy_publish" | "system_proxy_ownership" => Self::set_proof(
+                state,
+                ProofKind::SystemProxyOwnership,
                 ProofState::Failed,
                 None,
             ),
@@ -1485,6 +2078,7 @@ fn default_proofs() -> Vec<ProofRow> {
         ProofKind::HealthListener,
         ProofKind::SelectedOutboundHttps,
         ProofKind::LocalScopeOwnership,
+        ProofKind::SystemProxyOwnership,
     ]
     .into_iter()
     .map(|kind| ProofRow {
@@ -1529,12 +2123,15 @@ fn public_runtime_error(error: RuntimeError, redactor: &Redactor) -> PublicError
             | PublicErrorStage::ProveTraffic
             | PublicErrorStage::EngineProcess
             | PublicErrorStage::StopEngine
+            | PublicErrorStage::SystemProxyPublish
+            | PublicErrorStage::SystemProxyRestore
+            | PublicErrorStage::SystemProxyOwnership
     )
     .then(|| redactor.redact(error.message()));
     PublicError {
         code: PublicErrorCode::RuntimeFailure,
         stage,
-        message: "The local proxy operation failed".into(),
+        message: "The RouteDeck connection operation failed".into(),
         detail,
     }
 }
@@ -1551,6 +2148,9 @@ fn public_stage(stage: &str) -> PublicErrorStage {
         "prove_traffic" => PublicErrorStage::ProveTraffic,
         "engine_process" => PublicErrorStage::EngineProcess,
         "stop_engine" => PublicErrorStage::StopEngine,
+        "system_proxy_publish" => PublicErrorStage::SystemProxyPublish,
+        "system_proxy_restore" => PublicErrorStage::SystemProxyRestore,
+        "system_proxy_ownership" => PublicErrorStage::SystemProxyOwnership,
         "session_storage" => PublicErrorStage::SessionStorage,
         "random" => PublicErrorStage::Random,
         "monitor" => PublicErrorStage::Monitor,
@@ -1585,6 +2185,81 @@ mod tests {
         stop_fails: bool,
         alive: Arc<AtomicBool>,
         stops: Arc<AtomicUsize>,
+    }
+
+    struct FakeSystemProxy {
+        alive: Arc<AtomicBool>,
+        owned: AtomicBool,
+        foreign: AtomicBool,
+        fail_publish: AtomicBool,
+        fail_restore: AtomicBool,
+        publishes: AtomicUsize,
+        restores: AtomicUsize,
+        restore_saw_live_core: AtomicBool,
+    }
+
+    impl FakeSystemProxy {
+        fn new(alive: Arc<AtomicBool>) -> Self {
+            Self {
+                alive,
+                owned: AtomicBool::new(false),
+                foreign: AtomicBool::new(false),
+                fail_publish: AtomicBool::new(false),
+                fail_restore: AtomicBool::new(false),
+                publishes: AtomicUsize::new(0),
+                restores: AtomicUsize::new(0),
+                restore_saw_live_core: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl SystemProxyControl for FakeSystemProxy {
+        fn publish_loopback(
+            &self,
+            _http_port: u16,
+        ) -> Result<(), crate::system_proxy::SystemProxyError> {
+            assert!(self.alive.load(Ordering::SeqCst));
+            self.publishes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_publish.load(Ordering::SeqCst) {
+                return Err(crate::system_proxy::SystemProxyError::fixed(
+                    "fixture publish failure",
+                ));
+            }
+            self.owned.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn is_owned(&self) -> Result<bool, crate::system_proxy::SystemProxyError> {
+            Ok(self.owned.load(Ordering::SeqCst) && !self.foreign.load(Ordering::SeqCst))
+        }
+
+        fn restore_if_owned(
+            &self,
+        ) -> Result<SystemProxyRestoreOutcome, crate::system_proxy::SystemProxyError> {
+            self.restores.fetch_add(1, Ordering::SeqCst);
+            self.restore_saw_live_core
+                .store(self.alive.load(Ordering::SeqCst), Ordering::SeqCst);
+            if self.fail_restore.load(Ordering::SeqCst) {
+                return Err(crate::system_proxy::SystemProxyError::fixed(
+                    "fixture restore failure",
+                ));
+            }
+            if self.foreign.load(Ordering::SeqCst) {
+                self.owned.store(false, Ordering::SeqCst);
+                return Ok(SystemProxyRestoreOutcome::ForeignPreserved);
+            }
+            Ok(if self.owned.swap(false, Ordering::SeqCst) {
+                SystemProxyRestoreOutcome::Restored
+            } else {
+                SystemProxyRestoreOutcome::NoJournal
+            })
+        }
+
+        fn reconcile_stale_journal(
+            &self,
+        ) -> Result<SystemProxyRestoreOutcome, crate::system_proxy::SystemProxyError> {
+            self.restore_if_owned()
+        }
     }
 
     impl EngineProvider for FakeProvider {
@@ -1906,6 +2581,50 @@ mod tests {
         (controller, stops, alive)
     }
 
+    fn controller_with_system_proxy(
+        prober: Arc<dyn TrafficProber>,
+    ) -> (
+        ApplicationController,
+        Arc<FakeSystemProxy>,
+        Arc<AtomicUsize>,
+        Arc<AtomicBool>,
+    ) {
+        controller_with_system_proxy_stop_behavior(prober, false)
+    }
+
+    fn controller_with_system_proxy_stop_behavior(
+        prober: Arc<dyn TrafficProber>,
+        stop_fails: bool,
+    ) -> (
+        ApplicationController,
+        Arc<FakeSystemProxy>,
+        Arc<AtomicUsize>,
+        Arc<AtomicBool>,
+    ) {
+        let alive = Arc::new(AtomicBool::new(false));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let proxy = Arc::new(FakeSystemProxy::new(alive.clone()));
+        let root = std::env::temp_dir().join(format!(
+            "routedeck-system-proxy-test-{}",
+            random_hex(8).expect("test random")
+        ));
+        let controller = ApplicationController::with_services_and_controls(
+            root,
+            Arc::new(|_| {}),
+            Arc::new(FakeProvider {
+                check_fails: false,
+                stop_fails,
+                alive: alive.clone(),
+                stops: stops.clone(),
+            }),
+            Arc::new(FakeListener(true)),
+            prober,
+            Arc::new(HttpsSubscriptionFetcher),
+            proxy.clone(),
+        );
+        (controller, proxy, stops, alive)
+    }
+
     fn controller_with_stop_failure() -> ApplicationController {
         let alive = Arc::new(AtomicBool::new(false));
         let root = std::env::temp_dir().join(format!(
@@ -2002,6 +2721,10 @@ mod tests {
             Arc::new(FakeListener(true)),
             Arc::new(FakeProber(true)),
             fetcher,
+            Arc::new(SystemProxyManager::new(std::env::temp_dir().join(format!(
+                "routedeck-fetch-proxy-test-{}",
+                random_hex(8).expect("test random")
+            )))),
         )
     }
 
@@ -2094,10 +2817,11 @@ mod tests {
         assert_eq!(status.scope, RuntimeScope::LocalOnly);
         assert_eq!(status.mode, RuntimeMode::LocalOnly);
         assert!(status.session_id.is_some());
-        assert!(status
-            .proofs
-            .iter()
-            .all(|proof| proof.state == ProofState::Passed));
+        assert!(status.proofs.iter().all(|proof| {
+            proof.state == ProofState::Passed
+                || (proof.kind == ProofKind::SystemProxyOwnership
+                    && proof.state == ProofState::NotRun)
+        }));
         assert!(!serde_json::to_string(&status)
             .unwrap()
             .contains("\"phase\":\"connected\""));
@@ -2543,7 +3267,13 @@ mod tests {
         let stale = root.join("session-0123456789abcdef0123456789abcdef");
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::write(stale.join("config.json"), b"fixture-secret").unwrap();
-        let controller = ApplicationController::production(root.clone(), Arc::new(|_| {})).unwrap();
+        let proxy = Arc::new(FakeSystemProxy::new(Arc::new(AtomicBool::new(false))));
+        let controller = ApplicationController::production_with_system_proxy(
+            root.clone(),
+            Arc::new(|_| {}),
+            proxy,
+        )
+        .unwrap();
         assert_eq!(controller.status().phase, RuntimePhase::RecoveryRequired);
         let preview = controller.preview_import_content(NODE.into()).unwrap();
         let error = controller.confirm_import(&preview.preview_id).unwrap_err();
@@ -2675,6 +3405,162 @@ mod tests {
                 .default_route,
             DefaultRoute::Vpn
         );
+    }
+
+    fn system_routing(default_route: DefaultRoute) -> SystemProxyRouting {
+        SystemProxyRouting {
+            default_route,
+            apps: vec![SystemProxyAppRoute {
+                process_path: r"C:\Program Files\Browser\browser.exe".into(),
+                process_name: Some("browser.exe".into()),
+                route: if default_route == DefaultRoute::Direct {
+                    AppRouteAction::Vpn
+                } else {
+                    AppRouteAction::Direct
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn system_proxy_publishes_only_after_selected_health_and_restores_before_core_stop() {
+        let (controller, proxy, stops, alive) =
+            controller_with_system_proxy(Arc::new(OrdinaryFailProber));
+        let node = import_node(&controller);
+
+        let status = controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Direct))
+            .unwrap();
+        assert_eq!(status.scope, RuntimeScope::SystemProxy);
+        assert_eq!(status.mode, RuntimeMode::SystemProxy);
+        assert_eq!(status.phase, RuntimePhase::SystemProxyReady);
+        assert_eq!(proxy.publishes.load(Ordering::SeqCst), 1);
+        assert!(status.proofs.iter().any(|proof| {
+            proof.kind == ProofKind::SystemProxyOwnership && proof.state == ProofState::Passed
+        }));
+
+        controller.stop().unwrap();
+        assert!(proxy.restore_saw_live_core.load(Ordering::SeqCst));
+        assert_eq!(proxy.restores.load(Ordering::SeqCst), 1);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert!(!alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn repeated_identical_system_proxy_start_reuses_the_verified_session() {
+        let (controller, proxy, stops, alive) =
+            controller_with_system_proxy(Arc::new(FakeProber(true)));
+        let node = import_node(&controller);
+        let first = controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Direct))
+            .unwrap();
+
+        let second = controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Direct))
+            .unwrap();
+
+        assert_eq!(second.session_id, first.session_id);
+        assert_eq!(proxy.publishes.load(Ordering::SeqCst), 1);
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert!(alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn system_proxy_stop_preserves_foreign_state_and_reports_conflict() {
+        let (controller, proxy, stops, alive) =
+            controller_with_system_proxy(Arc::new(FakeProber(true)));
+        let node = import_node(&controller);
+        controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Vpn))
+            .unwrap();
+        proxy.foreign.store(true, Ordering::SeqCst);
+
+        let error = controller.stop().unwrap_err();
+        assert_eq!(error.stage, PublicErrorStage::SystemProxyOwnership);
+        assert_eq!(
+            controller.status().phase,
+            RuntimePhase::DisconnectedWithError
+        );
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert!(!alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn system_proxy_restore_failure_keeps_the_live_core_available_for_recovery() {
+        let (controller, proxy, stops, alive) =
+            controller_with_system_proxy(Arc::new(FakeProber(true)));
+        let node = import_node(&controller);
+        controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Vpn))
+            .unwrap();
+        proxy.fail_restore.store(true, Ordering::SeqCst);
+
+        let error = controller.stop().unwrap_err();
+        assert_eq!(error.stage, PublicErrorStage::SystemProxyRestore);
+        assert_eq!(controller.status().phase, RuntimePhase::RecoveryRequired);
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert!(alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn ambiguous_system_proxy_publish_failure_keeps_the_core_alive() {
+        let (controller, proxy, stops, alive) =
+            controller_with_system_proxy(Arc::new(FakeProber(true)));
+        let node = import_node(&controller);
+        proxy.fail_publish.store(true, Ordering::SeqCst);
+
+        let error = controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Direct))
+            .unwrap_err();
+        assert_eq!(error.stage, PublicErrorStage::SystemProxyRestore);
+        assert_eq!(controller.status().phase, RuntimePhase::RecoveryRequired);
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert!(alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn shutdown_is_prevented_until_system_proxy_restore_succeeds() {
+        let (controller, proxy, stops, alive) =
+            controller_with_system_proxy(Arc::new(FakeProber(true)));
+        let node = import_node(&controller);
+        controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Vpn))
+            .unwrap();
+        proxy.fail_restore.store(true, Ordering::SeqCst);
+
+        assert!(!controller.shutdown());
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert!(alive.load(Ordering::SeqCst));
+
+        proxy.fail_restore.store(false, Ordering::SeqCst);
+        assert!(controller.shutdown());
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert!(!alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn stop_retry_does_not_restore_system_proxy_twice_after_core_stop_failure() {
+        let (controller, proxy, stops, alive) =
+            controller_with_system_proxy_stop_behavior(Arc::new(FakeProber(true)), true);
+        let node = import_node(&controller);
+        controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Vpn))
+            .unwrap();
+
+        assert_eq!(
+            controller.stop().unwrap_err().stage,
+            PublicErrorStage::StopEngine
+        );
+        assert_eq!(proxy.restores.load(Ordering::SeqCst), 1);
+        assert!(alive.load(Ordering::SeqCst));
+
+        assert_eq!(
+            controller.stop().unwrap_err().stage,
+            PublicErrorStage::StopEngine
+        );
+        assert_eq!(proxy.restores.load(Ordering::SeqCst), 1);
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert!(alive.load(Ordering::SeqCst));
     }
 
     #[test]

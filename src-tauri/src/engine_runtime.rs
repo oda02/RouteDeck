@@ -15,18 +15,91 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 #[cfg(windows)]
-use crate::windows_process::{create_suspended_engine, EngineAction, PlatformProcess};
+use crate::windows_process::{create_suspended_engine, EngineCommand, PlatformProcess};
 use crate::{config::LocalPorts, redaction::Redactor};
 
-const EMBEDDED_ENGINE_LOCK: &str = include_str!("../../engine/sing-box.lock.json");
-const ENGINE_DIRECTORY: &str = "engine";
-const ENGINE_EXE: &str = "sing-box.exe";
+const EMBEDDED_SING_BOX_LOCK: &str = include_str!("../../engine/sing-box.lock.json");
+const EMBEDDED_XRAY_LOCK: &str = include_str!("../../engine/xray-core.lock.json");
+const SING_BOX_DIRECTORY: &str = "engine";
+const SING_BOX_EXE: &str = "sing-box.exe";
+const XRAY_DIRECTORY: &str = "xray";
+const XRAY_EXE: &str = "xray.exe";
 const CRONET_DLL: &str = "libcronet.dll";
 const CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 const CHECK_READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_CHECK_STDERR: usize = 64 * 1024;
 const MAX_DIAGNOSTIC_LINES: usize = 128;
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Xray is staged here and consumed by the dual-engine application milestone.
+pub(crate) enum EngineKind {
+    SingBox,
+    Xray,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // Descriptor metadata is intentionally exposed before dual-engine wiring.
+pub(crate) struct EngineDescriptor {
+    kind: EngineKind,
+    directory_name: &'static str,
+    executable_name: &'static str,
+    lock_json: &'static str,
+    lock_engine: &'static str,
+    version: &'static str,
+    execution_files: &'static [(&'static str, &'static str)],
+    check_command: EngineCommand,
+    run_command: EngineCommand,
+    display_name: &'static str,
+}
+
+const SING_BOX_EXECUTION_FILES: &[(&str, &str)] =
+    &[(SING_BOX_EXE, "executable"), (CRONET_DLL, "library")];
+const XRAY_EXECUTION_FILES: &[(&str, &str)] = &[(XRAY_EXE, "executable")];
+
+#[allow(dead_code)]
+impl EngineDescriptor {
+    pub(crate) const fn for_kind(kind: EngineKind) -> Self {
+        match kind {
+            EngineKind::SingBox => Self {
+                kind,
+                directory_name: SING_BOX_DIRECTORY,
+                executable_name: SING_BOX_EXE,
+                lock_json: EMBEDDED_SING_BOX_LOCK,
+                lock_engine: "sing-box",
+                version: "1.13.19",
+                execution_files: SING_BOX_EXECUTION_FILES,
+                check_command: EngineCommand::SingBoxCheck,
+                run_command: EngineCommand::SingBoxRun,
+                display_name: "sing-box",
+            },
+            EngineKind::Xray => Self {
+                kind,
+                directory_name: XRAY_DIRECTORY,
+                executable_name: XRAY_EXE,
+                lock_json: EMBEDDED_XRAY_LOCK,
+                lock_engine: "xray-core",
+                version: "26.3.27",
+                execution_files: XRAY_EXECUTION_FILES,
+                check_command: EngineCommand::XrayCheck,
+                run_command: EngineCommand::XrayRun,
+                display_name: "Xray",
+            },
+        }
+    }
+
+    pub(crate) const fn kind(self) -> EngineKind {
+        self.kind
+    }
+
+    pub(crate) const fn directory_name(self) -> &'static str {
+        self.directory_name
+    }
+
+    pub(crate) const fn executable_name(self) -> &'static str {
+        self.executable_name
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
@@ -80,21 +153,25 @@ struct LockedFile {
 #[derive(Debug)]
 pub(crate) struct FixedEngineLayout {
     engine_dir: PathBuf,
+    descriptor: EngineDescriptor,
 }
 
 impl FixedEngineLayout {
-    pub(crate) fn resolve() -> Result<Self, RuntimeError> {
+    fn resolve(descriptor: EngineDescriptor) -> Result<Self, RuntimeError> {
         let executable = std::env::current_exe()
             .map_err(|error| RuntimeError::new("engine_layout", error.to_string()))?;
         let package_root = executable.parent().ok_or_else(|| {
             RuntimeError::new("engine_layout", "application directory is unavailable")
         })?;
-        Self::from_package_root(package_root)
+        Self::from_package_root(package_root, descriptor)
     }
 
-    fn from_package_root(package_root: &Path) -> Result<Self, RuntimeError> {
+    fn from_package_root(
+        package_root: &Path,
+        descriptor: EngineDescriptor,
+    ) -> Result<Self, RuntimeError> {
         reject_reparse(package_root)?;
-        let engine_dir = package_root.join(ENGINE_DIRECTORY);
+        let engine_dir = package_root.join(descriptor.directory_name);
         reject_reparse(&engine_dir)?;
         let canonical_root = fs::canonicalize(package_root)
             .map_err(|error| RuntimeError::new("engine_layout", error.to_string()))?;
@@ -108,6 +185,7 @@ impl FixedEngineLayout {
         }
         Ok(Self {
             engine_dir: canonical_engine,
+            descriptor,
         })
     }
 }
@@ -119,36 +197,39 @@ struct VerifiedFiles {
 
 impl FixedEngineLayout {
     fn verify(&self) -> Result<(VerifiedFiles, String), RuntimeError> {
-        let lock = embedded_engine_lock()?;
+        let lock = embedded_engine_lock(self.descriptor)?;
         self.verify_lock(&lock)
     }
 
     fn verify_lock(&self, lock: &EngineLock) -> Result<(VerifiedFiles, String), RuntimeError> {
-        if lock.schema_version != 1 || lock.engine != "sing-box" || lock.version != "1.13.19" {
+        if lock.schema_version != 1
+            || lock.engine != self.descriptor.lock_engine
+            || lock.version != self.descriptor.version
+        {
             return Err(RuntimeError::new(
                 "engine_integrity",
                 "embedded engine identity is unsupported",
             ));
         }
-        let files = verify_runtime_directory(&self.engine_dir, lock)?;
+        let files = verify_runtime_directory(&self.engine_dir, lock, self.descriptor)?;
         Ok((files, lock.version.clone()))
     }
 }
 
-fn embedded_engine_lock() -> Result<EngineLock, RuntimeError> {
-    serde_json::from_str(EMBEDDED_ENGINE_LOCK)
+fn embedded_engine_lock(descriptor: EngineDescriptor) -> Result<EngineLock, RuntimeError> {
+    serde_json::from_str(descriptor.lock_json)
         .map_err(|_| RuntimeError::new("engine_integrity", "embedded lock is invalid"))
 }
 
 fn verify_runtime_directory(
     engine_dir: &Path,
     lock: &EngineLock,
+    descriptor: EngineDescriptor,
 ) -> Result<VerifiedFiles, RuntimeError> {
     let held_directory = open_engine_directory_guard(engine_dir)?;
     reject_unlocked_binaries(engine_dir, &lock.runtime_files)?;
     let mut held_files = BTreeMap::new();
-    let mut executable_valid = false;
-    let mut cronet_valid = false;
+    let mut execution_files = BTreeSet::new();
     for locked in &lock.runtime_files {
         if Path::new(&locked.path).file_name() != Some(OsStr::new(&locked.path)) {
             return Err(RuntimeError::new(
@@ -175,23 +256,23 @@ fn verify_runtime_directory(
                 format!("{} failed SHA-256 verification", locked.path),
             ));
         }
-        match locked.path.as_str() {
-            ENGINE_EXE if locked.kind == "executable" => executable_valid = true,
-            CRONET_DLL if locked.kind == "library" => cronet_valid = true,
-            _ => {}
+        if descriptor
+            .execution_files
+            .contains(&(locked.path.as_str(), locked.kind.as_str()))
+        {
+            execution_files.insert((locked.path.clone(), locked.kind.clone()));
         }
         held_files.insert(locked.path.clone(), file);
     }
-    if !executable_valid {
+    if execution_files.len() != descriptor.execution_files.len()
+        || descriptor
+            .execution_files
+            .iter()
+            .any(|(path, kind)| !execution_files.contains(&(path.to_string(), kind.to_string())))
+    {
         return Err(RuntimeError::new(
             "engine_integrity",
-            "locked executable is missing",
-        ));
-    }
-    if !cronet_valid {
-        return Err(RuntimeError::new(
-            "engine_integrity",
-            "locked libcronet is missing",
+            "locked execution file set is incomplete",
         ));
     }
     Ok(VerifiedFiles {
@@ -351,6 +432,7 @@ struct SealedEngine {
     executable: PathBuf,
     identities: BTreeMap<String, SealedObjectIdentity>,
     cleanup_lock: EngineLock,
+    descriptor: EngineDescriptor,
 }
 
 impl SealedEngine {
@@ -358,10 +440,11 @@ impl SealedEngine {
         session_directory: &Path,
         lock: &EngineLock,
         source: &VerifiedFiles,
+        descriptor: EngineDescriptor,
     ) -> Result<Self, RuntimeError> {
         #[cfg(not(windows))]
         {
-            let _ = (session_directory, lock, source);
+            let _ = (session_directory, lock, source, descriptor);
             return Err(RuntimeError::new(
                 "engine_integrity",
                 "sealed engine execution is supported only on Windows",
@@ -369,7 +452,7 @@ impl SealedEngine {
         }
         #[cfg(windows)]
         {
-            let execution_lock = execution_lock(lock)?;
+            let execution_lock = execution_lock(lock, descriptor)?;
             reject_reparse(session_directory)?;
             let directory = session_directory.join(format!("engine-run-{}", random_hex(16)?));
             create_private_directory(&directory)
@@ -398,14 +481,15 @@ impl SealedEngine {
                 apply_sealed_acl(&directory)?;
                 drop(directory_guard);
 
-                let verified = verify_runtime_directory(&directory, &execution_lock)?;
+                let verified = verify_runtime_directory(&directory, &execution_lock, descriptor)?;
                 let identities = sealed_identities(&verified)?;
                 verify_sealed_directory_is_read_only(&directory)?;
                 Ok(Self {
-                    executable: directory.join(ENGINE_EXE),
+                    executable: directory.join(descriptor.executable_name),
                     directory: directory.clone(),
                     identities,
                     cleanup_lock: execution_lock.clone(),
+                    descriptor,
                 })
             })();
             if result.is_err() {
@@ -416,7 +500,8 @@ impl SealedEngine {
     }
 
     fn verify_for_launch(&self) -> Result<VerifiedFiles, RuntimeError> {
-        let verified = verify_runtime_directory(&self.directory, &self.cleanup_lock)?;
+        let verified =
+            verify_runtime_directory(&self.directory, &self.cleanup_lock, self.descriptor)?;
         let identities = sealed_identities(&verified)?;
         if identities != self.identities {
             return Err(RuntimeError::new(
@@ -429,16 +514,18 @@ impl SealedEngine {
     }
 }
 
-fn execution_lock(lock: &EngineLock) -> Result<EngineLock, RuntimeError> {
+fn execution_lock(
+    lock: &EngineLock,
+    descriptor: EngineDescriptor,
+) -> Result<EngineLock, RuntimeError> {
     let has_disguised_binary = lock.runtime_files.iter().any(|entry| {
         let folded = entry.path.to_ascii_lowercase();
         matches!(
             Path::new(&folded).extension().and_then(OsStr::to_str),
             Some("exe" | "dll")
-        ) && !matches!(
-            (entry.path.as_str(), entry.kind.as_str()),
-            (ENGINE_EXE, "executable") | (CRONET_DLL, "library")
-        )
+        ) && !descriptor
+            .execution_files
+            .contains(&(entry.path.as_str(), entry.kind.as_str()))
     });
     let runtime_files = lock
         .runtime_files
@@ -447,13 +534,12 @@ fn execution_lock(lock: &EngineLock) -> Result<EngineLock, RuntimeError> {
         .cloned()
         .collect::<Vec<_>>();
     if has_disguised_binary
-        || runtime_files.len() != 2
-        || !runtime_files
-            .iter()
-            .any(|entry| entry.path == ENGINE_EXE && entry.kind == "executable")
-        || !runtime_files
-            .iter()
-            .any(|entry| entry.path == CRONET_DLL && entry.kind == "library")
+        || runtime_files.len() != descriptor.execution_files.len()
+        || descriptor.execution_files.iter().any(|(path, kind)| {
+            !runtime_files
+                .iter()
+                .any(|entry| entry.path == *path && entry.kind == *kind)
+        })
     {
         return Err(RuntimeError::new(
             "engine_integrity",
@@ -1719,6 +1805,7 @@ pub(crate) trait EngineLauncher: Send + Sync {
 
 pub(crate) struct VerifiedEngineLauncher {
     layout: FixedEngineLayout,
+    descriptor: EngineDescriptor,
     prepared: Mutex<Option<PreparedVerification>>,
 }
 
@@ -1731,8 +1818,14 @@ struct PreparedVerification {
 
 impl VerifiedEngineLauncher {
     pub(crate) fn resolve() -> Result<Self, RuntimeError> {
+        Self::resolve_for(EngineKind::SingBox)
+    }
+
+    pub(crate) fn resolve_for(kind: EngineKind) -> Result<Self, RuntimeError> {
+        let descriptor = EngineDescriptor::for_kind(kind);
         Ok(Self {
-            layout: FixedEngineLayout::resolve()?,
+            layout: FixedEngineLayout::resolve(descriptor)?,
+            descriptor,
             prepared: Mutex::new(None),
         })
     }
@@ -1746,14 +1839,15 @@ impl EngineLauncher for VerifiedEngineLauncher {
         diagnostics: Arc<Mutex<DiagnosticBuffer>>,
     ) -> Result<String, RuntimeError> {
         let (source_guards, version) = self.layout.verify()?;
-        let lock = embedded_engine_lock()?;
-        let sealed_engine = SealedEngine::create(config.directory(), &lock, &source_guards)?;
+        let lock = embedded_engine_lock(self.descriptor)?;
+        let sealed_engine =
+            SealedEngine::create(config.directory(), &lock, &source_guards, self.descriptor)?;
         drop(source_guards);
         let _config_guard = config.revalidate_for_launch()?;
         let (mut suspended, check_guards) = create_suspended_engine(
             &sealed_engine.executable,
             &sealed_engine.directory,
-            EngineAction::Check,
+            self.descriptor.check_command,
             config.path(),
             || sealed_engine.verify_for_launch(),
         )
@@ -1802,7 +1896,10 @@ impl EngineLauncher for VerifiedEngineLauncher {
             return Err(RuntimeError::new(
                 "config_check",
                 if sanitized.trim().is_empty() {
-                    "sing-box rejected the generated configuration".into()
+                    format!(
+                        "{} rejected the generated configuration",
+                        self.descriptor.display_name
+                    )
                 } else {
                     sanitized
                 },
@@ -1847,7 +1944,7 @@ impl EngineLauncher for VerifiedEngineLauncher {
         let (mut suspended, run_guards) = create_suspended_engine(
             &prepared.sealed_engine.executable,
             &prepared.sealed_engine.directory,
-            EngineAction::Run,
+            self.descriptor.run_command,
             config.path(),
             || prepared.sealed_engine.verify_for_launch(),
         )?;
@@ -1988,49 +2085,61 @@ mod tests {
         root: PathBuf,
         layout: FixedEngineLayout,
         lock: EngineLock,
+        descriptor: EngineDescriptor,
     }
 
     impl FixtureLayout {
         fn create() -> Self {
+            Self::create_for(EngineKind::SingBox)
+        }
+
+        fn create_for(kind: EngineKind) -> Self {
+            let descriptor = EngineDescriptor::for_kind(kind);
             let root = std::env::temp_dir().join(format!(
                 "routedeck-engine-fixture-{}",
                 random_hex(8).unwrap()
             ));
-            let engine = root.join(ENGINE_DIRECTORY);
+            let engine = root.join(descriptor.directory_name);
             fs::create_dir_all(&engine).unwrap();
             let executable = b"fixture executable";
-            let cronet = b"fixture cronet";
             let license = b"fixture license";
-            fs::write(engine.join(ENGINE_EXE), executable).unwrap();
-            fs::write(engine.join(CRONET_DLL), cronet).unwrap();
+            fs::write(engine.join(descriptor.executable_name), executable).unwrap();
+            let mut runtime_files = vec![LockedFile {
+                path: descriptor.executable_name.into(),
+                kind: "executable".into(),
+                size: executable.len() as u64,
+                sha256: digest(executable),
+            }];
+            if kind == EngineKind::SingBox {
+                let cronet = b"fixture cronet";
+                fs::write(engine.join(CRONET_DLL), cronet).unwrap();
+                runtime_files.push(LockedFile {
+                    path: CRONET_DLL.into(),
+                    kind: "library".into(),
+                    size: cronet.len() as u64,
+                    sha256: digest(cronet),
+                });
+            }
             fs::write(engine.join("LICENSE"), license).unwrap();
-            let layout = FixedEngineLayout::from_package_root(&root).unwrap();
+            runtime_files.push(LockedFile {
+                path: "LICENSE".into(),
+                kind: "license".into(),
+                size: license.len() as u64,
+                sha256: digest(license),
+            });
+            let layout = FixedEngineLayout::from_package_root(&root, descriptor).unwrap();
             let lock = EngineLock {
                 schema_version: 1,
-                engine: "sing-box".into(),
-                version: "1.13.19".into(),
-                runtime_files: vec![
-                    LockedFile {
-                        path: ENGINE_EXE.into(),
-                        kind: "executable".into(),
-                        size: executable.len() as u64,
-                        sha256: digest(executable),
-                    },
-                    LockedFile {
-                        path: CRONET_DLL.into(),
-                        kind: "library".into(),
-                        size: cronet.len() as u64,
-                        sha256: digest(cronet),
-                    },
-                    LockedFile {
-                        path: "LICENSE".into(),
-                        kind: "license".into(),
-                        size: license.len() as u64,
-                        sha256: digest(license),
-                    },
-                ],
+                engine: descriptor.lock_engine.into(),
+                version: descriptor.version.into(),
+                runtime_files,
             };
-            Self { root, layout, lock }
+            Self {
+                root,
+                layout,
+                lock,
+                descriptor,
+            }
         }
     }
 
@@ -2059,14 +2168,67 @@ mod tests {
         };
         assert_eq!(error.stage(), "engine_integrity");
         fs::remove_file(fixture.layout.engine_dir.join("extra.exe")).unwrap();
-        fs::write(fixture.layout.engine_dir.join(ENGINE_EXE), b"wrong size").unwrap();
+        fs::write(
+            fixture
+                .layout
+                .engine_dir
+                .join(fixture.descriptor.executable_name),
+            b"wrong size",
+        )
+        .unwrap();
         assert!(fixture.layout.verify_lock(&fixture.lock).is_err());
     }
 
     #[test]
+    fn descriptors_bind_each_pinned_manifest_to_its_own_runtime_directory() {
+        let sing_box = EngineDescriptor::for_kind(EngineKind::SingBox);
+        let xray = EngineDescriptor::for_kind(EngineKind::Xray);
+        assert_eq!(sing_box.kind(), EngineKind::SingBox);
+        assert_eq!(sing_box.directory_name(), "engine");
+        assert_eq!(sing_box.executable_name(), "sing-box.exe");
+        assert_eq!(xray.kind(), EngineKind::Xray);
+        assert_eq!(xray.directory_name(), "xray");
+        assert_eq!(xray.executable_name(), "xray.exe");
+
+        let sing_box_lock = embedded_engine_lock(sing_box).unwrap();
+        let xray_lock = embedded_engine_lock(xray).unwrap();
+        assert_eq!(sing_box_lock.engine, "sing-box");
+        assert_eq!(sing_box_lock.version, "1.13.19");
+        assert_eq!(xray_lock.engine, "xray-core");
+        assert_eq!(xray_lock.version, "26.3.27");
+
+        let sing_box_fixture = FixtureLayout::create_for(EngineKind::SingBox);
+        assert!(FixedEngineLayout::from_package_root(&sing_box_fixture.root, xray).is_err());
+        let xray_fixture = FixtureLayout::create_for(EngineKind::Xray);
+        xray_fixture.layout.verify_lock(&xray_fixture.lock).unwrap();
+    }
+
+    #[test]
+    fn xray_execution_seal_contains_only_its_pinned_executable() {
+        let fixture = FixtureLayout::create_for(EngineKind::Xray);
+        let execution = execution_lock(&fixture.lock, fixture.descriptor).unwrap();
+        assert_eq!(execution.runtime_files.len(), 1);
+        assert_eq!(execution.runtime_files[0].path, XRAY_EXE);
+        assert_eq!(execution.runtime_files[0].kind, "executable");
+
+        let mut disguised = fixture.lock.clone();
+        disguised.runtime_files.push(LockedFile {
+            path: "foreign.dll".into(),
+            kind: "license".into(),
+            size: 1,
+            sha256: digest(b"x"),
+        });
+        assert!(execution_lock(&disguised, fixture.descriptor).is_err());
+
+        let mut wrong_identity = fixture.lock.clone();
+        wrong_identity.engine = "sing-box".into();
+        assert!(fixture.layout.verify_lock(&wrong_identity).is_err());
+    }
+
+    #[test]
     fn runtime_entry_names_reject_case_variants_and_folded_duplicates() {
-        let exact = BTreeSet::from([ENGINE_EXE.to_owned()]);
-        let folded = BTreeSet::from([ENGINE_EXE.to_ascii_lowercase()]);
+        let exact = BTreeSet::from([SING_BOX_EXE.to_owned()]);
+        let folded = BTreeSet::from([SING_BOX_EXE.to_ascii_lowercase()]);
         let mut seen = BTreeSet::new();
         assert!(!accept_runtime_entry_name(
             "SING-BOX.EXE",
@@ -2076,14 +2238,14 @@ mod tests {
             &mut seen,
         ));
         assert!(accept_runtime_entry_name(
-            ENGINE_EXE,
+            SING_BOX_EXE,
             "sing-box.exe",
             &exact,
             &folded,
             &mut seen,
         ));
         assert!(!accept_runtime_entry_name(
-            ENGINE_EXE,
+            SING_BOX_EXE,
             "sing-box.exe",
             &exact,
             &folded,
@@ -2094,12 +2256,12 @@ mod tests {
     #[test]
     fn execution_lock_contains_only_the_executable_and_adjacent_library() {
         let fixture = FixtureLayout::create();
-        let execution = execution_lock(&fixture.lock).unwrap();
+        let execution = execution_lock(&fixture.lock, fixture.descriptor).unwrap();
         assert_eq!(execution.runtime_files.len(), 2);
         assert!(execution
             .runtime_files
             .iter()
-            .any(|entry| entry.path == ENGINE_EXE));
+            .any(|entry| entry.path == SING_BOX_EXE));
         assert!(execution
             .runtime_files
             .iter()
@@ -2116,7 +2278,7 @@ mod tests {
             size: 1,
             sha256: digest(b"x"),
         });
-        assert!(execution_lock(&ambiguous).is_err());
+        assert!(execution_lock(&ambiguous, fixture.descriptor).is_err());
 
         let mut disguised = fixture.lock.clone();
         disguised.runtime_files.push(LockedFile {
@@ -2125,7 +2287,7 @@ mod tests {
             size: 1,
             sha256: digest(b"x"),
         });
-        assert!(execution_lock(&disguised).is_err());
+        assert!(execution_lock(&disguised, fixture.descriptor).is_err());
     }
 
     #[test]
@@ -2152,7 +2314,7 @@ mod tests {
         .is_err());
         assert!(OpenOptions::new()
             .write(true)
-            .open(fixture.layout.engine_dir.join(ENGINE_EXE))
+            .open(fixture.layout.engine_dir.join(SING_BOX_EXE))
             .is_err());
         drop(guards);
         fs::write(fixture.layout.engine_dir.join("late.dll"), b"foreign").unwrap();
@@ -2167,12 +2329,13 @@ mod tests {
             .join(format!("session-{}", random_hex(16).unwrap()));
         create_private_directory(&session).unwrap();
         let (source, _) = fixture.layout.verify_lock(&fixture.lock).unwrap();
-        let sealed = SealedEngine::create(&session, &fixture.lock, &source).unwrap();
+        let sealed =
+            SealedEngine::create(&session, &fixture.lock, &source, fixture.descriptor).unwrap();
         drop(source);
 
         assert!(sealed.directory.starts_with(&session));
         assert_ne!(sealed.directory, fixture.layout.engine_dir);
-        assert!(sealed.directory.join(ENGINE_EXE).is_file());
+        assert!(sealed.directory.join(SING_BOX_EXE).is_file());
         assert!(sealed.directory.join(CRONET_DLL).is_file());
         assert!(!sealed.directory.join("LICENSE").exists());
         assert!(OpenOptions::new()
@@ -2182,7 +2345,7 @@ mod tests {
             .is_err());
         assert!(OpenOptions::new()
             .write(true)
-            .open(sealed.directory.join(ENGINE_EXE))
+            .open(sealed.directory.join(SING_BOX_EXE))
             .is_err());
         let guards = sealed.verify_for_launch().unwrap();
         assert_eq!(guards.files.len(), 2);
@@ -2190,7 +2353,7 @@ mod tests {
 
         let user = current_user_sid_string().unwrap();
         apply_protected_dacl_for_test(
-            &sealed.directory.join(ENGINE_EXE),
+            &sealed.directory.join(SING_BOX_EXE),
             &format!("O:{user}D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)"),
         )
         .unwrap();
@@ -2210,7 +2373,8 @@ mod tests {
             .join(format!("session-{}", random_hex(16).unwrap()));
         create_private_directory(&session).unwrap();
         let (source, _) = fixture.layout.verify_lock(&fixture.lock).unwrap();
-        let sealed = SealedEngine::create(&session, &fixture.lock, &source).unwrap();
+        let sealed =
+            SealedEngine::create(&session, &fixture.lock, &source, fixture.descriptor).unwrap();
         drop(source);
 
         let user = current_user_sid_string().unwrap();

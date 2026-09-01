@@ -47,18 +47,11 @@ const PROCESS_ABORT_CODE: u32 = 0x5254_444b;
 const MAX_COMMAND_LINE_UNITS: usize = 32_767;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EngineAction {
-    Check,
-    Run,
-}
-
-impl EngineAction {
-    fn verb(self) -> &'static OsStr {
-        match self {
-            Self::Check => OsStr::new("check"),
-            Self::Run => OsStr::new("run"),
-        }
-    }
+pub(crate) enum EngineCommand {
+    SingBoxCheck,
+    SingBoxRun,
+    XrayCheck,
+    XrayRun,
 }
 
 struct OwnedHandle(HANDLE);
@@ -342,13 +335,13 @@ impl Drop for PlatformProcess {
 pub(crate) fn create_suspended_engine<T>(
     executable: &Path,
     engine_dir: &Path,
-    action: EngineAction,
+    command: EngineCommand,
     config_path: &Path,
     preflight: impl FnOnce() -> Result<T, RuntimeError>,
 ) -> Result<(SuspendedProcess, T), RuntimeError> {
     let application = nul_terminated(executable.as_os_str(), "engine executable path")?;
     let current_directory = nul_terminated(engine_dir.as_os_str(), "engine directory path")?;
-    let mut command_line = command_line(executable.as_os_str(), action, config_path.as_os_str())?;
+    let mut command_line = command_line(executable.as_os_str(), command, config_path.as_os_str())?;
     let environment = environment_block()?;
 
     let security = SECURITY_ATTRIBUTES {
@@ -482,12 +475,23 @@ fn open_null(access: u32, security: &SECURITY_ATTRIBUTES) -> Result<OwnedHandle,
 
 fn command_line(
     executable: &OsStr,
-    action: EngineAction,
+    command: EngineCommand,
     config_path: &OsStr,
 ) -> Result<Vec<u16>, RuntimeError> {
     let mut output = Vec::new();
-    for (index, argument) in [executable, action.verb(), OsStr::new("-c"), config_path]
-        .into_iter()
+    let arguments: &[&OsStr] = match command {
+        EngineCommand::SingBoxCheck => &[OsStr::new("check"), OsStr::new("-c"), config_path],
+        EngineCommand::SingBoxRun => &[OsStr::new("run"), OsStr::new("-c"), config_path],
+        EngineCommand::XrayCheck => &[
+            OsStr::new("run"),
+            OsStr::new("-test"),
+            OsStr::new("-config"),
+            config_path,
+        ],
+        EngineCommand::XrayRun => &[OsStr::new("run"), OsStr::new("-config"), config_path],
+    };
+    for (index, argument) in std::iter::once(executable)
+        .chain(arguments.iter().copied())
         .enumerate()
     {
         if index != 0 {
@@ -626,6 +630,34 @@ mod tests {
         assert!(text.starts_with('"') && text.ends_with('"'));
         assert!(text.contains(r#"\"quoted\""#));
         assert!(text.ends_with(r#"\\""#));
+    }
+
+    #[test]
+    fn engine_commands_use_only_the_pinned_cli_shapes() {
+        let cases = [
+            (
+                EngineCommand::SingBoxCheck,
+                r#""engine.exe" "check" "-c" "config.json""#,
+            ),
+            (
+                EngineCommand::SingBoxRun,
+                r#""engine.exe" "run" "-c" "config.json""#,
+            ),
+            (
+                EngineCommand::XrayCheck,
+                r#""engine.exe" "run" "-test" "-config" "config.json""#,
+            ),
+            (
+                EngineCommand::XrayRun,
+                r#""engine.exe" "run" "-config" "config.json""#,
+            ),
+        ];
+        for (command, expected) in cases {
+            let encoded =
+                command_line(OsStr::new("engine.exe"), command, OsStr::new("config.json")).unwrap();
+            let actual = String::from_utf16(&encoded[..encoded.len() - 1]).unwrap();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

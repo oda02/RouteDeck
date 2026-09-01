@@ -38,22 +38,30 @@ pub fn run() {
             commands::discard_import_preview,
             commands::confirm_import,
             commands::start_local_proxy,
+            commands::start_system_proxy,
             commands::runtime_status,
             commands::stop_local_proxy,
+            commands::stop_system_proxy,
             commands::retry_session_recovery,
             commands::runtime_diagnostics,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build RouteDeck");
-    app.run(|handle, event| {
-        if matches!(
-            event,
-            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
-        ) {
+    app.run(|handle, event| match event {
+        tauri::RunEvent::ExitRequested { api, .. } => {
             if let Some(controller) = handle.try_state::<Arc<application::ApplicationController>>()
             {
-                controller.shutdown();
+                if !controller.shutdown() {
+                    api.prevent_exit();
+                }
             }
         }
+        tauri::RunEvent::Exit => {
+            if let Some(controller) = handle.try_state::<Arc<application::ApplicationController>>()
+            {
+                let _ = controller.shutdown();
+            }
+        }
+        _ => {}
     });
 }

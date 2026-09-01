@@ -18,6 +18,7 @@ pub struct LocalPorts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureMode {
     LocalProxy,
+    SystemProxy,
     Tun(TunSettings),
 }
 

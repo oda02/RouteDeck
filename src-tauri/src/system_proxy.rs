@@ -82,6 +82,13 @@ pub(crate) enum SystemProxyRestoreOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SystemProxyError(&'static str);
 
+impl SystemProxyError {
+    #[cfg(test)]
+    pub(crate) fn fixed(message: &'static str) -> Self {
+        Self(message)
+    }
+}
+
 impl fmt::Display for SystemProxyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.0)
@@ -103,6 +110,13 @@ struct SystemProxyJournal {
 trait SystemProxyBackend: Send + Sync {
     fn snapshot(&self) -> Result<SystemProxySnapshot, SystemProxyError>;
     fn apply(&self, state: &SystemProxySnapshot) -> Result<(), SystemProxyError>;
+}
+
+pub(crate) trait SystemProxyControl: Send + Sync {
+    fn publish_loopback(&self, http_port: u16) -> Result<(), SystemProxyError>;
+    fn is_owned(&self) -> Result<bool, SystemProxyError>;
+    fn restore_if_owned(&self) -> Result<SystemProxyRestoreOutcome, SystemProxyError>;
+    fn reconcile_stale_journal(&self) -> Result<SystemProxyRestoreOutcome, SystemProxyError>;
 }
 
 #[allow(dead_code)]
@@ -293,6 +307,24 @@ impl SystemProxyManager {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(_) => Err(SystemProxyError("could not remove proxy recovery journal")),
         }
+    }
+}
+
+impl SystemProxyControl for SystemProxyManager {
+    fn publish_loopback(&self, http_port: u16) -> Result<(), SystemProxyError> {
+        SystemProxyManager::publish_loopback(self, http_port)
+    }
+
+    fn is_owned(&self) -> Result<bool, SystemProxyError> {
+        SystemProxyManager::is_owned(self)
+    }
+
+    fn restore_if_owned(&self) -> Result<SystemProxyRestoreOutcome, SystemProxyError> {
+        SystemProxyManager::restore_if_owned(self)
+    }
+
+    fn reconcile_stale_journal(&self) -> Result<SystemProxyRestoreOutcome, SystemProxyError> {
+        SystemProxyManager::reconcile_stale_journal(self)
     }
 }
 #[derive(Clone, Copy)]

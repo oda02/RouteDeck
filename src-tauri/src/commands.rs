@@ -5,7 +5,7 @@ use tauri::State;
 use crate::{
     application::{
         ApplicationController, ConfirmedImport, Diagnostics, ImportPreview, PublicError,
-        PublicErrorCode, PublicErrorStage, RuntimeStatus,
+        PublicErrorCode, PublicErrorStage, RuntimeStatus, SystemProxyRouting,
     },
     domain::DefaultRoute,
 };
@@ -73,12 +73,34 @@ pub async fn start_local_proxy(
 }
 
 #[tauri::command]
+pub async fn start_system_proxy(
+    controller: State<'_, Arc<ApplicationController>>,
+    node_id: String,
+    routing: SystemProxyRouting,
+) -> Result<RuntimeStatus, PublicError> {
+    let controller = Arc::clone(controller.inner());
+    tauri::async_runtime::spawn_blocking(move || controller.start_system_proxy(&node_id, routing))
+        .await
+        .map_err(command_join_error)?
+}
+
+#[tauri::command]
 pub fn runtime_status(controller: State<'_, Arc<ApplicationController>>) -> RuntimeStatus {
     controller.status()
 }
 
 #[tauri::command]
 pub async fn stop_local_proxy(
+    controller: State<'_, Arc<ApplicationController>>,
+) -> Result<RuntimeStatus, PublicError> {
+    let controller = Arc::clone(controller.inner());
+    tauri::async_runtime::spawn_blocking(move || controller.stop())
+        .await
+        .map_err(command_join_error)?
+}
+
+#[tauri::command]
+pub async fn stop_system_proxy(
     controller: State<'_, Arc<ApplicationController>>,
 ) -> Result<RuntimeStatus, PublicError> {
     let controller = Arc::clone(controller.inner());
