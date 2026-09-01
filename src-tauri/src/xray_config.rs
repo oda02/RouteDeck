@@ -217,63 +217,52 @@ mod tests {
         let value: Value = serde_json::from_str(generated.as_str()).unwrap();
 
         assert_eq!(
-            value.pointer("/inbounds/0/listen").and_then(Value::as_str),
-            Some("127.0.0.1")
-        );
-        assert_eq!(
-            value
-                .pointer("/inbounds/0/settings/auth")
-                .and_then(Value::as_str),
-            Some("password")
-        );
-        assert_eq!(
-            value
-                .pointer("/inbounds/0/settings/udp")
-                .and_then(Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(value["outbounds"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            value
-                .pointer("/outbounds/0/settings/vnext/0/address")
-                .and_then(Value::as_str),
-            Some("example.test")
-        );
-        assert_eq!(
-            value
-                .pointer("/outbounds/0/settings/vnext/0/users/0/flow")
-                .and_then(Value::as_str),
-            Some("xtls-rprx-vision")
-        );
-        assert_eq!(
-            value
-                .pointer("/outbounds/0/settings/packetEncoding")
-                .and_then(Value::as_str),
-            Some("xudp")
-        );
-        assert_eq!(
-            value
-                .pointer("/outbounds/0/streamSettings/network")
-                .and_then(Value::as_str),
-            Some("tcp")
-        );
-        assert_eq!(
-            value
-                .pointer("/outbounds/0/streamSettings/security")
-                .and_then(Value::as_str),
-            Some("reality")
-        );
-        assert_eq!(
-            value
-                .pointer("/outbounds/0/streamSettings/realitySettings/publicKey")
-                .and_then(Value::as_str),
-            Some(public_key)
-        );
-        assert_eq!(
-            value
-                .pointer("/outbounds/0/streamSettings/realitySettings/spiderX")
-                .and_then(Value::as_str),
-            Some("/private?token=fixture")
+            value,
+            json!({
+                "log": { "loglevel": "error" },
+                "inbounds": [{
+                    "listen": "127.0.0.1",
+                    "port": 19191,
+                    "protocol": "socks",
+                    "tag": "bridge-in",
+                    "settings": {
+                        "auth": "password",
+                        "users": [{
+                            "user": "fixture-bridge-user",
+                            "pass": "fixture-bridge-password"
+                        }],
+                        "udp": true,
+                        "ip": "127.0.0.1"
+                    }
+                }],
+                "outbounds": [{
+                    "protocol": "vless",
+                    "tag": "selected",
+                    "settings": {
+                        "vnext": [{
+                            "address": "example.test",
+                            "port": 443,
+                            "users": [{
+                                "id": "11111111-2222-3333-4444-555555555555",
+                                "encryption": "none",
+                                "flow": "xtls-rprx-vision"
+                            }]
+                        }],
+                        "packetEncoding": "xudp"
+                    },
+                    "streamSettings": {
+                        "security": "reality",
+                        "network": "tcp",
+                        "realitySettings": {
+                            "serverName": "cover.test",
+                            "fingerprint": "chrome",
+                            "publicKey": public_key,
+                            "shortId": "a1b2",
+                            "spiderX": "/private?token=fixture"
+                        }
+                    }
+                }]
+            })
         );
         assert!(!format!("{generated:?}").contains("fixture-bridge-password"));
     }

@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "engine": "xray-core",
+  "purpose": "VLESS REALITY compatibility sidecar",
+  "version": "26.3.27",
+  "releaseTag": "v26.3.27",
+  "releaseCommit": "d2758a023cd7f4174a5a5fa4ff66e487d4342ba0",
+  "releaseCommitVerification": {
+    "verified": true,
+    "reason": "valid",
+    "verifiedAt": "2026-03-27T17:45:40Z"
+  },
+  "releaseAsset": {
+    "name": "Xray-windows-64.zip",
+    "url": "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-windows-64.zip",
+    "size": 20913304,
+    "sha256": "d004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad",
+    "githubApiDigest": "sha256:d004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad",
+    "digestAsset": {
+      "name": "Xray-windows-64.zip.dgst",
+      "url": "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-windows-64.zip.dgst",
+      "size": 299,
+      "sha256": "ba065fb42d4edfc262358ed726f38e76ef67045bf45f7bf2d683f69f808cf4d8",
+      "declaredArchiveSha256": "d004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad"
+    },
+    "archiveEntries": [
+      { "path": "xray_no_window.ps1", "size": 95 },
+      { "path": "xray.exe", "size": 35613696 },
+      { "path": "geoip.dat", "size": 19768301 },
+      { "path": "wintun.dll", "size": 427552 },
+      { "path": "xray_no_window.vbs", "size": 67 },
+      { "path": "geosite.dat", "size": 10491954 },
+      { "path": "LICENSE", "size": 16725 },
+      { "path": "LICENSE-wintun.txt", "size": 5431 },
+      { "path": "README.md", "size": 10813 }
+    ]
+  },
+  "runtimeFiles": [
+    {
+      "path": "xray.exe",
+      "archivePath": "xray.exe",
+      "kind": "executable",
+      "size": 35613696,
+      "sha256": "15c2d007954ac53ba69b80ec91242786b3c0b71d52649165b4ca1d5cc96ef8f1"
+    },
+    {
+      "path": "LICENSE",
+      "archivePath": "LICENSE",
+      "kind": "license",
+      "size": 16725,
+      "sha256": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5",
+      "spdx": "MPL-2.0"
+    }
+  ],
+  "excludedFromRuntime": [
+    "xray_no_window.ps1",
+    "geoip.dat",
+    "wintun.dll",
+    "xray_no_window.vbs",
+    "geosite.dat",
+    "LICENSE-wintun.txt",
+    "README.md"
+  ],
+  "provenance": {
+    "releaseId": 302486999,
+    "releaseApiUrl": "https://api.github.com/repos/XTLS/Xray-core/releases/tags/v26.3.27",
+    "releasePageUrl": "https://github.com/XTLS/Xray-core/releases/tag/v26.3.27",
+    "publishedAt": "2026-03-27T17:51:11Z",
+    "commitApiUrl": "https://api.github.com/repos/XTLS/Xray-core/commits/d2758a023cd7f4174a5a5fa4ff66e487d4342ba0",
+    "commitUrl": "https://github.com/XTLS/Xray-core/commit/d2758a023cd7f4174a5a5fa4ff66e487d4342ba0",
+    "sourceTreeUrl": "https://github.com/XTLS/Xray-core/tree/d2758a023cd7f4174a5a5fa4ff66e487d4342ba0",
+    "releaseWorkflowUrl": "https://github.com/XTLS/Xray-core/blob/d2758a023cd7f4174a5a5fa4ff66e487d4342ba0/.github/workflows/release.yml",
+    "license": {
+      "spdx": "MPL-2.0",
+      "url": "https://raw.githubusercontent.com/XTLS/Xray-core/d2758a023cd7f4174a5a5fa4ff66e487d4342ba0/LICENSE",
+      "size": 16725,
+      "sha256": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5"
+    }
+  }
+}
