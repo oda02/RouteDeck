@@ -24,7 +24,7 @@ function runtimeStatus(revision: number, phase: RuntimeStatusDto["phase"]): Runt
     nodeId: phase === "disconnected" ? undefined : "fixture-node",
     ports: phase === "disconnected" ? undefined : { http: 24080, socks: 24081, health: 24082 },
     routeCheckMs: phase === "local_proxy_ready" ? 84 : undefined,
-    engineVersion: "1.13.19",
+    engineVersion: phase === "disconnected" ? undefined : "1.13.19",
     proofs: [
       { kind: "engine_config", state: phase === "disconnected" ? "not_run" : "passed" },
       { kind: "engine_process", state: phase === "disconnected" ? "not_run" : "passed" },
@@ -44,7 +44,7 @@ test("release selection can never choose the demo controller", () => {
 });
 
 test("local-only readiness never maps to global Connected", () => {
-  assert.equal(runtimePhaseToConnectionPhase("outbound_verified"), "degraded");
+  assert.equal(runtimePhaseToConnectionPhase("outbound_verified"), "verifying-outbound");
   assert.equal(runtimePhaseToConnectionPhase("local_proxy_ready"), "degraded");
   assert.notEqual(runtimePhaseToConnectionPhase("local_proxy_ready"), "connected");
 });
@@ -107,4 +107,76 @@ test("schema validator rejects duplicate proofs and invalid enum values", () => 
     () => parseRuntimeStatus({ ...runtimeStatus(1, "disconnected"), scope: "system_proxy" }),
     ContractViolation,
   );
+});
+
+test("ready status requires complete proof, identity, latency, and distinct ports", () => {
+  const ready = runtimeStatus(4, "local_proxy_ready");
+  assert.doesNotThrow(() => parseRuntimeStatus(ready));
+  assert.throws(() => parseRuntimeStatus({ ...ready, sessionId: undefined }), ContractViolation);
+  assert.throws(
+    () => parseRuntimeStatus({ ...ready, ports: { http: 24080, socks: 24080, health: 24082 } }),
+    ContractViolation,
+  );
+  assert.throws(
+    () => parseRuntimeStatus({ ...ready, routeCheckMs: 85 }),
+    ContractViolation,
+  );
+  assert.throws(
+    () => parseRuntimeStatus({ ...ready, proofs: ready.proofs.map((proof) => proof.kind === "local_scope_ownership" ? { ...proof, state: "failed" as const } : proof) }),
+    ContractViolation,
+  );
+});
+
+test("cancelled import cannot retain or publish a late preview", async () => {
+  let resolvePreview!: (value: unknown) => void;
+  const previewResult = new Promise<unknown>((resolve) => { resolvePreview = resolve; });
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command) => {
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "preview_import_content") return previewResult;
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+  const pending = controller.previewSubscription({ type: "clipboard", value: "vless://hidden-fixture" });
+  controller.cancelImportPreview();
+  resolvePreview({
+    previewId: "preview-fixture",
+    nodes: [{ id: "node-fixture", displayName: "Fixture", protocol: "vless", insecureTls: false }],
+    rejected: [],
+    warnings: [],
+  });
+  await assert.rejects(pending, { code: "stale-subscription-preview" });
+  assert.equal(controller.getSnapshot().servers.length, 0);
+  controller.dispose();
+});
+
+test("local-only routing and settings actions fail instead of claiming success", async () => {
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async () => runtimeStatus(1, "disconnected"),
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+  assert.equal(controller.getSnapshot().runtimeScope, "local-only");
+  await assert.rejects(controller.applyRouting({ defaultRoute: "vpn", apps: [] }), { code: "capability-unavailable" });
+  await assert.rejects(controller.saveSettings(controller.getSnapshot().settings), { code: "capability-unavailable" });
+  controller.dispose();
+});
+
+test("malformed diagnostics always clears the running flag and fails closed", async () => {
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command) => command === "runtime_status"
+      ? runtimeStatus(1, "disconnected")
+      : { status: { ...runtimeStatus(2, "disconnected"), unexpected: true }, lines: [] },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+  await assert.rejects(controller.runDiagnostics(), { code: "backend-response-invalid" });
+  assert.equal(controller.getSnapshot().diagnostics.running, false);
+  assert.equal(controller.getSnapshot().backendAvailable, false);
+  controller.dispose();
 });

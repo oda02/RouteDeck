@@ -308,14 +308,15 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
   actionFailure: ActionFailure | null;
   onClearFailure: () => void;
 }) {
+  const localOnly = snapshot.runtimeScope === "local-only";
   const server = snapshot.servers.find((item) => item.id === snapshot.selectedServerId);
   const pending = pendingPhases.includes(snapshot.phase);
   const hasLiveCore = ["connected", "degraded", "blocked-by-conflict"].includes(snapshot.phase);
   const buttonLabel = pending
     ? phaseLabels[snapshot.phase]
     : hasLiveCore
-      ? snapshot.phase === "blocked-by-conflict" ? "Остановить локальный прокси" : "Отключить"
-      : snapshot.phase === "failed" ? "Повторить" : "Подключить";
+      ? localOnly || snapshot.phase === "blocked-by-conflict" ? "Остановить локальный прокси" : "Отключить"
+      : snapshot.phase === "failed" ? "Повторить" : localOnly ? "Запустить локальный прокси" : "Подключить";
   const visibleProofs = snapshot.proofs.filter((proof) => proof.id !== "config");
   const boundaryNotice = snapshot.notice?.id === "backend-unavailable" || snapshot.notice?.id === "backend-response-invalid";
   const vpnApps = snapshot.routing.apps.filter((app) => app.route === "vpn");
@@ -331,7 +332,7 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
           <p className="overline">Управление соединением</p>
           <h1 ref={headingRef} tabIndex={-1}>Главная</h1>
         </div>
-        <span className="mode-readout">{snapshot.mode === "proxy" ? "System Proxy" : "TUN"}</span>
+        <span className="mode-readout">{localOnly ? "Локальный прокси" : snapshot.mode === "proxy" ? "System Proxy" : "TUN"}</span>
       </div>
 
       <ActionFailureNotice failure={actionFailure} page="home" onClear={onClearFailure} />
@@ -356,14 +357,18 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
         <SegmentedControl
           label="Режим подключения"
           value={snapshot.mode}
-          options={[{ value: "proxy", label: "Системный прокси" }, { value: "tun", label: "TUN" }]}
+          options={localOnly
+            ? [{ value: "proxy", label: "Локальный прокси" }, { value: "tun", label: "TUN · недоступен", disabled: true }]
+            : [{ value: "proxy", label: "Системный прокси" }, { value: "tun", label: "TUN" }]}
           onChange={onModeChange}
-          disabled={pending}
+          disabled={pending || localOnly}
         />
         <div className="persistent-hint" data-kind={snapshot.mode === "tun" ? "warning" : "info"}>
           {snapshot.mode === "proxy" ? <InfoIcon size={18} /> : <ShieldIcon size={18} />}
           <p>
-            {snapshot.mode === "proxy"
+            {localOnly
+              ? "Запускает только отдельные HTTP/SOCKS-порты RouteDeck и проверяет выбранный сервер. Настройки прокси Windows, TUN и трафик приложений не изменяются."
+              : snapshot.mode === "proxy"
               ? "Работает только в приложениях, которые используют прокси Windows. Для надёжных правил по приложениям выберите TUN."
               : "Перехватывает системный трафик, может запросить UAC и проверит маршрут перед зелёным статусом."}
           </p>
@@ -395,9 +400,9 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
       <button className="summary-card" type="button" onClick={() => onNavigate("routing")}>
         <span className="summary-icon"><RoutingIcon size={20} /></span>
         <span className="selection-copy">
-          <span className="selection-label">Маршрутизация</span>
-          <strong>{routeSummary}</strong>
-          <span>{snapshot.mode === "tun" ? "Правила применяются через TUN" : "В System Proxy правила best effort"}</span>
+          <span className="selection-label">{localOnly ? "Черновик маршрутизации" : "Маршрутизация"}</span>
+          <strong>{localOnly ? "Правила не применяются" : routeSummary}</strong>
+          <span>{localOnly ? "Не применяется: Windows-routing backend ещё не подключён" : snapshot.mode === "tun" ? "Правила применяются через TUN" : "В System Proxy правила best effort"}</span>
         </span>
         <ChevronRightIcon size={20} />
       </button>
@@ -497,6 +502,7 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
   onClearFailure: () => void;
 }) {
   const [applying, setApplying] = useState(false);
+  const localOnly = snapshot.runtimeScope === "local-only";
   const dirty = JSON.stringify(draft) !== JSON.stringify(snapshot.routing);
   const summary = draft.defaultRoute === "direct"
     ? `Весь остальной трафик напрямую · ${draft.apps.filter((app) => app.route === "vpn").length} правила через VPN`
@@ -523,7 +529,9 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
     <div className="page">
       <div className="page-title-row">
         <div><p className="overline">Политика трафика</p><h1 ref={headingRef} tabIndex={-1}>Маршрутизация</h1></div>
-        {dirty ? <span className="quiet-badge warning-badge">Не сохранено</span> : <span className="quiet-badge">Применено</span>}
+        {localOnly
+          ? <span className="quiet-badge warning-badge">Только черновик</span>
+          : dirty ? <span className="quiet-badge warning-badge">Не сохранено</span> : <span className="quiet-badge">Применено</span>}
       </div>
       <ActionFailureNotice failure={actionFailure} page="routing" onClear={onClearFailure} />
       <section className="card">
@@ -534,10 +542,12 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
           options={[{ value: "direct", label: "Напрямую" }, { value: "vpn", label: "Через VPN" }]}
           onChange={(defaultRoute) => onDraftChange({ ...draft, defaultRoute })}
         />
-        <p className="effective-summary"><RoutingIcon size={18} />{summary}</p>
+        <p className="effective-summary"><RoutingIcon size={18} />{localOnly ? `Черновик: ${summary}` : summary}</p>
       </section>
 
-      {snapshot.mode === "proxy" ? (
+      {localOnly ? (
+        <OpaqueNotice notice={{ id: "local-routing-unavailable", kind: "warning", title: "Маршрутизация пока не применяется", body: "Можно подготовить черновик правил, но текущий backend запускает только локальный прокси. Он не изменяет System Proxy, TUN или маршруты приложений." }} />
+      ) : snapshot.mode === "proxy" ? (
         <OpaqueNotice notice={{ id: "proxy-routing-limit", kind: "info", title: "Правила в System Proxy работают best effort", body: "Они применяются к трафику proxy-aware приложений, который вошёл в локальный прокси. Для надёжного перехвата по приложениям нужен TUN." }} />
       ) : null}
 
@@ -561,7 +571,9 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
                 onChange={(route) => updateApp(app.id, route)}
               />
               <p className="rule-effective">
-                {snapshot.mode === "proxy"
+                {localOnly
+                  ? "Только черновик · правило не применяется к трафику"
+                  : snapshot.mode === "proxy"
                   ? "Best effort в proxy-aware приложениях · гарантия требует TUN"
                   : app.route === "inherit" ? `Эффективно: ${draft.defaultRoute === "direct" ? "напрямую" : "VPN"}` : `Эффективно: ${app.route === "direct" ? "напрямую" : "VPN"}`}
               </p>
@@ -569,8 +581,8 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
           ))}
         </div>
       </section>
-      <button className="primary-button" type="button" disabled={!dirty || applying} aria-busy={applying} onClick={apply}>
-        {applying ? <LoaderIcon size={20} /> : <CheckIcon size={20} />}{applying ? "Применяем…" : "Применить изменения"}
+      <button className="primary-button" type="button" disabled={localOnly || !dirty || applying} aria-busy={applying} onClick={apply} title={localOnly ? "Windows-routing backend ещё не подключён" : undefined}>
+        {applying ? <LoaderIcon size={20} /> : <CheckIcon size={20} />}{applying ? "Применяем…" : localOnly ? "Применение недоступно" : "Применить изменения"}
       </button>
     </div>
   );
@@ -589,6 +601,7 @@ function SettingsPage({ headingRef, snapshot, draft, onDraftChange, onSave, onRe
   onClearFailure: () => void;
 }) {
   const [saving, setSaving] = useState(false);
+  const localOnly = snapshot.runtimeScope === "local-only";
   const dirty = JSON.stringify(draft) !== JSON.stringify(snapshot.settings);
   const portsValid = draft.httpPort >= 1024 && draft.httpPort <= 65535 && draft.socksPort >= 1024 && draft.socksPort <= 65535 && draft.httpPort !== draft.socksPort;
   const save = () => {
@@ -610,30 +623,32 @@ function SettingsPage({ headingRef, snapshot, draft, onDraftChange, onSave, onRe
       </div>
       <ActionFailureNotice failure={actionFailure} page="settings" onClear={onClearFailure} />
 
+      {localOnly ? <OpaqueNotice notice={{ id: "local-settings-unavailable", kind: "warning", title: "Настройки пока остаются черновиком", body: "Текущий backend выбирает временные локальные порты сам и не применяет настройки System Proxy, TUN, трея или автозапуска. Элементы ниже можно осмотреть, но сохранить их пока нельзя." }} /> : null}
+
       <section className="card settings-group">
         <div className="section-heading compact-heading"><div><p className="overline">Интерфейс</p><h2>Общие</h2></div></div>
-        <label className="check-row"><input type="checkbox" checked={draft.startMinimized} onChange={(event) => onDraftChange({ ...draft, startMinimized: event.target.checked })} /><span><strong>Запускать свёрнутым</strong><small>Показывать RouteDeck только в трее после старта</small></span></label>
-        <label className="field-row"><span><strong>При закрытии окна</strong><small>Действие системной кнопки закрытия</small></span><select value={draft.closeBehavior} onChange={(event) => onDraftChange({ ...draft, closeBehavior: event.target.value as SettingsConfig["closeBehavior"] })}><option value="tray">Скрыть в трей</option><option value="exit">Завершить работу</option></select></label>
-        <label className="field-row"><span><strong>Тема</strong><small>Dark-first, без внешних шрифтов</small></span><select value={draft.theme} onChange={(event) => onDraftChange({ ...draft, theme: event.target.value as SettingsConfig["theme"] })}><option value="dark">Тёмная</option><option value="light">Светлая</option><option value="system">Как в Windows</option></select></label>
+        <label className="check-row"><input type="checkbox" disabled={localOnly} checked={draft.startMinimized} onChange={(event) => onDraftChange({ ...draft, startMinimized: event.target.checked })} /><span><strong>Запускать свёрнутым</strong><small>Показывать RouteDeck только в трее после старта</small></span></label>
+        <label className="field-row"><span><strong>При закрытии окна</strong><small>Действие системной кнопки закрытия</small></span><select disabled={localOnly} value={draft.closeBehavior} onChange={(event) => onDraftChange({ ...draft, closeBehavior: event.target.value as SettingsConfig["closeBehavior"] })}><option value="tray">Скрыть в трей</option><option value="exit">Завершить работу</option></select></label>
+        <label className="field-row"><span><strong>Тема</strong><small>Dark-first, без внешних шрифтов</small></span><select disabled={localOnly} value={draft.theme} onChange={(event) => onDraftChange({ ...draft, theme: event.target.value as SettingsConfig["theme"] })}><option value="dark">Тёмная</option><option value="light">Светлая</option><option value="system">Как в Windows</option></select></label>
       </section>
 
       <section className="card settings-group">
         <div className="section-heading compact-heading"><div><p className="overline">Локальные endpoints</p><h2>Подключение</h2></div></div>
-        <label className="number-field"><span>HTTP-порт</span><input type="number" min="1024" max="65535" value={draft.httpPort} aria-describedby="port-help" onChange={(event) => onDraftChange({ ...draft, httpPort: Number(event.target.value) })} /></label>
-        <label className="number-field"><span>SOCKS-порт</span><input type="number" min="1024" max="65535" value={draft.socksPort} aria-describedby="port-help" onChange={(event) => onDraftChange({ ...draft, socksPort: Number(event.target.value) })} /></label>
+        <label className="number-field"><span>HTTP-порт</span><input type="number" disabled={localOnly} min="1024" max="65535" value={draft.httpPort} aria-describedby="port-help" onChange={(event) => onDraftChange({ ...draft, httpPort: Number(event.target.value) })} /></label>
+        <label className="number-field"><span>SOCKS-порт</span><input type="number" disabled={localOnly} min="1024" max="65535" value={draft.socksPort} aria-describedby="port-help" onChange={(event) => onDraftChange({ ...draft, socksPort: Number(event.target.value) })} /></label>
         <p id="port-help" className={`field-help${portsValid ? "" : " field-error"}`}>{portsValid ? "Допустимо: 1024–65535. Порты должны отличаться." : "Укажите разные свободные порты от 1024 до 65535."}</p>
       </section>
 
       <section className="card settings-group">
         <div className="section-heading compact-heading"><div><p className="overline">Владение Windows</p><h2>Совместимость с другими VPN</h2></div></div>
-        <label className="radio-setting"><input type="radio" name="proxy-policy" value="never-overwrite" checked={draft.proxyConflictPolicy === "never-overwrite"} onChange={() => onDraftChange({ ...draft, proxyConflictPolicy: "never-overwrite" })} /><span><strong>Никогда не перезаписывать чужой прокси</strong><small>Безопасный вариант: сохранить состояние и показать конфликт</small></span></label>
-        <label className="radio-setting"><input type="radio" name="proxy-policy" value="ask" checked={draft.proxyConflictPolicy === "ask"} onChange={() => onDraftChange({ ...draft, proxyConflictPolicy: "ask" })} /><span><strong>Всегда спрашивать</strong><small>Показывать точные текущие и ожидаемые endpoints</small></span></label>
+        <label className="radio-setting"><input type="radio" disabled={localOnly} name="proxy-policy" value="never-overwrite" checked={draft.proxyConflictPolicy === "never-overwrite"} onChange={() => onDraftChange({ ...draft, proxyConflictPolicy: "never-overwrite" })} /><span><strong>Никогда не перезаписывать чужой прокси</strong><small>Безопасный вариант: сохранить состояние и показать конфликт</small></span></label>
+        <label className="radio-setting"><input type="radio" disabled={localOnly} name="proxy-policy" value="ask" checked={draft.proxyConflictPolicy === "ask"} onChange={() => onDraftChange({ ...draft, proxyConflictPolicy: "ask" })} /><span><strong>Всегда спрашивать</strong><small>Показывать точные текущие и ожидаемые endpoints</small></span></label>
         <div className="persistent-hint" data-kind="info"><InfoIcon size={18} /><p>Windows использует один эффективный системный прокси. Разные локальные порты не создают двух владельцев.</p></div>
       </section>
 
       <details className="card advanced-settings"><summary>Расширенные настройки</summary><div className="details-body"><p>Строгая маршрутизация TUN уменьшает утечки DNS, но может конфликтовать с виртуальными адаптерами. Диагностика покажет конкретную причину до UAC.</p><p>Сервис, драйвер и задача автозапуска в первой версии не устанавливаются.</p></div></details>
 
-      <button className="primary-button" type="button" disabled={!dirty || !portsValid || saving} aria-busy={saving} onClick={save}>{saving ? <LoaderIcon size={20} /> : <CheckIcon size={20} />}{saving ? "Сохраняем…" : "Сохранить изменения"}</button>
+      <button className="primary-button" type="button" disabled={localOnly || !dirty || !portsValid || saving} aria-busy={saving} onClick={save} title={localOnly ? "Сохранение настроек ещё не подключено" : undefined}>{saving ? <LoaderIcon size={20} /> : <CheckIcon size={20} />}{saving ? "Сохраняем…" : localOnly ? "Сохранение недоступно" : "Сохранить изменения"}</button>
 
       <section className="danger-zone" aria-labelledby="danger-title"><div><h2 id="danger-title">Опасная зона</h2><p>Сбрасывает только локальные настройки и черновики RouteDeck. Чужой VPN и настройки Windows не изменяются.</p></div><button className="danger-button" type="button" onClick={onReset}>Сбросить локальное состояние…</button></section>
     </div>
@@ -776,16 +791,24 @@ export default function App() {
   const headingRef = useRef<HTMLHeadingElement>(null);
   const subscriptionInputRef = useRef<HTMLInputElement>(null);
   const clipboardButtonRef = useRef<HTMLButtonElement>(null);
+  const importGeneration = useRef(0);
   const scrollPositions = useRef<Record<Destination, number>>({ home: 0, servers: 0, routing: 0, settings: 0, diagnostics: 0 });
 
+  const invalidateImport = useCallback(() => {
+    importGeneration.current += 1;
+    controller.cancelImportPreview();
+    setImporting(false);
+  }, []);
+
   const closeDialog = useCallback(() => {
+    invalidateImport();
     setDialog(null);
     setPendingMode(null);
     setImportError("");
     setSubscriptionPreview(null);
     setSubscriptionSource("");
     setSubscriptionVisible(false);
-  }, []);
+  }, [invalidateImport]);
 
   const showToast = useCallback((message: string, kind: ToastKind = "success") => {
     setToast({ message, kind });
@@ -925,18 +948,24 @@ export default function App() {
   });
 
   const readClipboardSource = () => {
+    controller.cancelImportPreview();
+    const generation = ++importGeneration.current;
     void runAsyncAction({
       page: "servers",
       title: "Не удалось прочитать буфер обмена",
-      setBusy: setImporting,
+      setBusy: (busy) => {
+        if (generation === importGeneration.current) setImporting(busy);
+      },
       action: () => navigator.clipboard.readText(),
       retry: readClipboardSource,
       errorPresentation: "inline",
       onError: (publicError) => {
+        if (generation !== importGeneration.current) return;
         setImportError(publicError.message);
         focusImportInput();
       },
       onSuccess: (value) => {
+        if (generation !== importGeneration.current) return;
         setSubscriptionSource(value);
         setImportError(value.trim() ? "" : "Буфер обмена пуст.");
         if (!value.trim()) focusImportInput();
@@ -955,21 +984,27 @@ export default function App() {
       return;
     }
     setImportError("");
+    controller.cancelImportPreview();
+    const generation = ++importGeneration.current;
     const source: SubscriptionImportSource = importMethod === "url"
       ? { type: "url", value: subscriptionSource }
       : { type: "clipboard", value: subscriptionSource };
     void runAsyncAction({
       page: "servers",
       title: "Не удалось проверить подписку",
-      setBusy: setImporting,
+      setBusy: (busy) => {
+        if (generation === importGeneration.current) setImporting(busy);
+      },
       action: () => controller.previewSubscription(source),
       retry: previewImport,
       errorPresentation: "inline",
       onError: (publicError) => {
+        if (generation !== importGeneration.current) return;
         setImportError(publicError.message);
         focusImportInput();
       },
       onSuccess: (preview) => {
+        if (generation !== importGeneration.current) return;
         // The raw URL/share-list is a secret and is no longer needed after the
         // backend has converted it into a masked preview token.
         setSubscriptionSource("");
@@ -981,15 +1016,21 @@ export default function App() {
 
   const commitImport = () => {
     if (!subscriptionPreview) return;
+    const generation = ++importGeneration.current;
     void runAsyncAction({
       page: "servers",
       title: "Не удалось импортировать подписку",
-      setBusy: setImporting,
+      setBusy: (busy) => {
+        if (generation === importGeneration.current) setImporting(busy);
+      },
       action: () => controller.commitSubscription(subscriptionPreview),
       retry: commitImport,
       errorPresentation: "inline",
-      onError: (publicError) => setImportError(publicError.message),
+      onError: (publicError) => {
+        if (generation === importGeneration.current) setImportError(publicError.message);
+      },
       onSuccess: () => {
+        if (generation !== importGeneration.current) return;
         closeDialog();
         setSubscriptionSource("");
         showToast("Подписка проверена и импортирована", "success");
@@ -1020,7 +1061,7 @@ export default function App() {
       case "home":
         return <HomePage snapshot={snapshot} headingRef={headingRef} onNavigate={navigate} onModeChange={handleModeChange} onConnect={handleConnect} onDisconnect={disconnect} onRetry={retryConnection} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "servers":
-        return <ServersPage snapshot={snapshot} headingRef={headingRef} search={search} onSearch={setSearch} onImport={() => setDialog("import")} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
+        return <ServersPage snapshot={snapshot} headingRef={headingRef} search={search} onSearch={setSearch} onImport={() => { invalidateImport(); setDialog("import"); }} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "routing":
         return <RoutingPage snapshot={snapshot} headingRef={headingRef} draft={routingDraft} onDraftChange={setRoutingDraft} onApply={applyRouting} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "settings":
@@ -1057,7 +1098,7 @@ export default function App() {
           focusKey={subscriptionPreview ? "preview" : "source"}
           onClose={closeDialog}
           actions={subscriptionPreview ? <>
-            <button className="secondary-button" type="button" data-autofocus onClick={() => { setSubscriptionPreview(null); setImportError(""); }}>Назад</button>
+            <button className="secondary-button" type="button" data-autofocus onClick={() => { invalidateImport(); setSubscriptionPreview(null); setImportError(""); }}>Назад</button>
             <button className="primary-button dialog-primary" type="button" disabled={importing} aria-busy={importing} onClick={commitImport}>{importing ? <LoaderIcon size={19} /> : <ImportIcon size={19} />}{importing ? "Импортируем…" : "Подтвердить импорт"}</button>
           </> : <>
             <button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Отмена</button>
@@ -1079,7 +1120,7 @@ export default function App() {
               label="Источник подписки"
               value={importMethod}
               options={[{ value: "url", label: "URL" }, { value: "clipboard", label: "Буфер" }, { value: "file", label: "Файл · скоро", disabled: true }]}
-              onChange={(method) => { setImportMethod(method); setSubscriptionSource(""); setSubscriptionVisible(false); setImportError(""); setSubscriptionPreview(null); }}
+              onChange={(method) => { invalidateImport(); setImportMethod(method); setSubscriptionSource(""); setSubscriptionVisible(false); setImportError(""); setSubscriptionPreview(null); }}
             />
             {importMethod === "url" ? (
               <div className="dialog-field"><label htmlFor="subscription-url">URL подписки</label><span className="secret-input"><input ref={subscriptionInputRef} id="subscription-url" type={subscriptionVisible ? "text" : "password"} autoComplete="off" value={subscriptionSource} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-help"} placeholder="https://provider.example/••••" onChange={(event) => { setSubscriptionSource(event.target.value); setImportError(""); }} /><button className="icon-button" type="button" aria-label={subscriptionVisible ? "Скрыть URL" : "Показать URL"} title={subscriptionVisible ? "Скрыть URL" : "Показать URL"} onClick={() => setSubscriptionVisible((visible) => !visible)}><EyeIcon size={18} /></button></span><small id="import-help">URL передаётся typed adapter как секрет и не попадает в диагностику.</small>{importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}</div>

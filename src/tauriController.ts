@@ -17,6 +17,7 @@ import type {
 import {
   ContractViolation,
   RuntimeRevisionGate,
+  isVerifiedLocalReady,
   parseConfirmedImport,
   parseDiagnostics,
   parseImportPreview,
@@ -70,6 +71,7 @@ const defaultSettings = (): SettingsConfig => ({
 
 const initialTauriSnapshot = (): ControllerSnapshot => ({
   isDemo: false,
+  runtimeScope: "local-only",
   backendAvailable: true,
   phase: "disconnected",
   mode: "proxy",
@@ -112,6 +114,7 @@ export function runtimePhaseToConnectionPhase(phase: RuntimePhaseDto): Connectio
     case "proving_traffic":
       return "verifying-outbound";
     case "outbound_verified":
+      return "verifying-outbound";
     case "local_proxy_ready":
     case "degraded":
       // The backend has proved only its explicit local proxy. It has not applied
@@ -222,7 +225,7 @@ export function projectRuntimeProofs(status: RuntimeStatusDto): ConnectionProof[
 }
 
 function runtimeNotice(status: RuntimeStatusDto): AppNotice | undefined {
-  if (status.phase === "outbound_verified" || status.phase === "local_proxy_ready") {
+  if (isVerifiedLocalReady(status)) {
     const endpoint = status.ports ? `127.0.0.1:${status.ports.http}` : "локальном порту";
     return {
       id: "local-proxy-only",
@@ -291,6 +294,7 @@ export class TauriController implements RouteDeckController {
   private boundaryFailed = false;
   private runtime?: RuntimeStatusDto;
   private pendingImport?: { dto: ImportPreviewDto; projected: SubscriptionPreview };
+  private importGeneration = 0;
   private beforeUnload?: () => void;
 
   constructor(loader: TauriTransportLoader = loadTauriTransport) {
@@ -438,6 +442,8 @@ export class TauriController implements RouteDeckController {
   };
 
   previewSubscription = async (source: SubscriptionImportSource): Promise<SubscriptionPreview> => {
+    const generation = ++this.importGeneration;
+    this.pendingImport = undefined;
     const content = source.value;
     if (!content.trim()) throw new RouteDeckError("empty-subscription-source");
     if (source.type === "url" && /^https:\/\//i.test(content.trim())) {
@@ -457,6 +463,7 @@ export class TauriController implements RouteDeckController {
       this.failBoundary("backend-response-invalid");
       throw new RouteDeckError("backend-response-invalid");
     }
+    if (generation !== this.importGeneration) throw new RouteDeckError("stale-subscription-preview");
     const counts = new Map<Protocol, number>();
     dto.nodes.forEach((node) => {
       const protocol = protocolName(node.protocol);
@@ -475,9 +482,15 @@ export class TauriController implements RouteDeckController {
     return projected;
   };
 
+  cancelImportPreview = (): void => {
+    this.importGeneration += 1;
+    this.pendingImport = undefined;
+  };
+
   commitSubscription = async (preview: SubscriptionPreview): Promise<void> => {
     const pending = this.pendingImport;
     if (!pending || preview.token !== pending.projected.token) throw new RouteDeckError("stale-subscription-preview");
+    const generation = ++this.importGeneration;
     const transport = await this.requireTransport();
     let raw: unknown;
     try {
@@ -497,6 +510,7 @@ export class TauriController implements RouteDeckController {
       this.failBoundary("backend-response-invalid");
       throw new RouteDeckError("backend-response-invalid");
     }
+    if (generation !== this.importGeneration) throw new RouteDeckError("stale-subscription-preview");
     const confirmedIds = new Set(confirmed.nodeIds);
     const servers: Server[] = pending.dto.nodes
       .filter((node) => confirmedIds.has(node.id))
@@ -518,28 +532,24 @@ export class TauriController implements RouteDeckController {
     });
   };
 
-  applyRouting = async (routing: RoutingConfig): Promise<void> => {
-    if (this.runtime && !["disconnected", "disconnected_with_error", "recovery_required"].includes(this.runtime.phase)) {
-      throw new RouteDeckError("runtime-failure");
-    }
-    this.publish({ routing });
+  applyRouting = async (_routing: RoutingConfig): Promise<void> => {
+    throw new RouteDeckError("capability-unavailable");
   };
 
-  saveSettings = async (settings: SettingsConfig): Promise<void> => {
-    this.publish({ settings });
+  saveSettings = async (_settings: SettingsConfig): Promise<void> => {
+    throw new RouteDeckError("capability-unavailable");
   };
 
   runDiagnostics = async (): Promise<void> => {
     const transport = await this.requireTransport();
     this.publish({ diagnostics: { ...this.snapshot.diagnostics, running: true } });
-    let raw: unknown;
     try {
-      raw = await transport.invoke("runtime_diagnostics");
-    } catch (error) {
-      this.publish({ diagnostics: { ...this.snapshot.diagnostics, running: false } });
-      throw safeInvokeError(error);
-    }
-    try {
+      let raw: unknown;
+      try {
+        raw = await transport.invoke("runtime_diagnostics");
+      } catch (error) {
+        throw safeInvokeError(error);
+      }
       const diagnostics = parseDiagnostics(raw);
       this.acceptRuntime(diagnostics.status);
       this.publish({
@@ -550,9 +560,14 @@ export class TauriController implements RouteDeckController {
           sanitizedLog: diagnostics.lines,
         },
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof RouteDeckError) throw error;
       this.failBoundary("backend-response-invalid");
       throw new RouteDeckError("backend-response-invalid");
+    } finally {
+      if (this.snapshot.diagnostics.running) {
+        this.publish({ diagnostics: { ...this.snapshot.diagnostics, running: false } });
+      }
     }
   };
 

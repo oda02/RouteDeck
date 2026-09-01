@@ -44,6 +44,7 @@ const demoProofs = (): ConnectionProof[] => baseProofs().map((proof) =>
 
 const initialSnapshot: ControllerSnapshot = {
   isDemo: true,
+  runtimeScope: "demo",
   backendAvailable: false,
   phase: "disconnected",
   mode: "proxy",
@@ -325,6 +326,8 @@ class DevelopmentDemoController implements RouteDeckController {
     };
   };
 
+  cancelImportPreview = () => undefined;
+
   commitSubscription = async (preview: SubscriptionPreview) => {
     if (!preview.token.startsWith("dev-preview-")) throw new RouteDeckError("stale-subscription-preview");
     await wait(280);
@@ -394,6 +397,7 @@ class DevelopmentDemoController implements RouteDeckController {
 class BackendUnavailableController implements RouteDeckController {
   private readonly snapshot: ControllerSnapshot = {
     isDemo: false,
+    runtimeScope: "unavailable",
     backendAvailable: false,
     phase: "failed",
     mode: "proxy",
@@ -447,6 +451,7 @@ class BackendUnavailableController implements RouteDeckController {
   dismissNotice = () => undefined;
   refreshServers = async () => this.unavailable();
   previewSubscription = async () => this.unavailable();
+  cancelImportPreview = () => undefined;
   commitSubscription = async () => this.unavailable();
   applyRouting = async () => this.unavailable();
   saveSettings = async () => this.unavailable();

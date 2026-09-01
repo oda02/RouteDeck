@@ -125,6 +125,12 @@ function record(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function exactKeys(input: Record<string, unknown>, allowed: readonly string[], required: readonly string[] = allowed): void {
+  const allowedSet = new Set(allowed);
+  if (Object.keys(input).some((key) => !allowedSet.has(key))) throw new ContractViolation();
+  if (required.some((key) => !(key in input))) throw new ContractViolation();
+}
+
 function finiteInteger(value: unknown, minimum = 0, maximum = Number.MAX_SAFE_INTEGER): number {
   if (!Number.isSafeInteger(value) || (value as number) < minimum || (value as number) > maximum) {
     throw new ContractViolation();
@@ -144,6 +150,13 @@ function optionalString(value: unknown, maximum: number): string | undefined {
   return boundedString(value, maximum);
 }
 
+function optionalIdentifier(value: unknown, maximum: number): string | undefined {
+  const text = optionalString(value, maximum);
+  if (text === undefined) return undefined;
+  if (!/^[A-Za-z0-9_-]+$/.test(text)) throw new ContractViolation();
+  return text;
+}
+
 function member<const T extends readonly string[]>(value: unknown, allowed: T): T[number] {
   if (typeof value !== "string" || !allowed.includes(value)) throw new ContractViolation();
   return value as T[number];
@@ -156,6 +169,7 @@ function optionalDuration(value: unknown): number | undefined {
 
 export function parsePublicError(value: unknown): PublicErrorDto {
   const input = record(value);
+  exactKeys(input, ["code", "stage", "message", "detail"], ["code", "stage", "message"]);
   return {
     code: member(input.code, publicErrorCodes),
     stage: member(input.stage, publicErrorStages),
@@ -166,9 +180,15 @@ export function parsePublicError(value: unknown): PublicErrorDto {
 
 export function parseRuntimeStatus(value: unknown): RuntimeStatusDto {
   const input = record(value);
+  exactKeys(
+    input,
+    ["revision", "sessionId", "scope", "mode", "phase", "nodeId", "ports", "routeCheckMs", "engineVersion", "proofs", "error"],
+    ["revision", "scope", "mode", "phase", "proofs"],
+  );
   if (!Array.isArray(input.proofs) || input.proofs.length > proofKinds.length) throw new ContractViolation();
   const proofs = input.proofs.map((entry): RuntimeProofDto => {
     const proof = record(entry);
+    exactKeys(proof, ["kind", "state", "latencyMs"], ["kind", "state"]);
     return {
       kind: member(proof.kind, proofKinds),
       state: member(proof.state, proofStates),
@@ -176,35 +196,89 @@ export function parseRuntimeStatus(value: unknown): RuntimeStatusDto {
     };
   });
   const seen = new Set(proofs.map((proof) => proof.kind));
-  if (seen.size !== proofs.length) throw new ContractViolation();
+  if (seen.size !== proofs.length || proofs.length !== proofKinds.length) throw new ContractViolation();
 
   let ports: RuntimeStatusDto["ports"];
   if (input.ports !== undefined && input.ports !== null) {
     const rawPorts = record(input.ports);
+    exactKeys(rawPorts, ["http", "socks", "health"]);
     ports = {
       http: finiteInteger(rawPorts.http, 1, 65535),
       socks: finiteInteger(rawPorts.socks, 1, 65535),
       health: finiteInteger(rawPorts.health, 1, 65535),
     };
+    if (new Set([ports.http, ports.socks, ports.health]).size !== 3) throw new ContractViolation();
   }
 
-  return {
+  const status: RuntimeStatusDto = {
     revision: finiteInteger(input.revision),
-    sessionId: optionalString(input.sessionId, 256),
+    sessionId: optionalIdentifier(input.sessionId, 256),
     scope: member(input.scope, ["local_only"] as const),
     mode: member(input.mode, ["local_only"] as const),
     phase: member(input.phase, runtimePhases),
-    nodeId: optionalString(input.nodeId, 256),
+    nodeId: optionalIdentifier(input.nodeId, 256),
     ports,
     routeCheckMs: optionalDuration(input.routeCheckMs),
     engineVersion: optionalString(input.engineVersion, 128),
     proofs,
     error: input.error === undefined || input.error === null ? undefined : parsePublicError(input.error),
   };
+  validateRuntimeRelationships(status);
+  return status;
+}
+
+const readyProofKinds = [
+  "engine_config",
+  "engine_process",
+  "http_listener",
+  "socks_listener",
+  "health_listener",
+  "selected_outbound_https",
+  "local_scope_ownership",
+] as const;
+
+function validateRuntimeRelationships(status: RuntimeStatusDto): void {
+  for (const proof of status.proofs) {
+    if (proof.latencyMs !== undefined && proof.state !== "passed") throw new ContractViolation();
+    if (proof.kind !== "selected_outbound_https" && proof.latencyMs !== undefined) throw new ContractViolation();
+  }
+
+  if (status.phase === "disconnected") {
+    if (status.sessionId || status.nodeId || status.ports || status.routeCheckMs !== undefined || status.engineVersion || status.error) {
+      throw new ContractViolation();
+    }
+    if (status.proofs.length !== readyProofKinds.length || status.proofs.some((proof) => proof.state !== "not_run")) {
+      throw new ContractViolation();
+    }
+  }
+
+  if (status.phase === "local_proxy_ready") {
+    if (!status.sessionId || !status.nodeId || !status.ports || status.error || status.routeCheckMs === undefined) {
+      throw new ContractViolation();
+    }
+    if (status.proofs.length !== readyProofKinds.length) throw new ContractViolation();
+    for (const kind of readyProofKinds) {
+      const proof = status.proofs.find((candidate) => candidate.kind === kind);
+      if (!proof || proof.state !== "passed") throw new ContractViolation();
+    }
+    const outbound = status.proofs.find((proof) => proof.kind === "selected_outbound_https");
+    if (outbound?.latencyMs === undefined || outbound.latencyMs !== status.routeCheckMs) throw new ContractViolation();
+  }
+}
+
+export function isVerifiedLocalReady(status: RuntimeStatusDto): boolean {
+  if (status.phase !== "local_proxy_ready") return false;
+  try {
+    validateRuntimeRelationships(status);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function parseImportPreview(value: unknown): ImportPreviewDto {
   const input = record(value);
+  exactKeys(input, ["previewId", "nodes", "rejected", "warnings"]);
   if (!Array.isArray(input.nodes) || input.nodes.length > 2000) throw new ContractViolation();
   if (!Array.isArray(input.rejected) || input.rejected.length > 2000) throw new ContractViolation();
   if (!Array.isArray(input.warnings) || input.warnings.length > 64) throw new ContractViolation();
@@ -212,6 +286,7 @@ export function parseImportPreview(value: unknown): ImportPreviewDto {
     previewId: boundedString(input.previewId, 256),
     nodes: input.nodes.map((entry) => {
       const node = record(entry);
+      exactKeys(node, ["id", "displayName", "protocol", "insecureTls"]);
       if (typeof node.insecureTls !== "boolean") throw new ContractViolation();
       return {
         id: boundedString(node.id, 256),
@@ -222,6 +297,7 @@ export function parseImportPreview(value: unknown): ImportPreviewDto {
     }),
     rejected: input.rejected.map((entry) => {
       const rejection = record(entry);
+      exactKeys(rejection, ["index", "reason"]);
       return {
         index: finiteInteger(rejection.index, 0, 2000),
         reason: boundedString(rejection.reason, 1024),
@@ -235,6 +311,7 @@ export function parseImportPreview(value: unknown): ImportPreviewDto {
 
 export function parseConfirmedImport(value: unknown): ConfirmedImportDto {
   const input = record(value);
+  exactKeys(input, ["imported", "nodeIds"]);
   if (!Array.isArray(input.nodeIds) || input.nodeIds.length > 2000) throw new ContractViolation();
   const confirmed: ConfirmedImportDto = {
     imported: finiteInteger(input.imported, 0, 2000),
@@ -247,6 +324,7 @@ export function parseConfirmedImport(value: unknown): ConfirmedImportDto {
 
 export function parseDiagnostics(value: unknown): DiagnosticsDto {
   const input = record(value);
+  exactKeys(input, ["status", "lines"]);
   if (!Array.isArray(input.lines) || input.lines.length > 256) throw new ContractViolation();
   return {
     status: parseRuntimeStatus(input.status),

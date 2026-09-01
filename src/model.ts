@@ -109,6 +109,7 @@ export interface DiagnosticsState {
 
 export interface ControllerSnapshot {
   isDemo: boolean;
+  runtimeScope: "demo" | "local-only" | "unavailable";
   backendAvailable: boolean;
   phase: ConnectionPhase;
   mode: ConnectionMode;
@@ -169,6 +170,7 @@ export interface RouteDeckController {
   dismissNotice: () => void;
   refreshServers: () => Promise<void>;
   previewSubscription: (source: SubscriptionImportSource) => Promise<SubscriptionPreview>;
+  cancelImportPreview: () => void;
   commitSubscription: (preview: SubscriptionPreview) => Promise<void>;
   applyRouting: (routing: RoutingConfig) => Promise<void>;
   saveSettings: (settings: SettingsConfig) => Promise<void>;
