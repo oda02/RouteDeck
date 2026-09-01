@@ -95,7 +95,9 @@ test("subscription transport choice is closed, accessible, and responsive", () =
   assert.match(source, /value: "direct", label: "Напрямую"/);
   assert.match(source, /value: "current_loopback_system_proxy", label: "Через текущий локальный системный прокси"/);
   assert.match(source, /не меняет настройку Windows, не переключается автоматически и не отправляет URL повторно/);
-  assert.match(source, /CONNECT к закреплённому публичному IP; URL и путь остаются внутри TLS исходного сервера/);
+  assert.match(source, /Прокси видит этот IP и может видеть имя сервера через TLS SNI/);
+  assert.match(source, /секретные path, query\/token, HTTP-заголовки и содержимое подписки остаются зашифрованы TLS/);
+  assert.doesNotMatch(source, /URL и путь остаются внутри TLS/);
   assert.match(styles, /@media \(max-width: 399px\)[\s\S]*\.subscription-transport \.segmented-control\s*{\s*grid-template-columns: minmax\(0, 1fr\)/);
 });
 
