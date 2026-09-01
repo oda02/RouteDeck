@@ -187,7 +187,8 @@ impl Node {
 
     fn security_identity(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(self.update_key.as_bytes());
+        hasher.update(b"RouteDeck/InsecureApproval/TLS/v1\0");
+        hash_tagged_component(&mut hasher, b"node.update_key", &self.update_key);
         if let Some(tls) = self.protocol.tls() {
             tls.hash_security_identity(&mut hasher);
         }
@@ -535,28 +536,75 @@ impl TlsOptions {
     }
 
     fn hash_security_identity(&self, hasher: &mut Sha256) {
-        hasher.update([u8::from(self.enabled), u8::from(self.insecure)]);
-        hash_component(hasher, self.server_name.as_deref().unwrap_or_default());
-        for value in &self.alpn {
-            hash_component(hasher, value);
-        }
-        hash_component(hasher, self.utls_fingerprint.as_deref().unwrap_or_default());
-        for value in &self.certificate_public_key_sha256 {
-            hash_component(hasher, value.expose());
-        }
-        for value in &self.ech_config {
-            hash_component(hasher, value.expose());
-        }
+        hash_tagged_bool(hasher, b"tls.enabled", self.enabled);
+        hash_tagged_bool(hasher, b"tls.insecure", self.insecure);
+        hash_tagged_optional(hasher, b"tls.server_name", self.server_name.as_deref());
+        hash_tagged_list(hasher, b"tls.alpn", self.alpn.iter().map(String::as_str));
+        hash_tagged_optional(
+            hasher,
+            b"tls.utls_fingerprint",
+            self.utls_fingerprint.as_deref(),
+        );
+        hash_tagged_list(
+            hasher,
+            b"tls.certificate_public_key_sha256",
+            self.certificate_public_key_sha256
+                .iter()
+                .map(Secret::expose),
+        );
+        hash_tagged_list(
+            hasher,
+            b"tls.ech_config",
+            self.ech_config.iter().map(Secret::expose),
+        );
+        hash_tagged_bool(hasher, b"tls.reality.present", self.reality.is_some());
         if let Some(reality) = &self.reality {
-            hash_component(hasher, reality.public_key.expose());
-            hash_component(hasher, reality.short_id.expose());
+            hash_tagged_component(
+                hasher,
+                b"tls.reality.public_key",
+                reality.public_key.expose(),
+            );
+            hash_tagged_component(hasher, b"tls.reality.short_id", reality.short_id.expose());
         }
     }
 }
 
-fn hash_component(hasher: &mut Sha256, value: &str) {
+fn hash_tag(hasher: &mut Sha256, tag: &[u8]) {
+    hasher.update((tag.len() as u64).to_le_bytes());
+    hasher.update(tag);
+}
+
+fn hash_tagged_component(hasher: &mut Sha256, tag: &[u8], value: &str) {
+    hash_tag(hasher, tag);
     hasher.update((value.len() as u64).to_le_bytes());
     hasher.update(value.as_bytes());
+}
+
+fn hash_tagged_bool(hasher: &mut Sha256, tag: &[u8], value: bool) {
+    hash_tag(hasher, tag);
+    hasher.update([u8::from(value)]);
+}
+
+fn hash_tagged_optional(hasher: &mut Sha256, tag: &[u8], value: Option<&str>) {
+    hash_tag(hasher, tag);
+    hasher.update([u8::from(value.is_some())]);
+    if let Some(value) = value {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+}
+
+fn hash_tagged_list<'a>(
+    hasher: &mut Sha256,
+    tag: &[u8],
+    values: impl ExactSizeIterator<Item = &'a str>,
+) {
+    hash_tag(hasher, tag);
+    hasher.update((values.len() as u64).to_le_bytes());
+    for value in values {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
 }
 
 impl fmt::Debug for TlsOptions {
@@ -1033,5 +1081,54 @@ mod tests {
         assert_eq!(first.update_key(), second.update_key());
         assert_ne!(first.id(), second.id());
         assert!(!format!("{first:?}").contains("11111111"));
+    }
+
+    #[test]
+    fn insecure_approval_identity_domain_separates_tls_fields_and_reality() {
+        fn imported(tls: &str) -> Node {
+            let json = format!(
+                r#"{{"type":"vless","tag":"identity","server":"example.test","server_port":443,"uuid":"11111111-2222-3333-4444-555555555555","tls":{tls}}}"#
+            );
+            crate::subscription::import_subscription(json.as_bytes())
+                .unwrap()
+                .nodes
+                .remove(0)
+        }
+
+        let pin = imported(
+            r#"{"enabled":true,"server_name":"example.test","insecure":true,"certificate_public_key_sha256":["same-value"]}"#,
+        );
+        let ech = imported(
+            r#"{"enabled":true,"server_name":"example.test","insecure":true,"ech":{"enabled":true,"config":["same-value"]}}"#,
+        );
+        assert_eq!(pin.update_key(), ech.update_key());
+        assert_ne!(pin.security_identity(), ech.security_identity());
+        let approval = InsecureApproval::record_explicit_user_approval(&pin).unwrap();
+        assert!(!approval.matches(&ech));
+
+        let no_reality =
+            imported(r#"{"enabled":true,"server_name":"example.test","insecure":true}"#);
+        let reality_a = imported(
+            r#"{"enabled":true,"server_name":"example.test","insecure":true,"reality":{"enabled":true,"public_key":"abcdefghijklmnopqrstuvwxyzABCDEFGH123456789","short_id":"a1"}}"#,
+        );
+        let reality_public_changed = imported(
+            r#"{"enabled":true,"server_name":"example.test","insecure":true,"reality":{"enabled":true,"public_key":"abcdefghijklmnopqrstuvwxyzABCDEFGH123456780","short_id":"a1"}}"#,
+        );
+        let reality_short_changed = imported(
+            r#"{"enabled":true,"server_name":"example.test","insecure":true,"reality":{"enabled":true,"public_key":"abcdefghijklmnopqrstuvwxyzABCDEFGH123456789","short_id":"b2"}}"#,
+        );
+        let identities = [
+            no_reality.security_identity(),
+            reality_a.security_identity(),
+            reality_public_changed.security_identity(),
+            reality_short_changed.security_identity(),
+        ];
+        assert_eq!(
+            identities
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            identities.len()
+        );
     }
 }
