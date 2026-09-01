@@ -38,6 +38,9 @@ const publicErrorCodes = [
   "subscription_url_invalid",
   "subscription_policy_blocked",
   "subscription_fetch_failed",
+  "subscription_proxy_unavailable",
+  "subscription_proxy_policy_blocked",
+  "subscription_proxy_connect_failed",
   "subscription_response_too_large",
   "subscription_fetch_timeout",
   "subscription_invalid_encoding",
@@ -63,6 +66,8 @@ const publicErrorStages = [
   "subscription_url",
   "subscription_dns",
   "subscription_fetch",
+  "subscription_proxy",
+  "subscription_proxy_connect",
   "subscription_response",
 ] as const;
 const protocols = ["vless", "hysteria2", "naive"] as const;
@@ -190,8 +195,11 @@ export function parsePublicError(value: unknown): PublicErrorDto {
     subscription_url_invalid: { message: "subscription.url.invalid", stages: ["subscription_url"] },
     subscription_policy_blocked: { message: "subscription.policy_blocked", stages: ["subscription_url", "subscription_dns"] },
     subscription_fetch_failed: { message: "subscription.fetch_failed", stages: ["subscription_dns", "subscription_fetch"] },
+    subscription_proxy_unavailable: { message: "subscription.proxy.unavailable", stages: ["subscription_proxy"] },
+    subscription_proxy_policy_blocked: { message: "subscription.proxy.policy_blocked", stages: ["subscription_proxy"] },
+    subscription_proxy_connect_failed: { message: "subscription.proxy.connect_failed", stages: ["subscription_proxy_connect"] },
     subscription_response_too_large: { message: "subscription.response_too_large", stages: ["subscription_response"] },
-    subscription_fetch_timeout: { message: "subscription.timeout", stages: ["subscription_fetch"] },
+    subscription_fetch_timeout: { message: "subscription.timeout", stages: ["subscription_fetch", "subscription_proxy_connect"] },
     subscription_invalid_encoding: { message: "subscription.invalid_encoding", stages: ["subscription_response"] },
   };
   const subscriptionContract = subscriptionContracts[error.code];

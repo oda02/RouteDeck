@@ -44,6 +44,7 @@ import {
   type Destination,
   type RoutingConfig,
   type SettingsConfig,
+  type SubscriptionFetchTransport,
   type SubscriptionPreview,
   type TunPathChoice,
 } from "./model";
@@ -232,8 +233,9 @@ function ProofCard({ proofs, title = "Проверка подключения", 
   );
 }
 
-function SegmentedControl<T extends string>({ label, value, options, onChange, disabled = false }: {
+function SegmentedControl<T extends string>({ label, describedBy, value, options, onChange, disabled = false }: {
   label: string;
+  describedBy?: string;
   value: T;
   options: Array<{ value: T; label: string; disabled?: boolean }>;
   onChange: (value: T) => void;
@@ -241,7 +243,7 @@ function SegmentedControl<T extends string>({ label, value, options, onChange, d
 }) {
   const groupName = useId();
   return (
-    <fieldset className="segmented-control" aria-label={label} data-count={options.length}>
+    <fieldset className="segmented-control" aria-label={label} aria-describedby={describedBy} data-count={options.length}>
       <legend className="sr-only">{label}</legend>
       {options.map((option) => (
         <label key={option.value} data-selected={value === option.value} data-disabled={disabled || option.disabled || undefined}>
@@ -783,6 +785,7 @@ export default function App() {
   const [toastPaused, setToastPaused] = useState(false);
   const [actionFailure, setActionFailure] = useState<ActionFailure | null>(null);
   const [importMethod, setImportMethod] = useState<"url" | "clipboard" | "file">("url");
+  const [subscriptionTransport, setSubscriptionTransport] = useState<SubscriptionFetchTransport>("direct");
   const [clipboardSource, setClipboardSource] = useState("");
   const [subscriptionVisible, setSubscriptionVisible] = useState(false);
   const [importError, setImportError] = useState("");
@@ -814,6 +817,7 @@ export default function App() {
     setImportError("");
     setSubscriptionPreview(null);
     setClipboardSource("");
+    setSubscriptionTransport("direct");
     clearSubscriptionUrl();
   }, [clearSubscriptionUrl, invalidateImport]);
 
@@ -1001,7 +1005,7 @@ export default function App() {
       // never copied into React state or a retry callback.
       let subscriptionUrl = subscriptionInputRef.current?.value ?? "";
       clearSubscriptionUrl();
-      pending = controller.previewSubscription({ type: "url", value: subscriptionUrl });
+      pending = controller.previewSubscription({ type: "url", value: subscriptionUrl, transport: subscriptionTransport });
       subscriptionUrl = "";
     } else {
       pending = controller.previewSubscription({ type: "clipboard", value: clipboardSource });
@@ -1080,7 +1084,7 @@ export default function App() {
       case "home":
         return <HomePage snapshot={snapshot} headingRef={headingRef} onNavigate={navigate} onModeChange={handleModeChange} onConnect={handleConnect} onDisconnect={disconnect} onRetry={retryConnection} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "servers":
-        return <ServersPage snapshot={snapshot} headingRef={headingRef} search={search} onSearch={setSearch} onImport={() => { invalidateImport(); setClipboardSource(""); clearSubscriptionUrl(); setDialog("import"); }} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
+        return <ServersPage snapshot={snapshot} headingRef={headingRef} search={search} onSearch={setSearch} onImport={() => { invalidateImport(); setClipboardSource(""); setSubscriptionTransport("direct"); clearSubscriptionUrl(); setDialog("import"); }} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "routing":
         return <RoutingPage snapshot={snapshot} headingRef={headingRef} draft={routingDraft} onDraftChange={setRoutingDraft} onApply={applyRouting} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "settings":
@@ -1146,7 +1150,24 @@ export default function App() {
             />
             {importing ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><LoaderIcon size={17} />{importMethod === "url" ? "Безопасно загружаем подписку по HTTPS…" : "Проверяем содержимое подписки…"}</p> : null}
             {importMethod === "url" ? (
-              <div className="dialog-field"><label htmlFor="subscription-url">HTTPS URL подписки</label><span className="secret-input"><input ref={subscriptionInputRef} id="subscription-url" type={subscriptionVisible ? "text" : "password"} autoComplete="off" defaultValue="" disabled={importing} data-error-autofocus={importError ? "true" : undefined} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-help"} placeholder="https://provider.example/••••" onInput={() => setImportError("")} /><button className="icon-button" type="button" disabled={importing} aria-label={subscriptionVisible ? "Скрыть URL" : "Показать URL"} title={subscriptionVisible ? "Скрыть URL" : "Показать URL"} onClick={() => setSubscriptionVisible((visible) => !visible)}><EyeIcon size={18} /></button></span><small id="import-help">Контроллер загрузит подписку по HTTPS, заблокирует опасные перенаправления и локальные адреса. URL очищается сразу после запуска и не попадает в диагностику.</small>{importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}</div>
+              <>
+                <div className="dialog-field subscription-transport">
+                  <span>Транспорт HTTPS-загрузки</span>
+                  <SegmentedControl
+                    label="Транспорт HTTPS-загрузки"
+                    describedBy="subscription-transport-help"
+                    value={subscriptionTransport}
+                    options={[
+                      { value: "direct", label: "Напрямую" },
+                      { value: "current_loopback_system_proxy", label: "Через текущий локальный системный прокси" },
+                    ]}
+                    disabled={importing}
+                    onChange={setSubscriptionTransport}
+                  />
+                  <small id="subscription-transport-help">Выбор применяется только к этой загрузке. RouteDeck не меняет настройку Windows, не переключается автоматически и не отправляет URL повторно. Прокси-режим принимает только статический числовой loopback и делает CONNECT к закреплённому публичному IP; URL и путь остаются внутри TLS исходного сервера.</small>
+                </div>
+                <div className="dialog-field"><label htmlFor="subscription-url">HTTPS URL подписки</label><span className="secret-input"><input ref={subscriptionInputRef} id="subscription-url" type={subscriptionVisible ? "text" : "password"} autoComplete="off" defaultValue="" disabled={importing} data-error-autofocus={importError ? "true" : undefined} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-help"} placeholder="https://provider.example/••••" onInput={() => setImportError("")} /><button className="icon-button" type="button" disabled={importing} aria-label={subscriptionVisible ? "Скрыть URL" : "Показать URL"} title={subscriptionVisible ? "Скрыть URL" : "Показать URL"} onClick={() => setSubscriptionVisible((visible) => !visible)}><EyeIcon size={18} /></button></span><small id="import-help">Контроллер загрузит подписку по HTTPS, заблокирует опасные перенаправления и локальные адреса. URL очищается сразу после запуска и не попадает в диагностику.</small>{importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}</div>
+              </>
             ) : (
               <div className="method-placeholder compact-placeholder">
                 <ImportIcon size={24} />

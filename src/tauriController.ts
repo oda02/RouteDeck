@@ -277,6 +277,12 @@ function routeDeckErrorFromBackend(error: PublicErrorDto): RouteDeckError {
       return new RouteDeckError("subscription-policy-blocked");
     case "subscription_fetch_failed":
       return new RouteDeckError("subscription-fetch-failed");
+    case "subscription_proxy_unavailable":
+      return new RouteDeckError("subscription-proxy-unavailable");
+    case "subscription_proxy_policy_blocked":
+      return new RouteDeckError("subscription-proxy-policy-blocked");
+    case "subscription_proxy_connect_failed":
+      return new RouteDeckError("subscription-proxy-connect-failed");
     case "subscription_response_too_large":
       return new RouteDeckError("subscription-response-too-large");
     case "subscription_fetch_timeout":
@@ -474,7 +480,7 @@ export class TauriController implements RouteDeckController {
     let raw: unknown;
     try {
       const pending = sourceType === "url"
-        ? transport.invoke("preview_import_url", { url: source.value })
+        ? transport.invoke("preview_import_url", { url: source.value, transport: source.transport })
         : transport.invoke("preview_import_content", { content: source.value });
       // Drop the controller stack's reference as soon as IPC owns the request.
       // Neither URL nor raw share content is retained in controller state.

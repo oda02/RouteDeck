@@ -124,8 +124,10 @@ export interface ControllerSnapshot {
   subscriptionUpdatedAt: string;
 }
 
+export type SubscriptionFetchTransport = "direct" | "current_loopback_system_proxy";
+
 export type SubscriptionImportSource =
-  | { type: "url"; value: string }
+  | { type: "url"; value: string; transport: SubscriptionFetchTransport }
   | { type: "clipboard"; value: string };
 
 export interface SubscriptionPreview {
@@ -146,6 +148,9 @@ export type RouteDeckErrorCode =
   | "insecure-subscription-url"
   | "subscription-policy-blocked"
   | "subscription-fetch-failed"
+  | "subscription-proxy-unavailable"
+  | "subscription-proxy-policy-blocked"
+  | "subscription-proxy-connect-failed"
   | "subscription-response-too-large"
   | "subscription-fetch-timeout"
   | "subscription-invalid-encoding"
