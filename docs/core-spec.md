@@ -190,10 +190,13 @@ Validation rules include DNS-name/IP syntax, port `1..65535`, UUID syntax, bound
 ### 6.1 Fetch boundary
 
 - V1 accepts only bounded `https://` URLs without userinfo or fragments. HTTP and LAN-source opt-ins are not implemented.
-- Do not use Windows, environment, or application proxy discovery implicitly. V1 subscription fetch is direct/current-network only; routing it through active RouteDeck requires a later explicit design and consent path.
+- Every URL import carries a closed transport choice: `Direct/current network` or `Current loopback System Proxy`. Direct never uses Windows, environment, or application proxy discovery. The proxy choice performs a read-only WinINet/RAS snapshot for that request and never changes proxy, registry, VPN, or process state.
+- `Current loopback System Proxy` accepts only an enabled static HTTP/HTTPS proxy whose selected endpoint is a numeric `127.0.0.0/8` or `[::1]` address with a nonzero port. PAC, WPAD, RAS, proxy credentials/URIs, lists, duplicate/unknown schemes, non-loopback endpoints, and ambiguous flags fail closed. It does not send proxy authentication or consult a credential store.
+- The proxy must never resolve the subscription hostname. RouteDeck resolves and validates the hostname itself on every hop, sends `CONNECT <pinned-public-IP>:<port>` to the loopback proxy, then performs Rustls TLS over that tunnel using the original hostname for SNI, `Host`, and normal Windows platform certificate validation. The CONNECT authority contains only the pinned public IP, but a tunnel proxy can observe the destination IP and plaintext TLS SNI hostname. TLS encrypts the URL path/query, HTTP `Host` and other headers, and response body against an ordinary tunnel proxy; it does not protect them from a proxy that holds a certificate chaining to a root trusted by the user's Windows trust store. Hostname secrecy would require a separately reviewed ECH design. There is no direct fallback.
 - Resolve every hostname separately on every hop with a bounded DNS timeout and answer count. Reject the whole answer when any IPv4/IPv6 result is loopback, private, CGNAT, link-local, unspecified, multicast, documentation, benchmarking, transition, or reserved. Pin only the validated answer set into the connection so a second resolver lookup cannot rebind it; keep the original hostname for TLS SNI/certificate verification.
 - Disable automatic redirects and follow at most 3 manually. Every target is parsed and revalidated as a new HTTPS URL; never forward cookies, authorization, caller headers, or a Referer.
 - Use bounded DNS/connect/read/overall timeouts. Read at most 10 MiB plus one sentinel byte from the response stream regardless of `Content-Length`. V1 does not request compression and rejects every non-identity `Content-Encoding`, avoiding an unreviewed decoder/decompression-bomb surface.
+- The explicit proxy path uses a bounded strict HTTP/1.1 CONNECT and origin-response parser: fixed header/line/count/trailer limits, status `200` for CONNECT, no folded headers, one framing mode, bounded chunk sizes, and HTTP/1.1 ALPN only. Redirect and non-200 bodies are not consumed.
 - Reject invalid UTF-8 except an optional UTF-8 BOM. Never execute content sniffed as HTML.
 - Reserve the same bounded preview slot before URL validation, DNS, fetch, and parse. Parse in memory and retain only the typed pending preview; the raw URL is never stored, logged, placed in diagnostics/errors/command lines, or emitted to the renderer after the request returns. Commit the new node set atomically only after confirmation. A failed refresh retains the prior working snapshot.
 
@@ -511,7 +514,8 @@ foreign state.
 
 v2rayN in System Proxy-only mode does not inherently prevent RouteDeck's local listeners
 or TUN core from starting, but its global proxy ownership may conflict with RouteDeck
-System Proxy and its subscription-fetch path must not be inherited accidentally. A
+System Proxy must not be inherited accidentally. Subscription fetch can use it only through
+the explicit read-only verified-loopback transport above; ordinary requests never inherit it. A
 foreign System Proxy also makes TUN per-app results unreliable for proxy-aware apps: the
 TUN may observe the foreign proxy core instead of the browser process. The UI labels this
 nested/best-effort and never silently disables the foreign proxy.

@@ -1,7 +1,7 @@
 # Rust dependency review
 
-- Review date: 2026-09-01
-- Scope: unprivileged local-only sing-box runtime
+- Review date: 2026-09-02
+- Scope: unprivileged local-only runtime and explicit HTTPS subscription transports
 - Policy: exact direct pins, committed Cargo lock, no native OpenSSL, no build/start download hook
 
 ## Typed core dependency baseline
@@ -41,11 +41,19 @@ The reviewed YAML graph is `serde-saphyr 1.2.0` → `granit-parser 1.2.0`, `anno
 - Advisory review: no RustSec advisory was present in the locally available advisory/security checks for this exact pin. Re-run the repository security job when the lock changes.
 - crates.io checksum: `219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3`.
 
+### `rustls = 0.23.39` and `rustls-platform-verifier = 0.7.0`
+
+- Provenance: the Rustls project and its official platform-verifier integration. Both exact versions and checksums were already present in the committed reqwest traffic-proof graph; making them direct dependencies adds no new crate or build script.
+- Purpose: after the loopback HTTP proxy acknowledges a numeric pinned-IP CONNECT, RouteDeck performs TLS itself with the original URL hostname as SNI and certificate identity. The platform verifier applies current Windows trust policy; verification is never disabled and blocks certificates that do not chain to a Windows-trusted root. A proxy-controlled root already trusted by Windows remains trusted by definition and can enable TLS interception; this transport makes no certificate-pinning claim.
+- Surface reduction: Rustls default features are disabled and only `aws_lc_rs`, `std`, and TLS 1.2/1.3 support are selected. ALPN offers only HTTP/1.1. There is no client certificate, custom root, caller-supplied trust-bypass verifier, TLS-to-proxy mode, proxy authentication, or certificate-ignore switch.
+- The custom HTTP/1.1 code is product-owned and bounded: numeric CONNECT authority only, fixed headers, no Referer/cookies/compression, 16 KiB/64-header response limit, 8 KiB line/trailer limits, unique framing, at most 4,096 chunks and 64 KiB of chunk framing, a 10 MiB decoded body, and one absolute deadline re-applied before every socket/TLS read and write.
+- crates.io checksums: Rustls `7c2c118cb077cca2822033836dfb1b975355dfb784b5e8da48f7b6c5db74e60e`; platform verifier `26d1e2536ce4f35f4846aa13bff16bd0ff40157cdb14cc056c7b14ba41233ba0`.
+
 ### `windows-sys = 0.61.2` (Windows target only)
 
 - Provenance: official Microsoft `windows-rs` projection crate, already present transitively.
-- Purpose: narrow Win32 calls for protected session files/directories, local-volume and opened-file identity/owner/DACL/reparse checks, bounded `GetAddrInfoExW` DNS resolution, restricted child pipes/handle inheritance, suspended process creation, a kill-on-close Job Object, and exact-PID ownership checks for the three loopback listeners.
-- Enabled namespaces: Foundation, Security/Authorization, Storage FileSystem, NetworkManagement/IpHelper, Networking/WinSock, JobObjects, Memory, Pipes, SystemInformation, and Threading only.
+- Purpose: narrow Win32 calls for protected session files/directories, local-volume and opened-file identity/owner/DACL/reparse checks, bounded `GetAddrInfoExW` DNS resolution, read-only WinINet per-connection proxy inspection, active-RAS rejection, restricted child pipes/handle inheritance, suspended process creation, a kill-on-close Job Object, and exact-PID ownership checks for the three loopback listeners.
+- Enabled namespaces: Foundation, Security/Authorization, Storage FileSystem, NetworkManagement/IpHelper/Rras, Networking/WinSock/WinInet, JobObjects, Memory, Pipes, SystemInformation, and Threading only. The subscription path calls `InternetQueryOptionW` and `RasEnumConnectionsW`; it never calls a setter or registry API.
 - Build/lifecycle: generated FFI bindings; no runtime, installer, network access, or build download.
 - crates.io checksum: `ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc`.
 
@@ -53,14 +61,14 @@ The reviewed YAML graph is `serde-saphyr 1.2.0` → `granit-parser 1.2.0`, `anno
 
 - `sha2 = 0.10.9`: hashes already pinned engine files from open handles.
 - `serde` / `serde_json`: parse the embedded, reviewed engine lock and serialize typed command/event DTOs.
-- `tauri`: typed command/state/event wiring only; an `AppManifest` generates permissions for the nine named commands, and the main capability grants only those commands plus event listen/unlisten. `preview_import_url` accepts one bounded secret URL string; the renderer still cannot supply request headers, a proxy, executable/configuration paths, arguments, environment, or health URL.
+- `tauri`: typed command/state/event wiring only; an `AppManifest` generates permissions for the nine named commands, and the main capability grants only those commands plus event listen/unlisten. `preview_import_url` accepts one bounded secret URL and the closed enum `direct | current_loopback_system_proxy`; the renderer cannot supply a proxy endpoint, request headers, executable/configuration paths, arguments, environment, or health URL.
 
 ## Deliberately not added
 
 - No shell/process helper crate: the Windows boundary calls `CreateProcessW` directly with a closed internal action enum, fixed arguments, explicit application/current-directory paths, an allow-listed environment with no `PATH`, and an explicit inherited-handle list.
 - No async runtime direct dependency: serialized operations run behind the controller boundary; Tauri owns command dispatch.
 - No temporary-file/ACL convenience crate: session files use a fixed application-data root, random private directory, restrictive Windows DACL, atomic rename, and best-effort deletion.
-- No native OpenSSL backend, updater, archive extractor, engine downloader, telemetry, third-party DNS client, compression decoder, cookie jar, or arbitrary request configuration. Windows DNS is called through the already reviewed `windows-sys` binding with a timeout; tests use a fake resolver/transport and never contact the network.
+- No native OpenSSL backend, updater, archive extractor, engine downloader, telemetry, third-party DNS client, compression decoder, cookie jar, HTTP parser crate, or arbitrary request configuration. Windows DNS and read-only WinINet/RAS inspection use the reviewed `windows-sys` binding; tests use fake resolver/proxy/TLS boundaries and never contact the internet.
 
 ## Residual risks
 
@@ -73,6 +81,8 @@ This closes the release-blocking cross-user and accidental late-DLL planting gap
 Cleanup is fail-closed and non-recursive: only the two exact sealed filenames are removed. A foreign/reparse/unknown entry is preserved and the non-empty session root causes `RecoveryRequired` on the next startup. Hostile second-user creation, ACL tamper, late-DLL attempts, unsupported filesystem, crash preservation, and handle-inheritance behavior remain isolated Windows-VM release tests; live-engine execution remains forbidden until those gates and the independent security review pass.
 
 Session construction reopens the atomically renamed config with non-reparse/non-write-sharing flags, hashes the bytes from that protected handle, and compares them to the exact generated bytes before recording file identity. Session construction failure deletes only the fresh random directory created by that same operation. Startup recovery deliberately does not infer ownership from a directory name or expected filenames: if any previous session entry exists, RouteDeck preserves it, starts the UI in typed `RecoveryRequired` state, and blocks Connect and confirmed-import replacement. The explicit `retry_session_recovery` command only rechecks that the user-reviewed directory is empty; it never deletes files. Any future automated deletion requires a durable product marker plus owner/DACL and opened-file identity revalidation.
+
+The explicit System Proxy fetch takes one read-only snapshot and then uses the copied loopback endpoint for that request. A concurrent settings change cannot alter the already selected numeric endpoint, but another same-user process can replace a loopback service and the user's or machine's trust store can contain a proxy-controlled root. The CONNECT authority contains only a pinned public IP, while a tunnel proxy can still observe that destination IP and the plaintext TLS SNI hostname. TLS hides the URL path/query, HTTP `Host` and other headers, and body from an ordinary tunnel proxy, but a proxy with a Windows-trusted MITM root can decrypt them; hostname secrecy would require ECH and is not claimed. Resisting same-user socket takeover or trusted-root compromise is outside a portable unprivileged process boundary.
 
 ## Update rule
 

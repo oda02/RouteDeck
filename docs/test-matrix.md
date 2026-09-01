@@ -80,10 +80,19 @@ restore, and termination or reconfiguration of another VPN are forbidden in ever
 | SF-09 | U | Invalid UTF-8/HTML login page | Invalid encoding has a finite error; HTML is rejected by the importer and never link-sniffed. |
 | SF-10 | U | Failed refresh after valid prior snapshot | Prior snapshot remains active atomically. |
 | SF-11 | U/C | v2rayN/System Proxy/environment proxy is configured while fetch policy is v1 Direct | Client has proxy discovery disabled and uses only policy-validated pinned destinations. |
-| SF-12 | U | User requests fetch through active RouteDeck in v1 | Not representable; only the explicit direct/current-network fetch boundary exists. |
+| SF-12 | U | User explicitly selects current loopback System Proxy | Backend receives the closed transport enum; there is no ambient or direct fallback. |
 | SF-13 | U | URL is oversized, has userinfo/fragment, lexical localhost/.local name, an IP literal in a blocked class, or >16 DNS answers | Rejected before transport (or immediately after the bounded DNS result). |
 | SF-14 | U | Four concurrent URL previews occupy fetch slots | Fifth request is rejected before URL parsing/DNS/network work; RAII releases every failed slot. |
-| SF-15 | U | TLS/connect/HTTP failure includes a secret query in the original or redirect URL | Public error contains only finite code/stage/localization key and `detail=null`. |
+| SF-15 | U | DNS timeout or TLS/connect/HTTP failure includes a secret query in the original or redirect URL | Public error contains only finite code/stage/localization key and `detail=null`; a DNS timeout retains the `subscription_dns` stage. |
+| SF-16 | U | WinINet flags select one bare all-protocol loopback endpoint, or a map containing a static `https=127/8` / `https=[::1]` endpoint with valid port | Accepted as a private request-local endpoint; an `http=`-only map is rejected because it does not define the HTTPS proxy; the endpoint is never serialized or logged. |
+| SF-17 | U | PAC/WPAD, active RAS, credentials/URI syntax, list, duplicate/unknown scheme, non-loopback endpoint, port zero, unknown flags | Stable unavailable/policy-blocked error; no request and no settings write. |
+| SF-18 | U | Fake loopback proxy/TLS boundary receives an HTTPS subscription request | CONNECT authority is the validated pinned public IP; original hostname is absent from CONNECT but retained as TLS SNI and origin Host. |
+| SF-19 | U | Loopback proxy returns 407, malformed/folded/oversized headers, HTTP/2 line, duplicate framing, invalid chunk, or timeout | Strict bounded failure with finite proxy stage/code; no auth retry or direct fallback. |
+| SF-20 | U | Proxy-mode redirect changes hostname and DNS answer | Every hop is freshly resolved/validated; each CONNECT uses only that hop's pinned public IP and original-hop SNI/Host. |
+| SF-21 | U | Proxy-mode DNS answer mixes public and blocked addresses | Rejected before any CONNECT is sent to the loopback proxy. |
+| SF-22 | U | Proxy-mode identity/chunked body, duplicate compression including gzip, more than 4,096 chunks / 64 KiB chunk framing, or body beyond 10 MiB | Valid bounded identity body succeeds; compressed/ambiguous/oversized framing fails closed. |
+| SF-23 | U | Proxy/TLS error contains secret URL and proxy port fixture | Public/debug error is finite and contains neither URL/host/query nor proxy endpoint. |
+| SF-24 | W | Read current WinINet/RAS state on an isolated fixture account | `InternetQueryOptionW`/`RasEnumConnectionsW` only; before/after proxy and registry snapshots are byte-for-byte unchanged. |
 
 ### 4.2 Share links and lists
 

@@ -22,7 +22,7 @@ use crate::{
     subscription::{import_subscription, ImportReport},
     subscription_fetch::{
         HttpsSubscriptionFetcher, SubscriptionFetchError, SubscriptionFetchErrorKind,
-        SubscriptionFetchStage, SubscriptionFetcher,
+        SubscriptionFetchStage, SubscriptionFetchTransport, SubscriptionFetcher,
     },
 };
 
@@ -137,6 +137,9 @@ pub enum PublicErrorCode {
     SubscriptionResponseTooLarge,
     SubscriptionFetchTimeout,
     SubscriptionInvalidEncoding,
+    SubscriptionProxyUnavailable,
+    SubscriptionProxyPolicyBlocked,
+    SubscriptionProxyConnectFailed,
     PreviewMissing,
     PreviewTokenInvalid,
     RecoveryRequired,
@@ -155,6 +158,8 @@ pub enum PublicErrorStage {
     SubscriptionDns,
     SubscriptionFetch,
     SubscriptionResponse,
+    SubscriptionProxy,
+    SubscriptionProxyConnect,
     SessionRecovery,
     Start,
     GenerateConfig,
@@ -450,9 +455,13 @@ impl ApplicationController {
         self.commit_import_preview(slot, report)
     }
 
-    pub fn preview_import_url(&self, url: String) -> Result<ImportPreview, PublicError> {
+    pub fn preview_import_url(
+        &self,
+        url: String,
+        transport: SubscriptionFetchTransport,
+    ) -> Result<ImportPreview, PublicError> {
         let slot = self.reserve_preview_slot()?;
-        self.preview_import_url_reserved(url, slot)
+        self.preview_import_url_reserved(url, transport, slot)
     }
 
     pub(crate) fn reserve_preview_slot(&self) -> Result<PreviewSlot, PublicError> {
@@ -462,12 +471,13 @@ impl ApplicationController {
     pub(crate) fn preview_import_url_reserved(
         &self,
         url: String,
+        transport: SubscriptionFetchTransport,
         slot: PreviewSlot,
     ) -> Result<ImportPreview, PublicError> {
         let content = self
             .services
             .subscription_fetcher
-            .fetch(&url)
+            .fetch(&url, transport)
             .map_err(public_subscription_fetch_error)?;
         drop(url);
         let report = import_subscription(content.as_bytes()).map_err(|_| {
@@ -1398,12 +1408,23 @@ fn public_subscription_fetch_error(error: SubscriptionFetchError) -> PublicError
         }
         SubscriptionFetchErrorKind::Timeout => PublicErrorCode::SubscriptionFetchTimeout,
         SubscriptionFetchErrorKind::InvalidEncoding => PublicErrorCode::SubscriptionInvalidEncoding,
+        SubscriptionFetchErrorKind::ProxyUnavailable => {
+            PublicErrorCode::SubscriptionProxyUnavailable
+        }
+        SubscriptionFetchErrorKind::ProxyPolicyBlocked => {
+            PublicErrorCode::SubscriptionProxyPolicyBlocked
+        }
+        SubscriptionFetchErrorKind::ProxyConnectFailed => {
+            PublicErrorCode::SubscriptionProxyConnectFailed
+        }
     };
     let stage = match error.stage() {
         SubscriptionFetchStage::Url => PublicErrorStage::SubscriptionUrl,
         SubscriptionFetchStage::Dns => PublicErrorStage::SubscriptionDns,
         SubscriptionFetchStage::Fetch => PublicErrorStage::SubscriptionFetch,
         SubscriptionFetchStage::Response => PublicErrorStage::SubscriptionResponse,
+        SubscriptionFetchStage::Proxy => PublicErrorStage::SubscriptionProxy,
+        SubscriptionFetchStage::ProxyConnect => PublicErrorStage::SubscriptionProxyConnect,
     };
     let localization_key = match error.kind() {
         SubscriptionFetchErrorKind::UrlInvalid => "subscription.url.invalid",
@@ -1412,6 +1433,9 @@ fn public_subscription_fetch_error(error: SubscriptionFetchError) -> PublicError
         SubscriptionFetchErrorKind::ResponseTooLarge => "subscription.response_too_large",
         SubscriptionFetchErrorKind::Timeout => "subscription.timeout",
         SubscriptionFetchErrorKind::InvalidEncoding => "subscription.invalid_encoding",
+        SubscriptionFetchErrorKind::ProxyUnavailable => "subscription.proxy.unavailable",
+        SubscriptionFetchErrorKind::ProxyPolicyBlocked => "subscription.proxy.policy_blocked",
+        SubscriptionFetchErrorKind::ProxyConnectFailed => "subscription.proxy.connect_failed",
     };
     PublicError::fixed(code, stage, localization_key)
 }
@@ -1822,7 +1846,11 @@ mod tests {
     }
 
     impl SubscriptionFetcher for FakeSubscriptionFetcher {
-        fn fetch(&self, _raw_url: &str) -> Result<String, SubscriptionFetchError> {
+        fn fetch(
+            &self,
+            _raw_url: &str,
+            _transport: SubscriptionFetchTransport,
+        ) -> Result<String, SubscriptionFetchError> {
             self.result.clone()
         }
     }
@@ -1832,8 +1860,27 @@ mod tests {
         release: Arc<Barrier>,
     }
 
+    struct CapturingSubscriptionFetcher {
+        selected: Arc<Mutex<Option<SubscriptionFetchTransport>>>,
+    }
+
+    impl SubscriptionFetcher for CapturingSubscriptionFetcher {
+        fn fetch(
+            &self,
+            _raw_url: &str,
+            transport: SubscriptionFetchTransport,
+        ) -> Result<String, SubscriptionFetchError> {
+            *self.selected.lock().unwrap() = Some(transport);
+            Ok(NODE.into())
+        }
+    }
+
     impl SubscriptionFetcher for BlockingSubscriptionFetcher {
-        fn fetch(&self, _raw_url: &str) -> Result<String, SubscriptionFetchError> {
+        fn fetch(
+            &self,
+            _raw_url: &str,
+            _transport: SubscriptionFetchTransport,
+        ) -> Result<String, SubscriptionFetchError> {
             self.ready.wait();
             self.release.wait();
             Ok(NODE.into())
@@ -2273,9 +2320,10 @@ mod tests {
         for index in 0..MAX_PENDING_IMPORT_PREVIEWS {
             let controller = controller.clone();
             workers.push(thread::spawn(move || {
-                controller.preview_import_url(format!(
-                    "https://subscriptions.test/list?token=secret-{index}"
-                ))
+                controller.preview_import_url(
+                    format!("https://subscriptions.test/list?token=secret-{index}"),
+                    SubscriptionFetchTransport::Direct,
+                )
             }));
         }
         ready.wait();
@@ -2284,7 +2332,10 @@ mod tests {
             MAX_PENDING_IMPORT_PREVIEWS
         );
         let overload = controller
-            .preview_import_url("https://subscriptions.test/overflow?token=secret".into())
+            .preview_import_url(
+                "https://subscriptions.test/overflow?token=secret".into(),
+                SubscriptionFetchTransport::Direct,
+            )
             .unwrap_err();
         assert_eq!(overload.code, PublicErrorCode::ImportRejected);
         release.wait();
@@ -2309,23 +2360,82 @@ mod tests {
 
     #[test]
     fn url_fetch_errors_emit_only_finite_localization_contract() {
-        let error = SubscriptionFetchError::new(
-            SubscriptionFetchErrorKind::PolicyBlocked,
-            SubscriptionFetchStage::Dns,
+        let cases = [
+            (
+                SubscriptionFetchError::new(
+                    SubscriptionFetchErrorKind::PolicyBlocked,
+                    SubscriptionFetchStage::Dns,
+                ),
+                PublicErrorCode::SubscriptionPolicyBlocked,
+                PublicErrorStage::SubscriptionDns,
+                "subscription.policy_blocked",
+            ),
+            (
+                SubscriptionFetchError::new(
+                    SubscriptionFetchErrorKind::ProxyUnavailable,
+                    SubscriptionFetchStage::Proxy,
+                ),
+                PublicErrorCode::SubscriptionProxyUnavailable,
+                PublicErrorStage::SubscriptionProxy,
+                "subscription.proxy.unavailable",
+            ),
+            (
+                SubscriptionFetchError::new(
+                    SubscriptionFetchErrorKind::ProxyPolicyBlocked,
+                    SubscriptionFetchStage::Proxy,
+                ),
+                PublicErrorCode::SubscriptionProxyPolicyBlocked,
+                PublicErrorStage::SubscriptionProxy,
+                "subscription.proxy.policy_blocked",
+            ),
+            (
+                SubscriptionFetchError::new(
+                    SubscriptionFetchErrorKind::ProxyConnectFailed,
+                    SubscriptionFetchStage::ProxyConnect,
+                ),
+                PublicErrorCode::SubscriptionProxyConnectFailed,
+                PublicErrorStage::SubscriptionProxyConnect,
+                "subscription.proxy.connect_failed",
+            ),
+        ];
+        for (error, code, stage, message) in cases {
+            let controller =
+                controller_with_fetcher(Arc::new(FakeSubscriptionFetcher { result: Err(error) }));
+            let raw_url = "https://secret-host.test/list?token=never-emit";
+            let public = controller
+                .preview_import_url(raw_url.into(), SubscriptionFetchTransport::Direct)
+                .unwrap_err();
+            assert_eq!(public.code, code);
+            assert_eq!(public.stage, stage);
+            assert_eq!(public.message, message);
+            assert!(public.detail.is_none());
+            let serialized = serde_json::to_string(&public).unwrap();
+            assert!(!serialized.contains("never-emit"));
+            assert!(!serialized.contains("secret-host"));
+            assert_eq!(controller.lock_state().preview_inflight, 0);
+            assert!(controller.lock_state().pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn explicit_subscription_transport_is_forwarded_without_fallback() {
+        let selected = Arc::new(Mutex::new(None));
+        let controller = controller_with_fetcher(Arc::new(CapturingSubscriptionFetcher {
+            selected: selected.clone(),
+        }));
+        let preview = controller
+            .preview_import_url(
+                "https://subscriptions.test/list?token=secret".into(),
+                SubscriptionFetchTransport::CurrentLoopbackSystemProxy,
+            )
+            .unwrap();
+        assert_eq!(
+            *selected.lock().unwrap(),
+            Some(SubscriptionFetchTransport::CurrentLoopbackSystemProxy)
         );
-        let controller =
-            controller_with_fetcher(Arc::new(FakeSubscriptionFetcher { result: Err(error) }));
-        let raw_url = "https://secret-host.test/list?token=never-emit";
-        let public = controller.preview_import_url(raw_url.into()).unwrap_err();
-        assert_eq!(public.code, PublicErrorCode::SubscriptionPolicyBlocked);
-        assert_eq!(public.stage, PublicErrorStage::SubscriptionDns);
-        assert_eq!(public.message, "subscription.policy_blocked");
-        assert!(public.detail.is_none());
-        let serialized = serde_json::to_string(&public).unwrap();
-        assert!(!serialized.contains("never-emit"));
-        assert!(!serialized.contains("secret-host"));
-        assert_eq!(controller.lock_state().preview_inflight, 0);
-        assert!(controller.lock_state().pending.is_empty());
+        controller
+            .discard_import_preview(&preview.preview_id)
+            .unwrap();
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod redaction;
 mod runtime_constants;
 pub mod subscription;
 pub mod subscription_fetch;
+mod system_proxy;
 #[cfg(windows)]
 mod windows_process;
 
