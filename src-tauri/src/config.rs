@@ -112,7 +112,7 @@ pub fn generate_config(request: ConfigRequest<'_>) -> Result<GeneratedConfig, Co
             "listen": "127.0.0.1",
             "listen_port": request.ports.health,
             "users": [{
-                "username": "routedeck-health",
+                "username": crate::runtime_constants::HEALTH_PROXY_USERNAME,
                 "password": health_password.expose()
             }]
         }),
@@ -551,6 +551,12 @@ mod tests {
         assert_eq!(
             value.pointer("/outbounds/0/flow").and_then(Value::as_str),
             Some("xtls-rprx-vision")
+        );
+        assert_eq!(
+            value
+                .pointer("/inbounds/2/users/0/username")
+                .and_then(Value::as_str),
+            Some(crate::runtime_constants::HEALTH_PROXY_USERNAME)
         );
         assert!(!first.as_str().contains("dns_mode"));
         assert!(!first.as_str().contains("hop_interval_max"));
