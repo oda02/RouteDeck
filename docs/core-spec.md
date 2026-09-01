@@ -277,7 +277,6 @@ Emit exactly the selected protocol outbound plus an explicit direct outbound:
     { "type": "direct", "tag": "direct" }
   ],
   "route": {
-    "auto_detect_interface": true,
     "default_domain_resolver": "remote-dns",
     "rules": [
       { "inbound": ["health-in"], "action": "route", "outbound": "selected" },
@@ -291,6 +290,12 @@ Emit exactly the selected protocol outbound plus an explicit direct outbound:
 ```
 
 `route.final` is always explicit; upstream otherwise uses the first outbound. Process rules precede the final route. Prefer canonical full executable paths; retain process names only as a user-visible fallback with a collision warning. The official route schema documents [`final` and interface binding](https://sing-box.sagernet.org/configuration/route/) and Windows [`process_name`/`process_path` rules](https://sing-box.sagernet.org/configuration/route/rule/).
+
+Local-proxy mode does not emit `auto_detect_interface` or bind an outbound to a
+physical adapter. Its selected outbound follows the effective Windows network path, so
+it can be tested while an existing TUN/VPN remains active (a deliberately nested path).
+RouteDeck emits `auto_detect_interface: true` only with its own TUN capture, where the
+selected server connection must avoid looping back into RouteDeck's adapter.
 
 The internal health rule is immutable and first: its only legal outbound is `selected`. No generated path from `health-in` may reach `direct`.
 

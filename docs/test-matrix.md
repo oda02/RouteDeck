@@ -267,7 +267,7 @@ All W/H proxy tests snapshot the exact WinINet per-connection state before execu
 | CO-08 | W | Ambiguous equal-metric defaults/tunnel adapter identity | Explicit choice required; no automatic mutation. |
 | CO-09 | W | Other VPN starts or stops while RouteDeck TUN runs | Route/ownership watcher detects change; re-proof or degrade; no false green. |
 | CO-10 | W | Prefix, DNS, or default-route conflict discovered post-start | Rollback RouteDeck-owned state only; preserve other VPN. |
-| CO-11 | H | User's real v2rayN remains running throughout non-mutating local listener/protocol test | No process termination or setting change; selected node can still be validated through explicit local health proxy. This is permitted before the Windows-mode VM gate because it publishes neither System Proxy nor TUN. |
+| CO-11 | H | User's real v2rayN/TUN remains running throughout non-mutating local listener/protocol test | No process termination or setting change; RouteDeck local-proxy outbounds follow the current Windows path (no physical-interface auto-detection) and can be validated through the explicit local health proxy. This is permitted before the Windows-mode VM gate because RouteDeck publishes neither System Proxy nor TUN. |
 | CO-12 | W | Foreign System Proxy feeds a foreign core while RouteDeck TUN is active | RouteDeck observes and explains the attribution boundary; browser-specific rules are not certified reliable. |
 
 ## 10. Protocol end-to-end acceptance

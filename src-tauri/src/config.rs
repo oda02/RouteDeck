@@ -182,6 +182,18 @@ pub fn generate_config(request: ConfigRequest<'_>) -> Result<GeneratedConfig, Co
         rules.push(json!({ "ip_is_private": true, "action": "route", "outbound": "direct" }));
     }
 
+    let mut route = json!({
+        "rules": rules,
+        "final": default_outbound(request.policy.default),
+        "default_domain_resolver": "bootstrap"
+    });
+    if matches!(request.mode, CaptureMode::Tun(_)) {
+        route
+            .as_object_mut()
+            .expect("generated route must be an object")
+            .insert("auto_detect_interface".into(), json!(true));
+    }
+
     let root = json!({
         // Runtime failures must remain diagnosable. The controller captures stderr into a
         // bounded buffer and applies the session redactor before storing any line.
@@ -193,12 +205,7 @@ pub fn generate_config(request: ConfigRequest<'_>) -> Result<GeneratedConfig, Co
         },
         "inbounds": inbounds,
         "outbounds": [selected, { "type": "direct", "tag": "direct" }],
-        "route": {
-            "rules": rules,
-            "final": default_outbound(request.policy.default),
-            "auto_detect_interface": true,
-            "default_domain_resolver": "bootstrap"
-        }
+        "route": route
     });
     validate_no_direct_health(&root)?;
     let text = serde_json::to_string_pretty(&root)
@@ -578,6 +585,7 @@ mod tests {
             Some(false)
         );
         assert!(value.pointer("/log/disabled").is_none());
+        assert!(value.pointer("/route/auto_detect_interface").is_none());
         assert!(!first.as_str().contains("dns_mode"));
         assert!(!first.as_str().contains("hop_interval_max"));
         assert!(!first.as_str().contains("\"engine\""));
@@ -672,6 +680,12 @@ mod tests {
             Some("RouteDeck")
         );
         assert!(value.pointer("/inbounds/3/dns_mode").is_none());
+        assert_eq!(
+            value
+                .pointer("/route/auto_detect_interface")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]

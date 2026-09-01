@@ -103,6 +103,7 @@ fn prove_via_http_proxy(
     port: u16,
     health_password: Option<&str>,
 ) -> Result<ProofResult, RuntimeError> {
+    let proxy_kind = proof_proxy_kind(health_password.is_some());
     let proxy_url = format!("http://127.0.0.1:{port}");
     let mut proxy = Proxy::all(&proxy_url)
         .map_err(|_| RuntimeError::new("prove_traffic", "local proof proxy URL is invalid"))?;
@@ -126,18 +127,26 @@ fn prove_via_http_proxy(
     if response.status() != StatusCode::NO_CONTENT {
         return Err(RuntimeError::new(
             "prove_traffic",
-            format!("traffic proof endpoint returned HTTP {}", response.status()),
+            format!(
+                "{proxy_kind}: proof endpoint returned HTTP {}",
+                response.status()
+            ),
         ));
     }
     let mut body = Vec::new();
     response
         .take((MAX_PROOF_BODY + 1) as u64)
         .read_to_end(&mut body)
-        .map_err(|error| RuntimeError::new("prove_traffic", error.to_string()))?;
+        .map_err(|_| {
+            RuntimeError::new(
+                "prove_traffic",
+                format!("{proxy_kind}: the HTTPS proof response could not be read"),
+            )
+        })?;
     if body.len() > MAX_PROOF_BODY {
         return Err(RuntimeError::new(
             "prove_traffic",
-            "traffic proof response exceeded the body limit",
+            format!("{proxy_kind}: proof response exceeded the body limit"),
         ));
     }
     Ok(ProofResult {
@@ -167,15 +176,19 @@ fn proof_request_error(error: reqwest::Error, authenticated: bool) -> RuntimeErr
         error.is_body() || error.is_decode(),
         &signals,
     );
-    let proxy_kind = if authenticated {
-        "private health proxy"
-    } else {
-        "ordinary local proxy"
-    };
+    let proxy_kind = proof_proxy_kind(authenticated);
     RuntimeError::new(
         "prove_traffic",
         format!("{proxy_kind}: {}", class.description()),
     )
+}
+
+fn proof_proxy_kind(authenticated: bool) -> &'static str {
+    if authenticated {
+        "private health proxy"
+    } else {
+        "ordinary local proxy"
+    }
 }
 
 fn append_bounded_signal(target: &mut String, source: &str) {
@@ -432,6 +445,8 @@ mod tests {
 
     #[test]
     fn request_failure_classifier_is_finite_and_actionable() {
+        assert_eq!(proof_proxy_kind(true), "private health proxy");
+        assert_eq!(proof_proxy_kind(false), "ordinary local proxy");
         assert_eq!(
             classify_error_signals(true, true, false, "certificate failure"),
             ProbeFailureClass::Timeout
