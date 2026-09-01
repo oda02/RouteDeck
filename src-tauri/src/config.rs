@@ -3,9 +3,9 @@ use std::{collections::BTreeSet, fmt, net::IpAddr};
 use serde_json::{json, Map, Value};
 
 use crate::domain::{
-    canonical_process_path, AppRouteAction, DefaultRoute, DnsPolicy, HysteriaObfsKind, Ipv6Policy,
-    LanPolicy, Node, NodeProtocol, PacketEncoding, PortSelection, RoutePolicy, Secret, TlsOptions,
-    VlessFlow, VlessTransport,
+    canonical_process_path, AppRouteAction, DefaultRoute, DnsPolicy, HysteriaObfsKind,
+    InsecureApproval, Ipv6Policy, LanPolicy, Node, NodeProtocol, PacketEncoding, PortSelection,
+    RoutePolicy, Secret, TlsOptions, VlessFlow, VlessTransport,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +43,7 @@ pub struct ConfigRequest<'a> {
     pub ports: LocalPorts,
     pub health_password: String,
     pub vpn_dns: Option<VpnDnsServer>,
+    pub insecure_approval: Option<&'a InsecureApproval>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +264,15 @@ pub fn validate_no_direct_health(config: &Value) -> Result<(), ConfigError> {
 }
 
 fn validate_request(request: &ConfigRequest<'_>) -> Result<(), ConfigError> {
+    if request.node.requires_insecure_approval()
+        && !request
+            .insecure_approval
+            .is_some_and(|approval| approval.matches(request.node))
+    {
+        return Err(ConfigError::new(
+            "insecure TLS requires explicit approval for the current node security identity",
+        ));
+    }
     let ports = [
         request.ports.http,
         request.ports.socks,
@@ -366,10 +376,12 @@ fn selected_outbound(node: &Node) -> Result<Value, ConfigError> {
                     object.insert("transport".into(), Value::Object(transport));
                 }
                 VlessTransport::Grpc { service_name } => {
-                    object.insert(
-                        "transport".into(),
-                        json!({ "type": "grpc", "service_name": service_name }),
-                    );
+                    let mut transport = Map::new();
+                    transport.insert("type".into(), json!("grpc"));
+                    if !service_name.is_empty() {
+                        transport.insert("service_name".into(), json!(service_name));
+                    }
+                    object.insert("transport".into(), Value::Object(transport));
                 }
             }
             if vless.tls.enabled {
@@ -517,6 +529,7 @@ mod tests {
             },
             health_password: "fixture-health-secret".into(),
             vpn_dns: None,
+            insecure_approval: None,
         }
     }
 
@@ -654,6 +667,22 @@ mod tests {
                 .and_then(Value::as_str),
             Some("route")
         );
+        let grpc_empty = node("vless://11111111-2222-3333-4444-555555555555@example.test:443?security=tls&type=grpc&sni=cover.test");
+        let empty_value: Value = serde_json::from_str(
+            generate_config(request(&grpc_empty, &policy))
+                .unwrap()
+                .as_str(),
+        )
+        .unwrap();
+        assert_eq!(
+            empty_value
+                .pointer("/outbounds/0/transport/type")
+                .and_then(Value::as_str),
+            Some("grpc")
+        );
+        assert!(empty_value
+            .pointer("/outbounds/0/transport/service_name")
+            .is_none());
     }
 
     #[test]
@@ -685,5 +714,81 @@ mod tests {
             rules[4].get("ip_is_private").and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn insecure_nodes_require_exact_controller_owned_approval() {
+        let uri =
+            node("hysteria2://fixture@example.test:443?sni=example.test&insecure=1#uri-insecure");
+        let json = node_from_subscription(
+            r#"{"type":"hysteria2","tag":"json-insecure","server":"example.test","server_port":443,"password":"fixture","tls":{"enabled":true,"server_name":"example.test","insecure":true}}"#,
+        );
+        let clash = node_from_subscription(
+            "proxies:\n  - name: clash-insecure\n    type: hysteria2\n    server: example.test\n    port: 443\n    password: fixture\n    sni: example.test\n    skip-cert-verify: true\n",
+        );
+        let policy = policy(DefaultRoute::Vpn);
+        for insecure in [&uri, &json, &clash] {
+            let error = generate_config(request(insecure, &policy)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "insecure TLS requires explicit approval for the current node security identity"
+            );
+        }
+
+        let approved = node_from_subscription(
+            r#"{"type":"vless","tag":"approval","server":"example.test","server_port":443,"uuid":"11111111-2222-3333-4444-555555555555","tls":{"enabled":true,"server_name":"example.test","insecure":true,"certificate_public_key_sha256":["pin-a"]}}"#,
+        );
+        let changed = node_from_subscription(
+            r#"{"type":"vless","tag":"approval","server":"example.test","server_port":443,"uuid":"11111111-2222-3333-4444-555555555555","tls":{"enabled":true,"server_name":"example.test","insecure":true,"certificate_public_key_sha256":["pin-b"]}}"#,
+        );
+        assert_eq!(approved.update_key(), changed.update_key());
+        let approval = InsecureApproval::record_explicit_user_approval(&approved).unwrap();
+        assert!(!format!("{approval:?}").contains("pin-a"));
+        let mut exact = request(&approved, &policy);
+        exact.insecure_approval = Some(&approval);
+        let value: Value = serde_json::from_str(generate_config(exact).unwrap().as_str()).unwrap();
+        assert_eq!(
+            value
+                .pointer("/outbounds/0/tls/insecure")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let mut mismatch = request(&changed, &policy);
+        mismatch.insecure_approval = Some(&approval);
+        assert!(generate_config(mismatch).is_err());
+        let mut wrong_node = request(&uri, &policy);
+        wrong_node.insecure_approval = Some(&approval);
+        assert!(generate_config(wrong_node).is_err());
+    }
+
+    #[test]
+    fn clash_hysteria_hopping_config_uses_ports_and_normalized_interval() {
+        let node = node_from_subscription(
+            "proxies:\n  - name: hopping\n    type: hysteria2\n    server: example.test\n    port: 443\n    ports: 2000-2010,8443\n    hop-interval: 15\n    password: fixture\n    sni: example.test\n",
+        );
+        let policy = policy(DefaultRoute::Vpn);
+        let value: Value =
+            serde_json::from_str(generate_config(request(&node, &policy)).unwrap().as_str())
+                .unwrap();
+        assert_eq!(
+            value
+                .pointer("/outbounds/0/hop_interval")
+                .and_then(Value::as_str),
+            Some("15s")
+        );
+        assert!(value.pointer("/outbounds/0/server_port").is_none());
+        assert_eq!(
+            value
+                .pointer("/outbounds/0/server_ports/0")
+                .and_then(Value::as_str),
+            Some("2000:2010")
+        );
+    }
+
+    fn node_from_subscription(input: &str) -> Node {
+        import_subscription(input.as_bytes())
+            .unwrap()
+            .nodes
+            .remove(0)
     }
 }

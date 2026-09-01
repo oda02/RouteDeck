@@ -315,11 +315,7 @@ fn parse_vless_query_transport(
                     "WebSocket parameters are invalid for gRPC transport",
                 ));
             }
-            let service_name = query
-                .get("serviceName")
-                .filter(|value| !value.is_empty())
-                .cloned()
-                .ok_or_else(|| ImportError::new("VLESS gRPC service name is required"))?;
+            let service_name = query.get("serviceName").cloned().unwrap_or_default();
             Ok(VlessTransport::Grpc { service_name })
         }
         _ => Err(ImportError::new("unsupported VLESS transport")),
@@ -633,11 +629,22 @@ fn parse_clash_vless(
             }
             let options = object
                 .get("grpc-opts")
-                .and_then(Value::as_object)
-                .ok_or_else(|| ImportError::new("Clash VLESS grpc-opts are required"))?;
-            strict_keys(options, &["grpc-service-name"])?;
+                .map(|value| {
+                    value
+                        .as_object()
+                        .ok_or_else(|| ImportError::new("invalid Clash VLESS grpc-opts"))
+                })
+                .transpose()?;
+            if let Some(options) = options {
+                strict_keys(options, &["grpc-service-name"])?;
+            }
             VlessTransport::Grpc {
-                service_name: required_str(options, "grpc-service-name")?.to_owned(),
+                service_name: options
+                    .map(|options| optional_str(options, "grpc-service-name"))
+                    .transpose()?
+                    .flatten()
+                    .unwrap_or("")
+                    .to_owned(),
             }
         }
         _ => return Err(ImportError::new("unsupported Clash VLESS transport")),
@@ -714,15 +721,31 @@ fn parse_clash_hysteria(
             "sni",
             "skip-cert-verify",
             "alpn",
+            "hop-interval",
         ],
     )?;
     let server = required_str(object, "server")?.to_owned();
     let ports = match (object.get("port"), object.get("ports")) {
-        (Some(_), Some(_)) => return Err(ImportError::new("use either port or ports")),
+        (Some(_), Some(Value::String(value))) => {
+            required_port(object, "port")?;
+            parse_clash_port_expression(value)?
+        }
         (Some(_), None) => PortSelection::single(required_port(object, "port")?)
             .map_err(|_| ImportError::new("invalid Hysteria2 port"))?,
         (None, Some(Value::String(value))) => parse_clash_port_expression(value)?,
         _ => return Err(ImportError::new("Hysteria2 port is required")),
+    };
+    let hop_interval = match object.get("hop-interval") {
+        None => None,
+        Some(Value::Number(value)) => {
+            let seconds = value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| (1..=3600).contains(value))
+                .ok_or_else(|| ImportError::new("invalid Hysteria2 hop interval"))?;
+            Some(format!("{seconds}s"))
+        }
+        Some(_) => return Err(ImportError::new("invalid Hysteria2 hop interval")),
     };
     let obfs = match optional_str(object, "obfs")? {
         None | Some("") => {
@@ -753,7 +776,7 @@ fn parse_clash_hysteria(
         server,
         NodeProtocol::Hysteria2(Hysteria2Node {
             ports,
-            hop_interval: None,
+            hop_interval,
             password: secret(required_str(object, "password")?.to_owned())?,
             obfs,
             tls,
@@ -877,7 +900,9 @@ fn parse_json_vless_transport(value: Option<&Value>) -> Result<VlessTransport, I
         "grpc" => {
             strict_keys(object, &["type", "service_name"])?;
             Ok(VlessTransport::Grpc {
-                service_name: required_str(object, "service_name")?.to_owned(),
+                service_name: optional_str(object, "service_name")?
+                    .unwrap_or("")
+                    .to_owned(),
             })
         }
         _ => Err(ImportError::new("unsupported VLESS transport")),
@@ -1525,13 +1550,18 @@ fn json_depth(value: &Value) -> usize {
 fn finish_report(
     nodes: Vec<Node>,
     rejected: Vec<NodeRejection>,
-    warnings: Vec<&'static str>,
+    mut warnings: Vec<&'static str>,
 ) -> Result<ImportReport, ImportError> {
     if nodes.is_empty() {
         Err(ImportError::new(
             "subscription contains no valid supported nodes",
         ))
     } else {
+        if nodes.iter().any(Node::requires_insecure_approval)
+            && !warnings.contains(&"insecure TLS nodes require explicit approval before use")
+        {
+            warnings.push("insecure TLS nodes require explicit approval before use");
+        }
         Ok(ImportReport {
             nodes,
             rejected,
@@ -1827,5 +1857,85 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn insecure_import_persists_warning_metadata() {
+        let report = import_subscription(
+            b"hysteria2://fixture@example.test:443?sni=example.test&insecure=1",
+        )
+        .unwrap();
+        assert!(report.nodes[0].requires_insecure_approval());
+        assert_eq!(
+            report.nodes[0].security_warnings(),
+            &[crate::domain::SecurityWarning::InsecureTlsVerification]
+        );
+        assert_eq!(
+            report.warnings,
+            vec!["insecure TLS nodes require explicit approval before use"]
+        );
+    }
+
+    #[test]
+    fn clash_hysteria_prefers_valid_ports_and_normalizes_fixed_hop_interval() {
+        let yaml = "proxies:\n  - name: hopping\n    type: hysteria2\n    server: example.test\n    port: 443\n    ports: 2000-2010,8443\n    hop-interval: 15\n    password: fixture\n    sni: example.test\n";
+        let node = import_subscription(yaml.as_bytes())
+            .unwrap()
+            .nodes
+            .remove(0);
+        assert!(matches!(
+            node.protocol(),
+            NodeProtocol::Hysteria2(Hysteria2Node {
+                ports: PortSelection::Ranges(_),
+                hop_interval: Some(value),
+                ..
+            }) if value == "15s"
+        ));
+
+        let invalid_range = "proxies:\n  - name: bad\n    type: hysteria2\n    server: example.test\n    port: 443\n    ports: 2000-2010\n    hop-interval: 15-30\n    password: fixture\n";
+        assert!(import_subscription(invalid_range.as_bytes()).is_err());
+        let invalid_fixed_port = "proxies:\n  - name: bad-port\n    type: hysteria2\n    server: example.test\n    port: 70000\n    ports: 2000-2010\n    password: fixture\n";
+        assert!(import_subscription(invalid_fixed_port.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn grpc_service_name_is_optional_in_all_supported_formats() {
+        let share =
+            format!("vless://{UUID}@example.test:443?security=tls&type=grpc&sni=example.test");
+        let json = format!(
+            r#"{{"type":"vless","server":"example.test","server_port":443,"uuid":"{UUID}","transport":{{"type":"grpc"}}}}"#
+        );
+        let yaml = format!(
+            "proxies:\n  - name: grpc\n    type: vless\n    server: example.test\n    port: 443\n    uuid: {UUID}\n    network: grpc\n"
+        );
+        for input in [share, json, yaml] {
+            let node = import_subscription(input.as_bytes())
+                .unwrap()
+                .nodes
+                .remove(0);
+            assert!(matches!(
+                node.protocol(),
+                NodeProtocol::Vless(VlessNode {
+                    transport: VlessTransport::Grpc { service_name },
+                    ..
+                }) if service_name.is_empty()
+            ));
+        }
+    }
+
+    #[test]
+    fn websocket_host_accepts_http_authority_and_rejects_injection() {
+        for host in ["cdn.test%3A8443", "%5B2001%3Adb8%3A%3A1%5D%3A443"] {
+            let link = format!(
+                "vless://{UUID}@example.test:443?security=tls&type=ws&host={host}&sni=example.test"
+            );
+            assert!(import_subscription(link.as_bytes()).is_ok());
+        }
+        for host in ["cdn.test%3Abad", "cdn.test%2Fevil", "user%40cdn.test"] {
+            let link = format!(
+                "vless://{UUID}@example.test:443?security=tls&type=ws&host={host}&sni=example.test"
+            );
+            assert!(import_subscription(link.as_bytes()).is_err());
+        }
     }
 }

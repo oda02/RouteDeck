@@ -183,7 +183,7 @@ RoutePolicy {
 
 `update_key` correlates a node across subscription refreshes without using credentials. `id` adds source format and source ordinal so duplicate nodes within one import cannot overwrite one another. Persistent storage namespaces `id` by subscription origin; neither identifier contains credential material.
 
-Validation rules include DNS-name/IP syntax, port `1..65535`, UUID syntax, bounded strings/arrays, compatible protocol/transport combinations, and TLS verification on by default. `insecure=true` is imported but must be visibly marked; RouteDeck never turns it on implicitly. Unknown required fields or unsupported transports cause a per-node rejection with a useful reason.
+Validation rules include DNS-name/IP syntax, port `1..65535`, UUID syntax, bounded strings/arrays, compatible protocol/transport combinations, and TLS verification on by default. `insecure=true` is imported with persistent `InsecureTlsVerification` metadata, but config generation rejects it unless the controller supplies an explicit approval bound to both the node's non-secret update key and a hash of its current TLS security identity. A changed SNI, pin, ECH/REALITY material, fingerprint, ALPN, or verification mode invalidates the approval. Approval objects are native-only, cannot be supplied by arbitrary imported JSON/YAML, and expose no secret. Unknown required fields or unsupported transports cause a per-node rejection with a useful reason.
 
 ## 6. Subscription ingestion
 
@@ -234,6 +234,8 @@ Read only `proxies`; ignore no field silently. Do not import `rules`, `rule-prov
 - a documented RouteDeck `type: naive` extension only; ordinary `type: http` is not assumed to be Naive because that would silently change protocol semantics.
 
 Mihomo's official schemas are the source for field names: [VLESS](https://wiki.metacubex.one/en/config/proxies/vless/) and [Hysteria2](https://wiki.metacubex.one/config/proxies/hysteria2/).
+
+For Mihomo Hysteria2, `ports` is the canonical hopping field. If both `port` and `ports` are present, both must validate and `ports` is used. A fixed numeric `hop-interval` maps to whole seconds (`15` → `15s`); interval ranges such as `15-30` are rejected. VLESS gRPC permits an omitted/empty service name. WebSocket `Host` is a bounded HTTP authority (DNS/IP, optional port, or bracketed IPv6 with optional port), never an arbitrary header value.
 
 ### 6.5 sing-box JSON
 

@@ -70,7 +70,7 @@ Every state-changing W/H test records a before snapshot and has a verified clean
 | SP-05 | U | VLESS `%25`/double-encoding, duplicate critical query key, control chars | Decode exactly once; ambiguity/control chars rejected. |
 | SP-06 | U | `hysteria2://` and `hy2://` with encoded auth, default port, SNI, obfs; URI certificate pin supplied separately | Supported fields form a canonical node; `pinSHA256` fails closed until exact sing-box mapping is reviewed. |
 | SP-07 | U | Hysteria2 userpass, IPv6 literal, port hopping supported by pinned schema | Correct mapping and config validation. |
-| SP-08 | U | Hysteria2 `insecure=1` | Imported with persistent visible warning; never enabled implicitly. |
+| SP-08 | U | Hysteria2 `insecure=1` | Imported with persistent visible warning; config generation rejects without exact controller-owned approval. |
 | SP-09 | U | Invalid Hysteria2 multi-port/unknown obfs/oversized ECH | Rejected or explicitly unsupported; no partial node. |
 | SP-10 | U | `naive+https` and `naive+quic` with percent-encoded credentials | Correct canonical Naive mode/TLS/QUIC mapping. |
 | SP-11 | U | Naive header contains CR/LF, auth override, invalid token, >16 headers, >8 KiB | Rejected. |
@@ -101,6 +101,9 @@ Every state-changing W/H test records a before snapshot and has a verified clean
 | CG-01 | U/C | VLESS TLS fixture | Deterministic JSON; `sing-box check` succeeds. |
 | CG-02 | U/C | VLESS REALITY + Vision fixture | `flow`, SNI, uTLS, public key, short ID preserved; check succeeds. |
 | CG-03 | U/C | VLESS WS/gRPC fixtures | Check succeeds; no unsupported silent fallback. |
+| CG-03A | U | Empty/omitted gRPC service and WS Host authorities with port/bracketed IPv6 | Accepted and mapped; malformed Host/control injection rejected. |
+| CG-03B | U | Clash HY2 with `port` + `ports` and numeric `hop-interval`; ranged interval | Both ports validate, `ports` wins, fixed seconds normalize; interval range rejected. |
+| CG-03C | U | URI/JSON/Clash `insecure`, exact approval, wrong-node or changed-security approval | Default reject; exact approval succeeds; mismatch and stale approval reject. |
 | CG-04 | U/C | Hysteria2 TLS, obfs, IPv4/IPv6, hopping fixtures | Check succeeds for supported combinations. |
 | CG-05 | U/C | Naive HTTPS/QUIC fixtures with adjacent pinned `libcronet.dll` | Check succeeds; package asserts DLL presence. |
 | CG-06 | U | Each config has distinct `http-in`, `socks-in`, authenticated `health-in`, loopback-only listens | Structural assertion passes. |

@@ -64,6 +64,43 @@ pub enum ProtocolKind {
     Naive,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityWarning {
+    InsecureTlsVerification,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct InsecureApproval {
+    update_key: String,
+    security_identity: String,
+}
+
+impl InsecureApproval {
+    /// Called only after the controller has recorded an explicit user approval for this node.
+    pub fn record_explicit_user_approval(node: &Node) -> Result<Self, DomainError> {
+        if !node.requires_insecure_approval() {
+            return Err(DomainError::new(
+                "node does not require insecure TLS approval",
+            ));
+        }
+        Ok(Self {
+            update_key: node.update_key.clone(),
+            security_identity: node.security_identity(),
+        })
+    }
+
+    pub(crate) fn matches(&self, node: &Node) -> bool {
+        self.update_key == node.update_key && self.security_identity == node.security_identity()
+    }
+}
+
+impl fmt::Debug for InsecureApproval {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InsecureApproval([BOUND SECURITY IDENTITY])")
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct Node {
     pub(crate) id: String,
@@ -72,6 +109,7 @@ pub struct Node {
     pub(crate) server: String,
     pub(crate) protocol: NodeProtocol,
     pub(crate) source_format: SourceFormat,
+    pub(crate) security_warnings: Vec<SecurityWarning>,
 }
 
 impl Node {
@@ -85,6 +123,11 @@ impl Node {
         validate_display_name(&display_name)?;
         let server = normalize_server(&server)?;
         protocol.validate()?;
+        let security_warnings = if protocol.tls().is_some_and(|tls| tls.insecure) {
+            vec![SecurityWarning::InsecureTlsVerification]
+        } else {
+            Vec::new()
+        };
         let identity = format!(
             "{}|{}|{}|{}",
             protocol.kind_name(),
@@ -101,6 +144,7 @@ impl Node {
             server,
             protocol,
             source_format,
+            security_warnings,
         })
     }
 
@@ -128,8 +172,26 @@ impl Node {
         self.source_format
     }
 
+    pub fn security_warnings(&self) -> &[SecurityWarning] {
+        &self.security_warnings
+    }
+
+    pub fn requires_insecure_approval(&self) -> bool {
+        self.security_warnings
+            .contains(&SecurityWarning::InsecureTlsVerification)
+    }
+
     pub(crate) fn protocol(&self) -> &NodeProtocol {
         &self.protocol
+    }
+
+    fn security_identity(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.update_key.as_bytes());
+        if let Some(tls) = self.protocol.tls() {
+            tls.hash_security_identity(&mut hasher);
+        }
+        format!("{:x}", hasher.finalize())
     }
 }
 
@@ -154,6 +216,15 @@ pub enum NodeProtocol {
 }
 
 impl NodeProtocol {
+    fn tls(&self) -> Option<&TlsOptions> {
+        match self {
+            Self::Vless(node) if node.tls.enabled => Some(&node.tls),
+            Self::Hysteria2(node) => Some(&node.tls),
+            Self::Naive(node) => Some(&node.tls),
+            Self::Vless(_) => None,
+        }
+    }
+
     fn validate(&self) -> Result<(), DomainError> {
         match self {
             Self::Vless(node) => {
@@ -277,15 +348,12 @@ impl VlessTransport {
                     return Err(DomainError::new("invalid VLESS WebSocket path"));
                 }
                 if let Some(host) = host {
-                    normalize_server(host)?;
+                    validate_http_host(host)?;
                 }
                 Ok(())
             }
             Self::Grpc { service_name } => {
-                if service_name.is_empty()
-                    || service_name.len() > 1_024
-                    || service_name.chars().any(char::is_control)
-                {
+                if service_name.len() > 1_024 || service_name.chars().any(char::is_control) {
                     return Err(DomainError::new("invalid VLESS gRPC service name"));
                 }
                 Ok(())
@@ -465,6 +533,30 @@ impl TlsOptions {
             self.reality.is_some()
         )
     }
+
+    fn hash_security_identity(&self, hasher: &mut Sha256) {
+        hasher.update([u8::from(self.enabled), u8::from(self.insecure)]);
+        hash_component(hasher, self.server_name.as_deref().unwrap_or_default());
+        for value in &self.alpn {
+            hash_component(hasher, value);
+        }
+        hash_component(hasher, self.utls_fingerprint.as_deref().unwrap_or_default());
+        for value in &self.certificate_public_key_sha256 {
+            hash_component(hasher, value.expose());
+        }
+        for value in &self.ech_config {
+            hash_component(hasher, value.expose());
+        }
+        if let Some(reality) = &self.reality {
+            hash_component(hasher, reality.public_key.expose());
+            hash_component(hasher, reality.short_id.expose());
+        }
+    }
+}
+
+fn hash_component(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
 }
 
 impl fmt::Debug for TlsOptions {
@@ -670,6 +762,53 @@ pub(crate) fn validate_port(port: u16) -> Result<(), DomainError> {
     } else {
         Ok(())
     }
+}
+
+pub(crate) fn validate_http_host(value: &str) -> Result<(), DomainError> {
+    if value.is_empty()
+        || value.len() > 512
+        || value.chars().any(char::is_whitespace)
+        || value.chars().any(char::is_control)
+        || value
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'@' | b','))
+    {
+        return Err(DomainError::new("invalid HTTP Host value"));
+    }
+    if let Some(rest) = value.strip_prefix('[') {
+        let close = rest
+            .find(']')
+            .ok_or_else(|| DomainError::new("invalid HTTP Host value"))?;
+        let address = &rest[..close];
+        if address.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(DomainError::new("invalid HTTP Host value"));
+        }
+        let suffix = &rest[close + 1..];
+        if suffix.is_empty() {
+            return Ok(());
+        }
+        let port = suffix
+            .strip_prefix(':')
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|port| *port != 0)
+            .ok_or_else(|| DomainError::new("invalid HTTP Host value"))?;
+        return validate_port(port);
+    }
+    if value.contains('[') || value.contains(']') || value.matches(':').count() > 1 {
+        return Err(DomainError::new("invalid HTTP Host value"));
+    }
+    let host = if let Some((host, port)) = value.rsplit_once(':') {
+        let port = port
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| DomainError::new("invalid HTTP Host value"))?;
+        validate_port(port)?;
+        host
+    } else {
+        value
+    };
+    normalize_server(host).map(|_| ())
 }
 
 pub(crate) fn validate_hop_interval(value: &str) -> Result<(), DomainError> {
