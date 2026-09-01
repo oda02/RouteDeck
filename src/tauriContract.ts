@@ -199,7 +199,7 @@ export function parsePublicError(value: unknown): PublicErrorDto {
     subscription_proxy_policy_blocked: { message: "subscription.proxy.policy_blocked", stages: ["subscription_proxy"] },
     subscription_proxy_connect_failed: { message: "subscription.proxy.connect_failed", stages: ["subscription_proxy_connect"] },
     subscription_response_too_large: { message: "subscription.response_too_large", stages: ["subscription_response"] },
-    subscription_fetch_timeout: { message: "subscription.timeout", stages: ["subscription_fetch", "subscription_proxy_connect"] },
+    subscription_fetch_timeout: { message: "subscription.timeout", stages: ["subscription_dns", "subscription_fetch", "subscription_proxy_connect"] },
     subscription_invalid_encoding: { message: "subscription.invalid_encoding", stages: ["subscription_response"] },
   };
   const subscriptionContract = subscriptionContracts[error.code];

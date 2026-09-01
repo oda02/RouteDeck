@@ -96,7 +96,9 @@ test("subscription transport choice is closed, accessible, and responsive", () =
   assert.match(source, /value: "current_loopback_system_proxy", label: "Через текущий локальный системный прокси"/);
   assert.match(source, /не меняет настройку Windows, не переключается автоматически и не отправляет URL повторно/);
   assert.match(source, /Прокси видит этот IP и может видеть имя сервера через TLS SNI/);
-  assert.match(source, /секретные path, query\/token, HTTP-заголовки и содержимое подписки остаются зашифрованы TLS/);
+  assert.match(source, /Секретные path, query\/token, HTTP-заголовки и содержимое скрыты TLS только без перехвата сертификатом из доверенного хранилища Windows/);
+  assert.match(source, /не может распознать намеренно доверенный локальный корневой сертификат как враждебный/);
+  assert.doesNotMatch(source, /содержимое подписки остаются зашифрованы TLS/);
   assert.doesNotMatch(source, /URL и путь остаются внутри TLS/);
   assert.match(styles, /@media \(max-width: 399px\)[\s\S]*\.subscription-transport \.segmented-control\s*{\s*grid-template-columns: minmax\(0, 1fr\)/);
 });
@@ -185,6 +187,12 @@ test("subscription fetch errors require the exact finite contract", () => {
     message: "subscription.timeout",
     detail: null,
   }), ContractViolation);
+  assert.doesNotThrow(() => parsePublicError({
+    code: "subscription_fetch_timeout",
+    stage: "subscription_dns",
+    message: "subscription.timeout",
+    detail: null,
+  }));
   assert.doesNotThrow(() => parsePublicError({
     code: "subscription_fetch_timeout",
     stage: "subscription_proxy_connect",
