@@ -19,10 +19,11 @@ Checked on 2026-09-01 in the local Windows workspace.
 ## Current limitations
 
 - The release artifact was inspected and hashed without executing it. The shell does not yet package or execute `sing-box`, WinTUN, a proxy controller, or privileged code.
+- Microsoft Defender scanned a uniquely staged, twice-verified copy of the exact engine directory on 2026-09-01 and returned exit code `0` with no threats found. No exclusions were added. This point-in-time result is evidence only, not a safety guarantee.
 - `cargo check` must run through `VsDevCmd.bat` (or another shell where MSVC tools including `link.exe` are already on `PATH`).
 - The current verification covers compilation only; Windows integration and privileged tests remain intentionally out of scope.
 - The PowerShell verifier is not the runtime integrity-and-launch gate. A separate path-based hash followed by process launch has a time-of-check/time-of-use race; the native controller must prevent replacement between verification and `CreateProcess`, and that implementation still requires security review and hostile concurrency tests.
-- The upstream ZIP includes the sing-box GPL-3.0-or-later license but not the separate Cronet/NaiveProxy/Chromium notices identified in the lock provenance. Packaging must include those notices (and complete third-party notices/source-compliance material after legal review) before release. No machine-enforced license-completeness gate or legal-compliance claim exists yet because the complete notices manifest has not been established; release packaging remains blocked until that reviewed manifest can be pinned and checked.
+- The upstream ZIP includes the sing-box GPL-3.0-or-later license but not a complete Cronet/Chromium or sing-box dependency notice inventory. Authentic top-level Cronet/NaiveProxy/Chromium license texts and the unresolved evidence are pinned under `engine/licenses/` and `engine/NOTICE.md`. `scripts/assemble-portable.ps1` enforces the current `blocked` manifest and exits before creating a target. This is not a legal-compliance claim; release packaging remains blocked pending the documented Windows Cronet notices, sing-box transitive notices, and source-compliance review.
 
 ## Reproduce the checks
 

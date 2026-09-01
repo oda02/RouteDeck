@@ -150,6 +150,11 @@ try {
   $engineDirectory = Join-Path $extractedOuter ([string] $lock.releaseAsset.archiveRoot)
   Assert-Pass 'reviewed extracted directory' $engineDirectory
 
+  $unexpectedExecutable = Join-Path $engineDirectory 'unexpected.exe'
+  [IO.File]::WriteAllBytes($unexpectedExecutable, [byte[]] @(0x4D, 0x5A))
+  Assert-Rejected 'extra extracted executable' $engineDirectory 'unexpected executable or DLL'
+  [IO.File]::Delete($unexpectedExecutable)
+
   $licensePath = Join-Path $engineDirectory 'LICENSE'
   $bytes = [IO.File]::ReadAllBytes($licensePath)
   $bytes[0] = $bytes[0] -bxor 1
