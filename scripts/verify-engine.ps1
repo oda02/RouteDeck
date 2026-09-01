@@ -1,3 +1,12 @@
+<#
+.SYNOPSIS
+Developer/packaging verification for the pinned sing-box artifact.
+
+.NOTES
+This script does not launch the engine and is not RouteDeck's runtime
+integrity gate. A path-based verification performed separately from process
+creation cannot prevent a time-of-check/time-of-use replacement.
+#>
 [CmdletBinding()]
 param(
   [Parameter(Mandatory = $true, Position = 0)]
@@ -41,6 +50,23 @@ function Assert-SafeRelativePath([string] $Value, [string] $Label) {
     }
     if ($segment.EndsWith('.') -or $segment.EndsWith(' ')) {
       Fail "$Label contains a Windows-ambiguous segment: $Value"
+    }
+
+    foreach ($character in $segment.ToCharArray()) {
+      if ([int] $character -lt 32) {
+        Fail "$Label contains a control character: $Value"
+      }
+      if ('<>:"|?*'.Contains([string] $character)) {
+        Fail "$Label contains an invalid Win32 character: $Value"
+      }
+    }
+
+    # Windows resolves reserved DOS device names even when they have an
+    # extension (for example, CON.txt). Trim spaces from the stem as Win32
+    # name normalization can otherwise alias a reserved name.
+    $stem = $segment.Split('.')[0].TrimEnd(' ')
+    if ($stem -match '^(CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9]|LPT[1-9])$') {
+      Fail "$Label contains a reserved Windows device name: $Value"
     }
   }
 
@@ -134,6 +160,8 @@ function Verify-Directory([System.IO.DirectoryInfo] $Directory, $Files, [string]
     $current = $pending.Pop()
     foreach ($child in $current.GetFileSystemInfos()) {
       Assert-NoReparsePoint $child 'engine directory entry'
+      $relative = [IO.Path]::GetRelativePath($Directory.FullName, $child.FullName).Replace('\', '/')
+      $relative = Assert-SafeRelativePath $relative 'engine directory entry'
       if ($child -is [System.IO.DirectoryInfo]) {
         $pending.Push($child)
         continue
@@ -142,7 +170,6 @@ function Verify-Directory([System.IO.DirectoryInfo] $Directory, $Files, [string]
       if ($extension -notin @('.exe', '.dll')) {
         continue
       }
-      $relative = [IO.Path]::GetRelativePath($Directory.FullName, $child.FullName).Replace('\', '/')
       if (-not $expectedExecutables.Contains($relative)) {
         Fail "unexpected executable or DLL in engine directory: $relative"
       }
@@ -154,19 +181,41 @@ function Verify-Directory([System.IO.DirectoryInfo] $Directory, $Files, [string]
 
 function Verify-Archive([System.IO.FileInfo] $Archive, $Lock, $Files) {
   Assert-NoReparsePoint $Archive 'engine archive'
-  Add-Type -AssemblyName System.IO.Compression
+
+  # The archive is untrusted until its complete byte identity is established.
+  # Do not construct ZipArchive or enumerate central-directory data before both
+  # the exact length and full-file digest match the reviewed lock.
+  Assert-Sha256 ([string] $Lock.releaseAsset.sha256) 'archive hash in lock'
 
   $expectedByArchivePath = @{}
   foreach ($file in $Files) {
     $expectedByArchivePath[[string] $file.archivePath] = $file
   }
 
-  $stream = [System.IO.File]::OpenRead($Archive.FullName)
+  # Keep the same read-only handle open from digesting through ZIP inspection.
+  # FileShare.Read prevents a cooperating Windows process from replacing or
+  # modifying these bytes between the pre-parse check and enumeration.
+  $stream = [System.IO.File]::Open(
+    $Archive.FullName,
+    [System.IO.FileMode]::Open,
+    [System.IO.FileAccess]::Read,
+    [System.IO.FileShare]::Read
+  )
   try {
+    if ([long] $stream.Length -ne [long] $Lock.releaseAsset.size) {
+      Fail "archive size mismatch: expected $($Lock.releaseAsset.size), got $($stream.Length)"
+    }
+    $archiveHash = Get-StreamSha256 $stream
+    if ($archiveHash -cne [string] $Lock.releaseAsset.sha256) {
+      Fail "archive SHA-256 mismatch: expected $($Lock.releaseAsset.sha256), got $archiveHash"
+    }
+    [void] $stream.Seek(0, [System.IO.SeekOrigin]::Begin)
+
+    Add-Type -AssemblyName System.IO.Compression
     $zip = [System.IO.Compression.ZipArchive]::new(
       $stream,
       [System.IO.Compression.ZipArchiveMode]::Read,
-      $false
+      $true
     )
     try {
       $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -194,15 +243,6 @@ function Verify-Archive([System.IO.FileInfo] $Archive, $Lock, $Files) {
         if (-not $seen.Contains([string] $expectedPath)) {
           Fail "required archive entry is missing: $expectedPath"
         }
-      }
-
-      if ([long] $Archive.Length -ne [long] $Lock.releaseAsset.size) {
-        Fail "archive size mismatch: expected $($Lock.releaseAsset.size), got $($Archive.Length)"
-      }
-      Assert-Sha256 ([string] $Lock.releaseAsset.sha256) 'archive hash in lock'
-      $archiveHash = Get-FileSha256 $Archive.FullName
-      if ($archiveHash -cne [string] $Lock.releaseAsset.sha256) {
-        Fail "archive SHA-256 mismatch: expected $($Lock.releaseAsset.sha256), got $archiveHash"
       }
 
       foreach ($entry in $zip.Entries) {
