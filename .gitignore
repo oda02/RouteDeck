@@ -1,0 +1,11 @@
+node_modules/
+dist/
+src-tauri/target/
+.idea/
+.vscode/
+*.log
+*.pdb
+*.dmp
+.env
+.env.*
+!.env.example
