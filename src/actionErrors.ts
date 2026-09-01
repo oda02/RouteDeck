@@ -26,16 +26,10 @@ export function toPublicActionError(error: unknown): PublicActionError {
         return { message: "Адрес подписки или перенаправление заблокированы политикой безопасности. Используйте публичный HTTPS URL без перехода в локальную сеть." };
       case "subscription-fetch-failed":
         return { message: "Не удалось безопасно загрузить HTTPS-подписку через текущий сетевой путь Windows. Проверьте доступность адреса и повторно введите URL." };
-      case "subscription-proxy-unavailable":
-        return { message: "Текущий системный прокси недоступен или не является поддерживаемым локальным прокси. Проверьте настройку Windows и повторно введите URL." };
-      case "subscription-proxy-policy-blocked":
-        return { message: "Текущий системный прокси отклонён политикой безопасности. RouteDeck разрешает только статический числовой loopback-адрес без учётных данных." };
-      case "subscription-proxy-connect-failed":
-        return { message: "Не удалось установить CONNECT через текущий локальный системный прокси. Проверьте, работает ли выбранный VPN или прокси, и повторно введите URL." };
       case "subscription-response-too-large":
         return { message: "Ответ подписки превышает безопасный размер. Используйте более компактную подписку." };
       case "subscription-fetch-timeout":
-        return { message: "Сервер подписки или явно выбранный системный прокси не ответил за отведённое время. Повторите попытку позже." };
+        return { message: "Сервер подписки не ответил за отведённое время через текущий сетевой путь Windows. Повторите попытку позже." };
       case "subscription-invalid-encoding":
         return { message: "Сервер вернул подписку в неподдерживаемой кодировке. Нужен корректный текст UTF-8." };
       case "empty-subscription-source":

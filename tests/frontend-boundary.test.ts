@@ -185,22 +185,10 @@ test("subscription fetch errors require the exact finite contract", () => {
     message: "subscription.timeout",
     detail: null,
   }));
-  assert.doesNotThrow(() => parsePublicError({
-    code: "subscription_fetch_timeout",
-    stage: "subscription_proxy_connect",
-    message: "subscription.timeout",
-    detail: null,
-  }));
-  assert.doesNotThrow(() => parsePublicError({
+  assert.throws(() => parsePublicError({
     code: "subscription_proxy_unavailable",
     stage: "subscription_proxy",
     message: "subscription.proxy.unavailable",
-    detail: null,
-  }));
-  assert.throws(() => parsePublicError({
-    code: "subscription_proxy_policy_blocked",
-    stage: "subscription_proxy_connect",
-    message: "subscription.proxy.policy_blocked",
     detail: null,
   }), ContractViolation);
   assert.doesNotThrow(() => parsePublicError({
@@ -413,12 +401,8 @@ test("HTTPS fetch failures map to finite localized errors without backend detail
     ["subscription_url_invalid", "subscription_url", "subscription.url.invalid", "invalid-subscription-url"],
     ["subscription_policy_blocked", "subscription_dns", "subscription.policy_blocked", "subscription-policy-blocked"],
     ["subscription_fetch_failed", "subscription_fetch", "subscription.fetch_failed", "subscription-fetch-failed"],
-    ["subscription_proxy_unavailable", "subscription_proxy", "subscription.proxy.unavailable", "subscription-proxy-unavailable"],
-    ["subscription_proxy_policy_blocked", "subscription_proxy", "subscription.proxy.policy_blocked", "subscription-proxy-policy-blocked"],
-    ["subscription_proxy_connect_failed", "subscription_proxy_connect", "subscription.proxy.connect_failed", "subscription-proxy-connect-failed"],
     ["subscription_response_too_large", "subscription_response", "subscription.response_too_large", "subscription-response-too-large"],
     ["subscription_fetch_timeout", "subscription_fetch", "subscription.timeout", "subscription-fetch-timeout"],
-    ["subscription_fetch_timeout", "subscription_proxy_connect", "subscription.timeout", "subscription-fetch-timeout"],
     ["subscription_invalid_encoding", "subscription_response", "subscription.invalid_encoding", "subscription-invalid-encoding"],
   ] as const;
   let backendError: unknown;
