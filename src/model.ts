@@ -144,6 +144,7 @@ export type RouteDeckErrorCode =
   | "capability-unavailable"
   | "runtime-failure"
   | "node-not-selected"
+  | "subscription-import-rejected"
   | "invalid-subscription-url"
   | "insecure-subscription-url"
   | "subscription-policy-blocked"

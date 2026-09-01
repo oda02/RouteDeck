@@ -266,6 +266,8 @@ function protocolName(protocol: ImportPreviewDto["nodes"][number]["protocol"]): 
 
 function routeDeckErrorFromBackend(error: PublicErrorDto): RouteDeckError {
   switch (error.code) {
+    case "import_rejected":
+      return new RouteDeckError("subscription-import-rejected");
     case "preview_missing":
     case "preview_token_invalid":
       return new RouteDeckError("stale-subscription-preview");

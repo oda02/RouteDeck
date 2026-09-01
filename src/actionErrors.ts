@@ -16,6 +16,8 @@ export function toPublicActionError(error: unknown): PublicActionError {
         return { message: "Локальный backend не завершил действие. Откройте безопасную диагностику и повторите попытку." };
       case "node-not-selected":
         return { message: "Сначала импортируйте и выберите сервер." };
+      case "subscription-import-rejected":
+        return { message: "Полученные данные не распознаны как поддерживаемая подписка. Проверьте формат источника и повторите импорт." };
       case "invalid-subscription-url":
         return { message: "Проверьте формат HTTPS URL подписки." };
       case "insecure-subscription-url":

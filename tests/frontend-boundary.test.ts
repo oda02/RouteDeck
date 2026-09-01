@@ -483,6 +483,40 @@ test("HTTPS fetch failures map to finite localized errors without backend detail
   controller.dispose();
 });
 
+test("known import rejection is localized instead of masked as a runtime failure", async () => {
+  const secret = "https://provider.example/subscription?token=never-display";
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command) => {
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "preview_import_url") {
+        throw {
+          code: "import_rejected",
+          stage: "import",
+          message: "subscription.content.rejected",
+          detail: null,
+        };
+      }
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+
+  await assert.rejects(
+    controller.previewSubscription({ type: "url", value: secret, transport: "current_loopback_system_proxy" }),
+    (error: unknown) => {
+      assert.ok(error instanceof RouteDeckError);
+      assert.equal(error.code, "subscription-import-rejected");
+      const publicError = toPublicActionError(error);
+      assert.match(publicError.message, /не распознаны как поддерживаемая подписка/);
+      assert.doesNotMatch(JSON.stringify(publicError), /never-display|provider\.example/);
+      return true;
+    },
+  );
+  controller.dispose();
+});
+
 test("malformed backend error closes the renderer boundary", async () => {
   const secret = "https://provider.example/subscription?token=malformed-error";
   const transport: TauriTransport = {
