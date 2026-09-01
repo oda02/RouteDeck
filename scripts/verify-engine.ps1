@@ -65,7 +65,7 @@ function Assert-SafeRelativePath([string] $Value, [string] $Label) {
     # extension (for example, CON.txt). Trim spaces from the stem as Win32
     # name normalization can otherwise alias a reserved name.
     $stem = $segment.Split('.')[0].TrimEnd(' ')
-    if ($stem -match '^(CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9]|LPT[1-9])$') {
+    if ($stem -match '^(CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])$') {
       Fail "$Label contains a reserved Windows device name: $Value"
     }
   }

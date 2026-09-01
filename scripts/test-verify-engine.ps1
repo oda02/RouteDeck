@@ -97,6 +97,16 @@ try {
       }
     }
   }
+  foreach ($superscript in @('¹', '²', '³')) {
+    foreach ($prefix in @('COM', 'LPT')) {
+      $device = "$prefix$superscript"
+      $hostileCases += @{
+        Name = 'reserved-' + $prefix.ToLowerInvariant() + '-superscript-' + $superscript
+        Path = "engine/$device.config"
+        Message = 'reserved Windows device name'
+      }
+    }
+  }
   $hostileCases += @(
     @{ Name = 'invalid-less-than'; Path = 'engine/bad<name.dll'; Message = 'invalid Win32 character' },
     @{ Name = 'invalid-greater-than'; Path = 'engine/bad>name.dll'; Message = 'invalid Win32 character' },
