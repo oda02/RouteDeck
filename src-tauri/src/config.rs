@@ -610,7 +610,7 @@ mod tests {
 
     #[test]
     fn emits_hysteria_and_naive_113_shapes() {
-        let hy2 = node("hysteria2://fixture-password@example.test:443?obfs=salamander&obfs-password=fixture-obfs&sni=example.test");
+        let hy2 = node("hysteria2://fixture-password@example.test:443?alpn=h3&fp=chrome&obfs=salamander&obfs-password=fixture-obfs&security=tls&sni=example.test");
         let naive = node("naive+quic://fixture-user:fixture-pass@example.test:443");
         let policy = policy(DefaultRoute::Vpn);
         let hy2_value: Value =
@@ -622,6 +622,13 @@ mod tests {
                 .and_then(Value::as_str),
             Some("salamander")
         );
+        assert_eq!(
+            hy2_value
+                .pointer("/outbounds/0/tls/alpn/0")
+                .and_then(Value::as_str),
+            Some("h3")
+        );
+        assert!(hy2_value.pointer("/outbounds/0/tls/utls").is_none());
         let naive_value: Value =
             serde_json::from_str(generate_config(request(&naive, &policy)).unwrap().as_str())
                 .unwrap();
