@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
+import { toPublicActionError } from "../src/actionErrors.ts";
+import { RouteDeckError } from "../src/model.ts";
 import { selectControllerRuntime } from "../src/runtimeSelection.ts";
 import {
   ContractViolation,
   RuntimeRevisionGate,
+  parsePublicError,
   parseRuntimeStatus,
   parseUnitResponse,
   type RuntimeStatusDto,
@@ -51,6 +54,15 @@ test("non-dismissible import keeps focus inside the mounted dialog", () => {
   assert.match(source, /data-dialog-busy-focus/);
   assert.match(source, /role="status" aria-live="polite" tabIndex=\{0\} data-dialog-busy-focus/);
   assert.doesNotMatch(source, /previouslyFocused\?\.focus/);
+});
+
+test("URL input is masked and cleared before the async preview action", () => {
+  const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  assert.match(source, /id="subscription-url" type=\{subscriptionVisible \? "text" : "password"\}/);
+  const secretClear = source.indexOf("if (sourceType === \"url\") {");
+  const asyncAction = source.indexOf("void runAsyncAction({", secretClear);
+  assert.ok(secretClear >= 0 && asyncAction > secretClear);
+  assert.match(source.slice(secretClear, asyncAction), /setSubscriptionSource\(""\)/);
 });
 
 test("local-only readiness never maps to global Connected", () => {
@@ -119,6 +131,44 @@ test("schema validator rejects duplicate proofs and invalid enum values", () => 
   );
 });
 
+test("subscription fetch errors require the exact finite contract", () => {
+  assert.deepEqual(parsePublicError({
+    code: "subscription_fetch_timeout",
+    stage: "subscription_fetch",
+    message: "subscription.timeout",
+    detail: null,
+  }), {
+    code: "subscription_fetch_timeout",
+    stage: "subscription_fetch",
+    message: "subscription.timeout",
+    detail: undefined,
+  });
+  assert.throws(() => parsePublicError({
+    code: "subscription_fetch_timeout",
+    stage: "subscription_response",
+    message: "subscription.timeout",
+    detail: null,
+  }), ContractViolation);
+  assert.doesNotThrow(() => parsePublicError({
+    code: "subscription_fetch_failed",
+    stage: "subscription_dns",
+    message: "subscription.fetch_failed",
+    detail: null,
+  }));
+  assert.throws(() => parsePublicError({
+    code: "subscription_policy_blocked",
+    stage: "subscription_fetch",
+    message: "subscription.policy_blocked",
+    detail: null,
+  }), ContractViolation);
+  assert.throws(() => parsePublicError({
+    code: "subscription_fetch_timeout",
+    stage: "subscription_fetch",
+    message: "raw backend detail",
+    detail: "https://secret.example/token",
+  }), ContractViolation);
+});
+
 test("unit command responses accept only Rust null", () => {
   assert.doesNotThrow(() => parseUnitResponse(null));
   assert.throws(() => parseUnitResponse(undefined), ContractViolation);
@@ -172,6 +222,108 @@ test("cancelled import cannot retain or publish a late preview", async () => {
   await assert.rejects(pending, { code: "stale-subscription-preview" });
   assert.deepEqual(discarded, [{ command: "discard_import_preview", arguments_: { previewId: "preview-fixture" } }]);
   assert.equal(controller.getSnapshot().servers.length, 0);
+  controller.dispose();
+});
+
+test("HTTPS URL preview uses the exact typed command and retains no secret", async () => {
+  const secret = "https://user:password@provider.example/subscription?token=secret";
+  const calls: Array<{ command: string; arguments_?: Record<string, unknown> }> = [];
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command, arguments_) => {
+      calls.push({ command, arguments_ });
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "preview_import_url") return {
+        previewId: "preview-url",
+        nodes: [{ id: "node-url", displayName: "Fetched", protocol: "vless", insecureTls: false }],
+        rejected: [],
+        warnings: [],
+      };
+      if (command === "discard_import_preview") return null;
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+  const preview = await controller.previewSubscription({ type: "url", value: secret });
+  assert.deepEqual(calls[1], { command: "preview_import_url", arguments_: { url: secret } });
+  assert.equal(preview.sourceLabel, "HTTPS-подписка · адрес скрыт");
+  assert.ok(!JSON.stringify(preview).includes(secret));
+  assert.ok(!JSON.stringify(controller.getSnapshot()).includes(secret));
+  assert.ok(!JSON.stringify(controller).includes(secret));
+  controller.cancelImportPreview();
+  controller.dispose();
+});
+
+test("stale HTTPS URL preview is discarded without publishing its secret", async () => {
+  const secret = "https://provider.example/subscription?token=late-secret";
+  let resolvePreview!: (value: unknown) => void;
+  const previewResult = new Promise<unknown>((resolve) => { resolvePreview = resolve; });
+  const discarded: unknown[] = [];
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command, arguments_) => {
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "preview_import_url") return previewResult;
+      if (command === "discard_import_preview") {
+        discarded.push(arguments_);
+        return null;
+      }
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+  const pending = controller.previewSubscription({ type: "url", value: secret });
+  controller.cancelImportPreview();
+  resolvePreview({
+    previewId: "preview-url-late",
+    nodes: [{ id: "node-url-late", displayName: "Late", protocol: "hysteria2", insecureTls: false }],
+    rejected: [],
+    warnings: [],
+  });
+  await assert.rejects(pending, { code: "stale-subscription-preview" });
+  assert.deepEqual(discarded, [{ previewId: "preview-url-late" }]);
+  assert.ok(!JSON.stringify(controller).includes(secret));
+  controller.dispose();
+});
+
+test("HTTPS fetch failures map to finite localized errors without backend detail", async () => {
+  const cases = [
+    ["subscription_url_invalid", "subscription_url", "subscription.url.invalid", "invalid-subscription-url"],
+    ["subscription_policy_blocked", "subscription_dns", "subscription.policy_blocked", "subscription-policy-blocked"],
+    ["subscription_fetch_failed", "subscription_fetch", "subscription.fetch_failed", "subscription-fetch-failed"],
+    ["subscription_response_too_large", "subscription_response", "subscription.response_too_large", "subscription-response-too-large"],
+    ["subscription_fetch_timeout", "subscription_fetch", "subscription.timeout", "subscription-fetch-timeout"],
+    ["subscription_invalid_encoding", "subscription_response", "subscription.invalid_encoding", "subscription-invalid-encoding"],
+  ] as const;
+  let backendError: unknown;
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command) => {
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "preview_import_url") throw backendError;
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+  for (const [code, stage, message, expectedCode] of cases) {
+    const secret = `https://provider.example/${code}?token=never-display`;
+    backendError = { code, stage, message, detail: null };
+    await assert.rejects(
+      controller.previewSubscription({ type: "url", value: secret }),
+      (error: unknown) => {
+        assert.ok(error instanceof RouteDeckError);
+        assert.equal(error.code, expectedCode);
+        const localized = toPublicActionError(error);
+        assert.ok(localized.message.length > 0 && localized.message.length < 240);
+        assert.doesNotMatch(JSON.stringify(localized), /never-display|subscription\./);
+        assert.doesNotMatch(JSON.stringify(error), /never-display/);
+        return true;
+      },
+    );
+  }
   controller.dispose();
 });
 

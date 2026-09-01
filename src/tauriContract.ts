@@ -35,6 +35,12 @@ const publicErrorCodes = [
   "node_not_found",
   "runtime_failure",
   "command_failed",
+  "subscription_url_invalid",
+  "subscription_policy_blocked",
+  "subscription_fetch_failed",
+  "subscription_response_too_large",
+  "subscription_fetch_timeout",
+  "subscription_invalid_encoding",
 ] as const;
 const publicErrorStages = [
   "import",
@@ -54,6 +60,10 @@ const publicErrorStages = [
   "monitor",
   "command",
   "runtime",
+  "subscription_url",
+  "subscription_dns",
+  "subscription_fetch",
+  "subscription_response",
 ] as const;
 const protocols = ["vless", "hysteria2", "naive"] as const;
 
@@ -170,12 +180,28 @@ function optionalDuration(value: unknown): number | undefined {
 export function parsePublicError(value: unknown): PublicErrorDto {
   const input = record(value);
   exactKeys(input, ["code", "stage", "message", "detail"], ["code", "stage", "message"]);
-  return {
+  const error: PublicErrorDto = {
     code: member(input.code, publicErrorCodes),
     stage: member(input.stage, publicErrorStages),
     message: boundedString(input.message, 4096),
     detail: optionalString(input.detail, 8192),
   };
+  const subscriptionContracts: Partial<Record<PublicErrorCodeDto, { message: string; stages: PublicErrorStageDto[] }>> = {
+    subscription_url_invalid: { message: "subscription.url.invalid", stages: ["subscription_url"] },
+    subscription_policy_blocked: { message: "subscription.policy_blocked", stages: ["subscription_url", "subscription_dns"] },
+    subscription_fetch_failed: { message: "subscription.fetch_failed", stages: ["subscription_dns", "subscription_fetch"] },
+    subscription_response_too_large: { message: "subscription.response_too_large", stages: ["subscription_response"] },
+    subscription_fetch_timeout: { message: "subscription.timeout", stages: ["subscription_fetch"] },
+    subscription_invalid_encoding: { message: "subscription.invalid_encoding", stages: ["subscription_response"] },
+  };
+  const subscriptionContract = subscriptionContracts[error.code];
+  if (subscriptionContract) {
+    if (error.message !== subscriptionContract.message || !subscriptionContract.stages.includes(error.stage)) {
+      throw new ContractViolation();
+    }
+    if (input.detail !== undefined && input.detail !== null) throw new ContractViolation();
+  }
+  return error;
 }
 
 export function parseRuntimeStatus(value: unknown): RuntimeStatusDto {

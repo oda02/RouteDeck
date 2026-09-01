@@ -1,0 +1,46 @@
+import { RouteDeckError } from "./model.ts";
+
+export type PublicActionError = { message: string; redactedDetail?: string };
+
+/** Maps finite internal codes to localized copy without exposing backend detail. */
+export function toPublicActionError(error: unknown): PublicActionError {
+  if (error instanceof RouteDeckError) {
+    switch (error.code) {
+      case "backend-unavailable":
+        return { message: "Backend RouteDeck недоступен. Действие безопасно заблокировано." };
+      case "backend-response-invalid":
+        return { message: "Backend вернул неожиданные данные. Сетевые действия безопасно заблокированы." };
+      case "capability-unavailable":
+        return { message: "Эта возможность ещё не подключена к проверенному Windows-backend." };
+      case "runtime-failure":
+        return { message: "Локальный backend не завершил действие. Откройте безопасную диагностику и повторите попытку." };
+      case "node-not-selected":
+        return { message: "Сначала импортируйте и выберите сервер." };
+      case "invalid-subscription-url":
+        return { message: "Проверьте формат HTTPS URL подписки." };
+      case "insecure-subscription-url":
+        return { message: "Для подписки требуется защищённый HTTPS URL." };
+      case "subscription-policy-blocked":
+        return { message: "Адрес подписки или перенаправление заблокированы политикой безопасности. Используйте публичный HTTPS URL без перехода в локальную сеть." };
+      case "subscription-fetch-failed":
+        return { message: "Не удалось безопасно загрузить HTTPS-подписку. Проверьте доступность адреса и повторите попытку." };
+      case "subscription-response-too-large":
+        return { message: "Ответ подписки превышает безопасный размер. Используйте более компактную подписку." };
+      case "subscription-fetch-timeout":
+        return { message: "Сервер подписки не ответил за отведённое время. Повторите попытку позже." };
+      case "subscription-invalid-encoding":
+        return { message: "Сервер вернул подписку в неподдерживаемой кодировке. Нужен корректный текст UTF-8." };
+      case "empty-subscription-source":
+        return { message: "Источник подписки пуст." };
+      case "stale-subscription-preview":
+        return { message: "Предпросмотр устарел. Проверьте источник ещё раз." };
+    }
+  }
+  if (typeof DOMException !== "undefined" && error instanceof DOMException && error.name === "NotAllowedError") {
+    return { message: "Windows не разрешила доступ к буферу обмена. Проверьте разрешение и повторите действие." };
+  }
+  return {
+    message: "Действие не выполнено. Технические сведения скрыты, чтобы не показать секреты.",
+    redactedDetail: "Откройте безопасный диагностический отчёт или повторите действие.",
+  };
+}

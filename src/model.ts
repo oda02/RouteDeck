@@ -144,7 +144,11 @@ export type RouteDeckErrorCode =
   | "node-not-selected"
   | "invalid-subscription-url"
   | "insecure-subscription-url"
-  | "subscription-url-fetch-unavailable"
+  | "subscription-policy-blocked"
+  | "subscription-fetch-failed"
+  | "subscription-response-too-large"
+  | "subscription-fetch-timeout"
+  | "subscription-invalid-encoding"
   | "empty-subscription-source"
   | "stale-subscription-preview";
 

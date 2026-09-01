@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import { controller } from "./controller";
+import { toPublicActionError, type PublicActionError } from "./actionErrors";
 import {
   ActivityIcon,
   CheckIcon,
@@ -33,7 +34,6 @@ import {
   XIcon,
 } from "./icons";
 import {
-  RouteDeckError,
   destinations,
   type AppNotice,
   type AppRouteChoice,
@@ -52,7 +52,6 @@ import {
 type DialogKind = "import" | "tun-preflight" | "mode-change" | "reset" | null;
 type ToastKind = "success" | "info" | "warning";
 type ToastState = { message: string; kind: ToastKind };
-type PublicActionError = { message: string; redactedDetail?: string };
 type ActionFailure = { page: Destination; notice: AppNotice; retry?: () => void };
 type AsyncActionOptions<T> = {
   page: Destination;
@@ -105,40 +104,6 @@ const proofStateLabels = {
   fail: "Ошибка",
   skipped: "Недоступно",
 } as const;
-
-function toPublicActionError(error: unknown): PublicActionError {
-  if (error instanceof RouteDeckError) {
-    switch (error.code) {
-      case "backend-unavailable":
-        return { message: "Backend RouteDeck недоступен. Действие безопасно заблокировано." };
-      case "backend-response-invalid":
-        return { message: "Backend вернул неожиданные данные. Сетевые действия безопасно заблокированы." };
-      case "capability-unavailable":
-        return { message: "Эта возможность ещё не подключена к проверенному Windows-backend." };
-      case "runtime-failure":
-        return { message: "Локальный backend не завершил действие. Откройте безопасную диагностику и повторите попытку." };
-      case "node-not-selected":
-        return { message: "Сначала импортируйте и выберите сервер." };
-      case "invalid-subscription-url":
-        return { message: "Проверьте формат URL подписки." };
-      case "insecure-subscription-url":
-        return { message: "Для подписки требуется защищённый HTTPS URL." };
-      case "subscription-url-fetch-unavailable":
-        return { message: "Загрузка HTTPS-подписки ещё не подключена. Пока импортируйте её содержимое через буфер обмена." };
-      case "empty-subscription-source":
-        return { message: "Источник подписки пуст." };
-      case "stale-subscription-preview":
-        return { message: "Предпросмотр устарел. Проверьте источник ещё раз." };
-    }
-  }
-  if (error instanceof DOMException && error.name === "NotAllowedError") {
-    return { message: "Windows не разрешила доступ к буферу обмена. Проверьте разрешение и повторите действие." };
-  }
-  return {
-    message: "Действие не выполнено. Технические сведения скрыты, чтобы не показать секреты.",
-    redactedDetail: "Откройте безопасный диагностический отчёт или повторите действие.",
-  };
-}
 
 function useController() {
   return useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
@@ -998,20 +963,34 @@ export default function App() {
     setImportError("");
     controller.cancelImportPreview();
     const generation = ++importGeneration.current;
-    const source: SubscriptionImportSource = importMethod === "url"
-      ? { type: "url", value: subscriptionSource }
-      : { type: "clipboard", value: subscriptionSource };
+    const sourceValue = subscriptionSource;
+    const sourceType = importMethod === "url" ? "url" : "clipboard";
+    let source: SubscriptionImportSource = { type: sourceType, value: sourceValue };
+    if (sourceType === "url") {
+      // The URL may contain credentials. Remove it from React state before IPC
+      // starts; errors require explicit re-entry instead of retaining a secret.
+      setSubscriptionSource("");
+      setSubscriptionVisible(false);
+    }
     void runAsyncAction({
       page: "servers",
       title: "Не удалось проверить подписку",
       setBusy: (busy) => {
         if (generation === importGeneration.current) setImporting(busy);
       },
-      action: () => controller.previewSubscription(source),
+      action: () => {
+        const pending = controller.previewSubscription(source);
+        source = { type: "clipboard", value: "" };
+        return pending;
+      },
       retry: previewImport,
       errorPresentation: "inline",
       onError: (publicError) => {
         if (generation !== importGeneration.current) return;
+        if (sourceType === "url") {
+          setSubscriptionSource("");
+          setSubscriptionVisible(false);
+        }
         setImportError(publicError.message);
         focusImportInput();
       },
@@ -1115,7 +1094,7 @@ export default function App() {
             <button className="primary-button dialog-primary" type="button" disabled={importing} aria-busy={importing} onClick={commitImport}>{importing ? <LoaderIcon size={19} /> : <ImportIcon size={19} />}{importing ? "Импортируем…" : "Подтвердить импорт"}</button>
           </> : <>
             <button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Отмена</button>
-            <button className="primary-button dialog-primary" type="button" disabled={importing || importMethod === "file"} aria-busy={importing} onClick={previewImport}>{importing ? <LoaderIcon size={19} /> : <ImportIcon size={19} />}{importing ? "Проверяем…" : "Проверить источник"}</button>
+            <button className="primary-button dialog-primary" type="button" disabled={importing || importMethod === "file"} aria-busy={importing} onClick={previewImport}>{importing ? <LoaderIcon size={19} /> : <ImportIcon size={19} />}{importing ? (importMethod === "url" ? "Загружаем по HTTPS…" : "Проверяем содержимое…") : (importMethod === "url" ? "Безопасно загрузить по HTTPS" : "Проверить содержимое")}</button>
           </>}
         >
           {subscriptionPreview ? (
@@ -1137,7 +1116,7 @@ export default function App() {
               onChange={(method) => { invalidateImport(); setImportMethod(method); setSubscriptionSource(""); setSubscriptionVisible(false); setImportError(""); setSubscriptionPreview(null); }}
             />
             {importMethod === "url" ? (
-              <div className="dialog-field"><label htmlFor="subscription-url">URL подписки</label><span className="secret-input"><input ref={subscriptionInputRef} id="subscription-url" type={subscriptionVisible ? "text" : "password"} autoComplete="off" value={subscriptionSource} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-help"} placeholder="https://provider.example/••••" onChange={(event) => { setSubscriptionSource(event.target.value); setImportError(""); }} /><button className="icon-button" type="button" aria-label={subscriptionVisible ? "Скрыть URL" : "Показать URL"} title={subscriptionVisible ? "Скрыть URL" : "Показать URL"} onClick={() => setSubscriptionVisible((visible) => !visible)}><EyeIcon size={18} /></button></span><small id="import-help">URL передаётся typed adapter как секрет и не попадает в диагностику.</small>{importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}</div>
+              <div className="dialog-field"><label htmlFor="subscription-url">HTTPS URL подписки</label><span className="secret-input"><input ref={subscriptionInputRef} id="subscription-url" type={subscriptionVisible ? "text" : "password"} autoComplete="off" value={subscriptionSource} disabled={importing} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-help"} placeholder="https://provider.example/••••" onChange={(event) => { setSubscriptionSource(event.target.value); setImportError(""); }} /><button className="icon-button" type="button" disabled={importing} aria-label={subscriptionVisible ? "Скрыть URL" : "Показать URL"} title={subscriptionVisible ? "Скрыть URL" : "Показать URL"} onClick={() => setSubscriptionVisible((visible) => !visible)}><EyeIcon size={18} /></button></span><small id="import-help">Контроллер загрузит подписку по HTTPS, заблокирует опасные перенаправления и локальные адреса. URL очищается сразу после запуска и не попадает в диагностику.</small>{importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}</div>
             ) : (
               <div className="method-placeholder compact-placeholder">
                 <ImportIcon size={24} />

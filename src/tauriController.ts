@@ -271,6 +271,18 @@ function routeDeckErrorFromBackend(error: PublicErrorDto): RouteDeckError {
       return new RouteDeckError("stale-subscription-preview");
     case "node_not_found":
       return new RouteDeckError("node-not-selected");
+    case "subscription_url_invalid":
+      return new RouteDeckError("invalid-subscription-url");
+    case "subscription_policy_blocked":
+      return new RouteDeckError("subscription-policy-blocked");
+    case "subscription_fetch_failed":
+      return new RouteDeckError("subscription-fetch-failed");
+    case "subscription_response_too_large":
+      return new RouteDeckError("subscription-response-too-large");
+    case "subscription_fetch_timeout":
+      return new RouteDeckError("subscription-fetch-timeout");
+    case "subscription_invalid_encoding":
+      return new RouteDeckError("subscription-invalid-encoding");
     default:
       return new RouteDeckError("runtime-failure");
   }
@@ -446,16 +458,20 @@ export class TauriController implements RouteDeckController {
   previewSubscription = async (source: SubscriptionImportSource): Promise<SubscriptionPreview> => {
     if (this.confirmingImport) throw new RouteDeckError("stale-subscription-preview");
     const generation = this.invalidatePendingImport();
-    const content = source.value;
-    if (!content.trim()) throw new RouteDeckError("empty-subscription-source");
-    if (source.type === "url" && /^https:\/\//i.test(content.trim())) {
-      throw new RouteDeckError("subscription-url-fetch-unavailable");
-    }
+    if (!source.value.trim()) throw new RouteDeckError("empty-subscription-source");
+    const sourceType = source.type;
     const transport = await this.requireTransport();
     let raw: unknown;
     try {
-      raw = await transport.invoke("preview_import_content", { content });
+      const pending = sourceType === "url"
+        ? transport.invoke("preview_import_url", { url: source.value })
+        : transport.invoke("preview_import_content", { content: source.value });
+      // Drop the controller stack's reference as soon as IPC owns the request.
+      // Neither URL nor raw share content is retained in controller state.
+      source = { type: "clipboard", value: "" };
+      raw = await pending;
     } catch (error) {
+      source = { type: "clipboard", value: "" };
       throw safeInvokeError(error);
     }
     let dto: ImportPreviewDto;
@@ -476,7 +492,7 @@ export class TauriController implements RouteDeckController {
     });
     const projected: SubscriptionPreview = {
       token: dto.previewId,
-      sourceLabel: source.type === "clipboard" ? "Буфер обмена · скрыто" : "Вставленная ссылка · скрыто",
+      sourceLabel: sourceType === "clipboard" ? "Буфер обмена · скрыто" : "HTTPS-подписка · адрес скрыт",
       supported: (["VLESS", "Hysteria2", "Naive"] as const)
         .map((protocol) => ({ protocol, count: counts.get(protocol) ?? 0 }))
         .filter((entry) => entry.count > 0),
