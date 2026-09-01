@@ -68,7 +68,7 @@ Every state-changing W/H test records a before snapshot and has a verified clean
 | SP-03 | U | VLESS WS and gRPC supported variants | Correct bounded transport mapping; generated config validates. |
 | SP-04 | U | VLESS missing UUID/host/port, invalid UUID, unsupported flow/security/transport | Node rejected with field-specific reason; no downgrade. |
 | SP-05 | U | VLESS `%25`/double-encoding, duplicate critical query key, control chars | Decode exactly once; ambiguity/control chars rejected. |
-| SP-06 | U | `hysteria2://` and `hy2://` with encoded auth, default port, SNI, obfs, certificate pin | Correct canonical node. |
+| SP-06 | U | `hysteria2://` and `hy2://` with encoded auth, default port, SNI, obfs; URI certificate pin supplied separately | Supported fields form a canonical node; `pinSHA256` fails closed until exact sing-box mapping is reviewed. |
 | SP-07 | U | Hysteria2 userpass, IPv6 literal, port hopping supported by pinned schema | Correct mapping and config validation. |
 | SP-08 | U | Hysteria2 `insecure=1` | Imported with persistent visible warning; never enabled implicitly. |
 | SP-09 | U | Invalid Hysteria2 multi-port/unknown obfs/oversized ECH | Rejected or explicitly unsupported; no partial node. |
@@ -86,7 +86,7 @@ Every state-changing W/H test records a before snapshot and has a verified clean
 | --- | --- | --- | --- |
 | PY-01 | U | Clash `proxies` with VLESS REALITY and Hysteria2 | Supported fields mapped; config fixtures validate. |
 | PY-02 | U | YAML aliases/recursive alias/depth bomb/duplicate key/custom tag/multi-document | Bounded reject; no file/env evaluation. |
-| PY-03 | U | Clash config includes rules, providers, external controller, DNS, scripts, paths | Only supported `proxies` considered; diagnostics state ignored sections; none executed. |
+| PY-03 | U | Clash config includes rules, providers, external controller, DNS, scripts, paths | Entire import is rejected because only the top-level `proxies` key is allowed; none executed. |
 | PY-04 | U | Clash `type:http` carrying Naive-looking server | Remains unsupported HTTP; never guessed as Naive. |
 | PJ-01 | U | sing-box JSON containing standalone supported outbounds | Extract into canonical nodes; tags sanitized. |
 | PJ-02 | U | JSON includes imported inbound/API/service/route/log path | Those objects never enter generated config. |

@@ -40,7 +40,7 @@ System Proxy can coexist with another locally listening proxy because listeners 
 
 ## Development
 
-Requirements: Windows 10/11, WebView2, Node.js 22.12+, npm 10+, Rust 1.88+ with the MSVC target and Visual Studio C++ Build Tools.
+Requirements: Windows 10/11, WebView2, Node.js 22.12+, npm 10+, Rust 1.89+ with the MSVC target and Visual Studio C++ Build Tools.
 
 Dependency execution is intentionally conservative:
 

@@ -5,7 +5,7 @@ use serde_json::{json, Map, Value};
 use crate::domain::{
     canonical_process_path, AppRouteAction, DefaultRoute, DnsPolicy, HysteriaObfsKind, Ipv6Policy,
     LanPolicy, Node, NodeProtocol, PacketEncoding, PortSelection, RoutePolicy, Secret, TlsOptions,
-    VlessFlow,
+    VlessFlow, VlessTransport,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +165,11 @@ pub fn generate_config(request: ConfigRequest<'_>) -> Result<GeneratedConfig, Co
     if matches!(request.mode, CaptureMode::Tun(_)) {
         rules.push(json!({ "inbound": ["tun-in"], "protocol": "dns", "action": "hijack-dns" }));
     }
+    // User traffic must not escape an IPv4-only policy through a more-specific app or LAN rule.
+    // Health remains first and TUN DNS hijacking remains ahead of this reject rule.
+    if request.policy.ipv6 == Ipv6Policy::Disabled {
+        rules.push(json!({ "ip_version": 6, "action": "reject" }));
+    }
     for app in &request.policy.apps {
         rules.push(json!({
             "process_path": [canonical_process_path(&app.process_path)],
@@ -174,9 +179,6 @@ pub fn generate_config(request: ConfigRequest<'_>) -> Result<GeneratedConfig, Co
     }
     if request.policy.lan == LanPolicy::Direct {
         rules.push(json!({ "ip_is_private": true, "action": "route", "outbound": "direct" }));
-    }
-    if request.policy.ipv6 == Ipv6Policy::Disabled {
-        rules.push(json!({ "ip_version": 6, "action": "reject" }));
     }
 
     let root = json!({
@@ -352,6 +354,24 @@ fn selected_outbound(node: &Node) -> Result<Value, ConfigError> {
                     }),
                 );
             }
+            match &vless.transport {
+                VlessTransport::Tcp => {}
+                VlessTransport::WebSocket { path, host } => {
+                    let mut transport = Map::new();
+                    transport.insert("type".into(), json!("ws"));
+                    transport.insert("path".into(), json!(path));
+                    if let Some(host) = host {
+                        transport.insert("headers".into(), json!({ "Host": host }));
+                    }
+                    object.insert("transport".into(), Value::Object(transport));
+                }
+                VlessTransport::Grpc { service_name } => {
+                    object.insert(
+                        "transport".into(),
+                        json!({ "type": "grpc", "service_name": service_name }),
+                    );
+                }
+            }
             if vless.tls.enabled {
                 object.insert("tls".into(), tls_value(&vless.tls, true));
             }
@@ -394,7 +414,7 @@ fn selected_outbound(node: &Node) -> Result<Value, ConfigError> {
             if naive.quic {
                 object.insert("quic".into(), json!(true));
             }
-            object.insert("tls".into(), tls_value(&naive.tls, false));
+            object.insert("tls".into(), tls_value(&naive.tls, true));
         }
     }
     Ok(Value::Object(object))
@@ -566,7 +586,12 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
-        assert!(naive_value.pointer("/outbounds/0/tls/enabled").is_none());
+        assert_eq!(
+            naive_value
+                .pointer("/outbounds/0/tls/enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
@@ -599,5 +624,66 @@ mod tests {
             ipv6_address: Some("fdfe:dcba:9876::1/126".into()),
         });
         assert!(generate_config(public).is_err());
+    }
+
+    #[test]
+    fn emits_closed_vless_transport_shapes() {
+        let policy = policy(DefaultRoute::Vpn);
+        let ws = node("vless://11111111-2222-3333-4444-555555555555@example.test:443?security=tls&type=ws&path=%2Fsocket&host=cdn.test&sni=cover.test");
+        let grpc = node("vless://11111111-2222-3333-4444-555555555555@example.test:443?security=tls&type=grpc&serviceName=route&sni=cover.test");
+        let ws_value: Value =
+            serde_json::from_str(generate_config(request(&ws, &policy)).unwrap().as_str()).unwrap();
+        assert_eq!(
+            ws_value
+                .pointer("/outbounds/0/transport/type")
+                .and_then(Value::as_str),
+            Some("ws")
+        );
+        assert_eq!(
+            ws_value
+                .pointer("/outbounds/0/transport/headers/Host")
+                .and_then(Value::as_str),
+            Some("cdn.test")
+        );
+        let grpc_value: Value =
+            serde_json::from_str(generate_config(request(&grpc, &policy)).unwrap().as_str())
+                .unwrap();
+        assert_eq!(
+            grpc_value
+                .pointer("/outbounds/0/transport/service_name")
+                .and_then(Value::as_str),
+            Some("route")
+        );
+    }
+
+    #[test]
+    fn ipv6_reject_precedes_overlapping_app_and_lan_routes() {
+        let node = node("hysteria2://fixture-password@example.test:443?sni=example.test");
+        let mut policy = policy(DefaultRoute::Vpn);
+        policy.ipv6 = Ipv6Policy::Disabled;
+        policy.apps.push(crate::domain::AppRoute {
+            process_path: r"C:\Apps\Browser.exe".into(),
+            process_name: Some("Browser.exe".into()),
+            action: AppRouteAction::Vpn,
+        });
+        let mut config_request = request(&node, &policy);
+        config_request.mode = CaptureMode::Tun(TunSettings::default());
+        let value: Value =
+            serde_json::from_str(generate_config(config_request).unwrap().as_str()).unwrap();
+        let rules = value.pointer("/route/rules").unwrap().as_array().unwrap();
+        assert_eq!(
+            rules[0].pointer("/inbound/0").and_then(Value::as_str),
+            Some("health-in")
+        );
+        assert_eq!(
+            rules[1].get("action").and_then(Value::as_str),
+            Some("hijack-dns")
+        );
+        assert_eq!(rules[2].get("ip_version").and_then(Value::as_u64), Some(6));
+        assert!(rules[3].get("process_path").is_some());
+        assert_eq!(
+            rules[4].get("ip_is_private").and_then(Value::as_bool),
+            Some(true)
+        );
     }
 }

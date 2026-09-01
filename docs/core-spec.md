@@ -160,7 +160,8 @@ The importer output is a typed model, not arbitrary JSON:
 
 ```text
 Node {
-  id: stable hash of normalized non-secret identity,
+  id: deterministic per-import instance hash of update_key, source format, and source ordinal,
+  update_key: stable hash of normalized non-secret endpoint identity,
   display_name,
   protocol: Vless | Hysteria2 | Naive,
   server: hostname-or-IP,
@@ -179,6 +180,8 @@ RoutePolicy {
   dns: Vpn | CurrentNetwork,
 }
 ```
+
+`update_key` correlates a node across subscription refreshes without using credentials. `id` adds source format and source ordinal so duplicate nodes within one import cannot overwrite one another. Persistent storage namespaces `id` by subscription origin; neither identifier contains credential material.
 
 Validation rules include DNS-name/IP syntax, port `1..65535`, UUID syntax, bounded strings/arrays, compatible protocol/transport combinations, and TLS verification on by default. `insecure=true` is imported but must be visibly marked; RouteDeck never turns it on implicitly. Unknown required fields or unsupported transports cause a per-node rejection with a useful reason.
 
@@ -212,7 +215,7 @@ Map REALITY to sing-box client TLS `reality.enabled`, `public_key`, and `short_i
 
 #### Hysteria2
 
-Accept `hysteria2://` and `hy2://` using the official [Hysteria2 URI scheme](https://v2.hysteria.network/docs/developers/URI-Scheme/): percent-encoded auth/userpass, hostname/port (default 443), `obfs`, `obfs-password`, `sni`, `insecure`, `pinSHA256`, `ech`, and fragment display name. Multi-port syntax must map only if representable by the pinned sing-box Hysteria2 schema; otherwise reject with an explanation. Do not import client bandwidth values from ad-hoc query extensions.
+Accept `hysteria2://` and `hy2://` using the official [Hysteria2 URI scheme](https://v2.hysteria.network/docs/developers/URI-Scheme/): percent-encoded auth/userpass, hostname/port (default 443), official comma/range multi-port authority syntax, `obfs`, `obfs-password`, `sni`, `insecure`, and fragment display name. RouteDeck deliberately rejects URI `pinSHA256` because the Hysteria URI fingerprint value does not have a reviewed one-to-one representation in the pinned sing-box 1.13 schema. URI `ech` is also rejected until its encoded DNS ECHConfigList can be strictly decoded and emitted as the PEM form sing-box requires; raw base64 must never be passed through. Do not import client bandwidth values from ad-hoc query extensions.
 
 `hysteria2+realm` is not in the MVP allow-list unless the pinned sing-box outbound schema and fixtures explicitly cover it.
 

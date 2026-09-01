@@ -6,6 +6,10 @@ use url::Url;
 use crate::domain::{Node, NodeProtocol, Secret, TlsOptions};
 
 const REDACTED: &str = "[REDACTED]";
+const OMITTED: &str = "[REDACTED: diagnostic omitted]";
+const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+const MAX_SECRET_PATTERNS: usize = 128;
+const MAX_PATTERN_BYTES: usize = 64 * 1024;
 const SENSITIVE_KEYS: &[&str] = &[
     "authorization",
     "auth",
@@ -29,6 +33,7 @@ const SENSITIVE_KEYS: &[&str] = &[
 #[derive(Default, Clone)]
 pub struct Redactor {
     secrets: Vec<String>,
+    saturated: bool,
 }
 
 impl fmt::Debug for Redactor {
@@ -82,16 +87,35 @@ impl Redactor {
     }
 
     pub fn redact(&self, input: &str) -> String {
+        if self.saturated || input.len() > MAX_DIAGNOSTIC_BYTES {
+            return OMITTED.into();
+        }
         let mut output = redact_json(input).unwrap_or_else(|| redact_urls(input));
+        if output.len() > MAX_DIAGNOSTIC_BYTES {
+            return OMITTED.into();
+        }
         output = redact_labeled_values(&output);
+        if output.len() > MAX_DIAGNOSTIC_BYTES {
+            return OMITTED.into();
+        }
         for secret in &self.secrets {
             output = output.replace(secret, REDACTED);
+            if output.len() > MAX_DIAGNOSTIC_BYTES {
+                return OMITTED.into();
+            }
             let encoded: String = url::form_urlencoded::byte_serialize(secret.as_bytes()).collect();
             if encoded != *secret {
                 output = replace_ascii_case_insensitive(&output, &encoded, REDACTED);
+                if output.len() > MAX_DIAGNOSTIC_BYTES {
+                    return OMITTED.into();
+                }
             }
         }
-        output
+        if output.len() > MAX_DIAGNOSTIC_BYTES {
+            OMITTED.into()
+        } else {
+            output
+        }
     }
 
     fn add(&mut self, secret: &Secret) {
@@ -118,6 +142,12 @@ impl Redactor {
             .filter(|secret| !secret.is_empty())
             .collect();
         self.secrets = unique.into_iter().collect();
+        let pattern_bytes = self.secrets.iter().map(String::len).sum::<usize>();
+        if self.secrets.len() > MAX_SECRET_PATTERNS || pattern_bytes > MAX_PATTERN_BYTES {
+            self.secrets.clear();
+            self.saturated = true;
+            return self;
+        }
         self.secrets
             .sort_by_key(|secret| std::cmp::Reverse(secret.len()));
         self
@@ -165,7 +195,7 @@ fn redact_urls(input: &str) -> String {
             .map_or(start, |index| start + index + 1);
         let token_end = input[marker + 3..]
             .find(|character: char| {
-                character.is_whitespace() || matches!(character, '"' | '\'' | '>' | ')' | ',' | ';')
+                character.is_whitespace() || matches!(character, '"' | '\'' | '<' | '>')
             })
             .map_or(input.len(), |index| marker + 3 + index);
         output.push_str(&input[start..token_start]);
@@ -175,6 +205,8 @@ fn redact_urls(input: &str) -> String {
                 || !url.username().is_empty()
                 || url.password().is_some()
                 || url.query().is_some()
+                || !matches!(url.path(), "" | "/")
+                || url.fragment().is_some()
             {
                 output.push_str(url.scheme());
                 output.push_str("://");
@@ -322,5 +354,27 @@ mod tests {
         assert!(!output.contains("fixture-token"));
         assert!(!output.contains("/sub/path"));
         assert!(output.contains("provider.test"));
+    }
+
+    #[test]
+    fn redacts_https_paths_fragments_and_adjacent_punctuation() {
+        let output = Redactor::default().redact(
+            "(https://provider.test/private/fixture-secret#fragment),; https://other.test/sub-token;",
+        );
+        assert!(!output.contains("fixture-secret"));
+        assert!(!output.contains("fragment"));
+        assert!(!output.contains("sub-token"));
+        assert!(output.contains("provider.test"));
+    }
+
+    #[test]
+    fn fails_closed_for_oversize_diagnostics_and_pattern_sets() {
+        let oversized = "x".repeat(MAX_DIAGNOSTIC_BYTES + 1);
+        assert_eq!(Redactor::default().redact(&oversized), OMITTED);
+        let mut redactor = Redactor::default();
+        for index in 0..=MAX_SECRET_PATTERNS {
+            redactor = redactor.with_secret(&format!("secret-{index}"));
+        }
+        assert_eq!(redactor.redact("ordinary diagnostic"), OMITTED);
     }
 }

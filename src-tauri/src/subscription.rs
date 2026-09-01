@@ -2,13 +2,17 @@ use std::{collections::BTreeMap, fmt, str};
 
 use base64::{engine::general_purpose, Engine as _};
 use percent_encoding::percent_decode_str;
+use serde::{
+    de::{self, MapAccess, SeqAccess, Visitor},
+    Deserialize, Deserializer,
+};
 use serde_json::{Map, Value};
 use url::Url;
 
 use crate::domain::{
     validate_headers, validate_hop_interval, Hysteria2Node, HysteriaObfs, HysteriaObfsKind,
     NaiveNode, Node, NodeProtocol, PacketEncoding, PortSelection, RealityOptions, Secret,
-    SourceFormat, TlsOptions, VlessFlow, VlessNode,
+    SourceFormat, TlsOptions, VlessFlow, VlessNode, VlessTransport,
 };
 
 pub const MAX_INPUT_BYTES: usize = 10 * 1024 * 1024;
@@ -60,6 +64,9 @@ pub fn import_subscription(input: &[u8]) -> Result<ImportReport, ImportError> {
     if matches!(text.as_bytes().first(), Some(b'{') | Some(b'[')) {
         return import_json(text);
     }
+    if looks_like_clash_yaml(text) {
+        return import_clash_yaml(text);
+    }
     if contains_share_line(text) {
         return import_lines(text, SourceFormat::ShareLink);
     }
@@ -106,7 +113,7 @@ fn import_lines(text: &str, source: SourceFormat) -> Result<ImportReport, Import
         if nodes.len() + rejected.len() >= MAX_NODES {
             return Err(ImportError::new("subscription contains too many nodes"));
         }
-        match parse_share_link(line, source) {
+        match parse_share_link(line, source, index) {
             Ok(node) => nodes.push(node),
             Err(reason) => rejected.push(NodeRejection {
                 index,
@@ -142,7 +149,11 @@ fn decode_base64_once(text: &str) -> Result<Vec<u8>, ImportError> {
     Err(ImportError::new("invalid base64 subscription"))
 }
 
-fn parse_share_link(line: &str, source: SourceFormat) -> Result<Node, ImportError> {
+fn parse_share_link(
+    line: &str,
+    source: SourceFormat,
+    source_ordinal: usize,
+) -> Result<Node, ImportError> {
     let lower = line.to_ascii_lowercase();
     if !has_valid_percent_encoding(line) {
         return Err(ImportError::new("share link has invalid percent encoding"));
@@ -150,16 +161,22 @@ fn parse_share_link(line: &str, source: SourceFormat) -> Result<Node, ImportErro
     if lower.contains("%0d") || lower.contains("%0a") || line.chars().any(char::is_control) {
         return Err(ImportError::new("share link contains a control character"));
     }
-    let url = Url::parse(line).map_err(|_| ImportError::new("malformed share link"))?;
+    let (normalized, authority_ports) = normalize_hysteria_authority(line)?;
+    let url = Url::parse(normalized.as_deref().unwrap_or(line))
+        .map_err(|_| ImportError::new("malformed share link"))?;
     match url.scheme().to_ascii_lowercase().as_str() {
-        "vless" => parse_vless_url(&url, source),
-        "hysteria2" | "hy2" => parse_hysteria_url(&url, source),
-        "naive+https" | "naive+quic" => parse_naive_url(&url, source),
+        "vless" => parse_vless_url(&url, source, source_ordinal),
+        "hysteria2" | "hy2" => parse_hysteria_url(&url, source, source_ordinal, authority_ports),
+        "naive+https" | "naive+quic" => parse_naive_url(&url, source, source_ordinal),
         _ => Err(ImportError::new("unsupported share-link scheme")),
     }
 }
 
-fn parse_vless_url(url: &Url, source: SourceFormat) -> Result<Node, ImportError> {
+fn parse_vless_url(
+    url: &Url,
+    source: SourceFormat,
+    source_ordinal: usize,
+) -> Result<Node, ImportError> {
     require_authority_only(url)?;
     let query = strict_query(
         url,
@@ -174,6 +191,9 @@ fn parse_vless_url(url: &Url, source: SourceFormat) -> Result<Node, ImportError>
             "pbk",
             "sid",
             "packetEncoding",
+            "host",
+            "path",
+            "serviceName",
         ],
     )?;
     let uuid = decode_component(url.username())?;
@@ -194,12 +214,7 @@ fn parse_vless_url(url: &Url, source: SourceFormat) -> Result<Node, ImportError>
     if !matches!(encryption, "" | "none") {
         return Err(ImportError::new("unsupported VLESS encryption"));
     }
-    if query
-        .get("type")
-        .is_some_and(|value| !matches!(value.as_str(), "" | "tcp"))
-    {
-        return Err(ImportError::new("unsupported VLESS transport"));
-    }
+    let transport = parse_vless_query_transport(&query)?;
     let flow = match query.get("flow").map(String::as_str).unwrap_or("") {
         "" => None,
         "xtls-rprx-vision" => Some(VlessFlow::Vision),
@@ -256,14 +271,67 @@ fn parse_vless_url(url: &Url, source: SourceFormat) -> Result<Node, ImportError>
             uuid: secret(uuid)?,
             flow,
             packet_encoding,
+            transport,
             tls,
         }),
         source,
+        source_ordinal,
     )
     .map_err(|_| ImportError::new("invalid VLESS node"))
 }
 
-fn parse_hysteria_url(url: &Url, source: SourceFormat) -> Result<Node, ImportError> {
+fn parse_vless_query_transport(
+    query: &BTreeMap<String, String>,
+) -> Result<VlessTransport, ImportError> {
+    match query.get("type").map(String::as_str).unwrap_or("tcp") {
+        "" | "tcp" => {
+            if ["host", "path", "serviceName"]
+                .iter()
+                .any(|key| query.contains_key(*key))
+            {
+                return Err(ImportError::new(
+                    "VLESS transport parameters do not match TCP",
+                ));
+            }
+            Ok(VlessTransport::Tcp)
+        }
+        "ws" => {
+            if query.contains_key("serviceName") {
+                return Err(ImportError::new(
+                    "gRPC service name is invalid for WebSocket transport",
+                ));
+            }
+            let path = query
+                .get("path")
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "/".into());
+            let host = query.get("host").filter(|value| !value.is_empty()).cloned();
+            Ok(VlessTransport::WebSocket { path, host })
+        }
+        "grpc" => {
+            if query.contains_key("host") || query.contains_key("path") {
+                return Err(ImportError::new(
+                    "WebSocket parameters are invalid for gRPC transport",
+                ));
+            }
+            let service_name = query
+                .get("serviceName")
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .ok_or_else(|| ImportError::new("VLESS gRPC service name is required"))?;
+            Ok(VlessTransport::Grpc { service_name })
+        }
+        _ => Err(ImportError::new("unsupported VLESS transport")),
+    }
+}
+
+fn parse_hysteria_url(
+    url: &Url,
+    source: SourceFormat,
+    source_ordinal: usize,
+    authority_ports: Option<PortSelection>,
+) -> Result<Node, ImportError> {
     require_authority_only(url)?;
     let query = strict_query(
         url,
@@ -282,7 +350,11 @@ fn parse_hysteria_url(url: &Url, source: SourceFormat) -> Result<Node, ImportErr
         ));
     }
     let server = host(url)?;
-    let port = url.port().unwrap_or(443);
+    let ports = authority_ports.unwrap_or(
+        PortSelection::single(url.port().unwrap_or(443))
+            .map_err(|_| ImportError::new("invalid Hysteria2 port"))?,
+    );
+    let port = ports.primary_port();
     let mut auth = decode_component(url.username())?;
     if let Some(password) = url.password() {
         if !auth.is_empty() {
@@ -308,25 +380,34 @@ fn parse_hysteria_url(url: &Url, source: SourceFormat) -> Result<Node, ImportErr
     if query.contains_key("obfs-password") && obfs.is_none() {
         return Err(ImportError::new("Hysteria2 obfs password has no obfs type"));
     }
+    if query.contains_key("ech") {
+        return Err(ImportError::new(
+            "Hysteria2 URI ECH import is not supported safely",
+        ));
+    }
     let tls = tls_from_query(&query)?;
     let name = display_name(url, "Hysteria2", &server, port)?;
     Node::create(
         name,
         server,
         NodeProtocol::Hysteria2(Hysteria2Node {
-            ports: PortSelection::single(port)
-                .map_err(|_| ImportError::new("invalid Hysteria2 port"))?,
+            ports,
             hop_interval: None,
             password: secret(auth)?,
             obfs,
             tls,
         }),
         source,
+        source_ordinal,
     )
     .map_err(|_| ImportError::new("invalid Hysteria2 node"))
 }
 
-fn parse_naive_url(url: &Url, source: SourceFormat) -> Result<Node, ImportError> {
+fn parse_naive_url(
+    url: &Url,
+    source: SourceFormat,
+    source_ordinal: usize,
+) -> Result<Node, ImportError> {
     require_authority_only(url)?;
     let query = strict_query(url, &["extra-headers"])?;
     let server = host(url)?;
@@ -372,13 +453,19 @@ fn parse_naive_url(url: &Url, source: SourceFormat) -> Result<Node, ImportError>
             tls,
         }),
         source,
+        source_ordinal,
     )
     .map_err(|_| ImportError::new("invalid Naive node"))
 }
 
 fn import_json(text: &str) -> Result<ImportReport, ImportError> {
-    let root: Value =
-        serde_json::from_str(text).map_err(|_| ImportError::new("invalid sing-box JSON"))?;
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let root = NoDuplicateJson::deserialize(&mut deserializer)
+        .map_err(|_| ImportError::new("invalid sing-box JSON"))?
+        .0;
+    deserializer
+        .end()
+        .map_err(|_| ImportError::new("invalid sing-box JSON"))?;
     if json_depth(&root) > MAX_JSON_DEPTH {
         return Err(ImportError::new("JSON nesting is too deep"));
     }
@@ -402,7 +489,7 @@ fn import_json(text: &str) -> Result<ImportReport, ImportError> {
     let mut nodes = Vec::new();
     let mut rejected = Vec::new();
     for (index, value) in items.into_iter().enumerate() {
-        match parse_json_outbound(value) {
+        match parse_json_outbound(value, index) {
             Ok(node) => nodes.push(node),
             Err(error) => rejected.push(NodeRejection {
                 index,
@@ -413,19 +500,303 @@ fn import_json(text: &str) -> Result<ImportReport, ImportError> {
     finish_report(nodes, rejected, warnings)
 }
 
-fn parse_json_outbound(value: &Value) -> Result<Node, ImportError> {
+fn looks_like_clash_yaml(text: &str) -> bool {
+    text.lines()
+        .filter(|line| !line.starts_with(char::is_whitespace))
+        .map(str::trim)
+        .any(|line| line == "proxies:" || line.starts_with("proxies: "))
+}
+
+fn import_clash_yaml(text: &str) -> Result<ImportReport, ImportError> {
+    use serde_saphyr::options::{DuplicateKeyPolicy, MergeKeyPolicy};
+    let options = serde_saphyr::options! {
+        budget: serde_saphyr::budget! {
+            max_events: 50_000,
+            max_aliases: 0,
+            max_anchors: 0,
+            max_recorded_anchor_events: 0,
+            max_recorded_anchor_bytes: 0,
+            max_depth: MAX_JSON_DEPTH,
+            max_documents: 1,
+            max_nodes: 10_000,
+            max_total_scalar_bytes: MAX_INPUT_BYTES,
+            max_total_comment_bytes: MAX_INPUT_BYTES,
+            max_merge_keys: 0,
+        },
+        emit_comments: false,
+        duplicate_keys: DuplicateKeyPolicy::Error,
+        merge_keys: MergeKeyPolicy::Error,
+        strict_booleans: true,
+        reject_unsupported_tags: true,
+    };
+    let root: Value = serde_saphyr::from_str_with_options(text, options)
+        .map_err(|_| ImportError::new("invalid Clash YAML"))?;
+    if json_depth(&root) > MAX_JSON_DEPTH {
+        return Err(ImportError::new("YAML nesting is too deep"));
+    }
+    let object = root
+        .as_object()
+        .ok_or_else(|| ImportError::new("Clash YAML must be an object"))?;
+    strict_keys(object, &["proxies"])
+        .map_err(|_| ImportError::new("unsupported top-level Clash field"))?;
+    let proxies = object
+        .get("proxies")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ImportError::new("Clash proxies must be an array"))?;
+    if proxies.len() > MAX_NODES {
+        return Err(ImportError::new("subscription contains too many nodes"));
+    }
+    let mut nodes = Vec::new();
+    let mut rejected = Vec::new();
+    for (index, proxy) in proxies.iter().enumerate() {
+        let result = proxy
+            .as_object()
+            .ok_or_else(|| ImportError::new("Clash proxy must be an object"))
+            .and_then(|object| match required_str(object, "type")? {
+                "vless" => parse_clash_vless(object, index),
+                "hysteria2" | "hy2" => parse_clash_hysteria(object, index),
+                _ => Err(ImportError::new("unsupported Clash proxy type")),
+            });
+        match result {
+            Ok(node) => nodes.push(node),
+            Err(error) => rejected.push(NodeRejection {
+                index,
+                reason: error.0,
+            }),
+        }
+    }
+    finish_report(nodes, rejected, Vec::new())
+}
+
+fn parse_clash_vless(
+    object: &Map<String, Value>,
+    source_ordinal: usize,
+) -> Result<Node, ImportError> {
+    strict_keys(
+        object,
+        &[
+            "name",
+            "type",
+            "server",
+            "port",
+            "uuid",
+            "network",
+            "tls",
+            "servername",
+            "skip-cert-verify",
+            "alpn",
+            "client-fingerprint",
+            "reality-opts",
+            "ws-opts",
+            "grpc-opts",
+            "packet-encoding",
+            "flow",
+        ],
+    )?;
+    let server = required_str(object, "server")?.to_owned();
+    let port = required_port(object, "port")?;
+    let uuid = required_str(object, "uuid")?.to_owned();
+    crate::domain::validate_uuid(&uuid).map_err(|_| ImportError::new("invalid VLESS UUID"))?;
+    let network = optional_str(object, "network")?.unwrap_or("tcp");
+    let transport = match network {
+        "tcp" => {
+            if object.contains_key("ws-opts") || object.contains_key("grpc-opts") {
+                return Err(ImportError::new(
+                    "Clash VLESS transport options do not match TCP",
+                ));
+            }
+            VlessTransport::Tcp
+        }
+        "ws" => {
+            if object.contains_key("grpc-opts") {
+                return Err(ImportError::new("invalid Clash VLESS transport options"));
+            }
+            let options = object
+                .get("ws-opts")
+                .and_then(Value::as_object)
+                .ok_or_else(|| ImportError::new("Clash VLESS ws-opts are required"))?;
+            strict_keys(options, &["path", "headers"])?;
+            let path = optional_str(options, "path")?.unwrap_or("/").to_owned();
+            let host = match options.get("headers") {
+                None => None,
+                Some(Value::Object(headers)) => {
+                    strict_keys(headers, &["Host"])?;
+                    Some(required_str(headers, "Host")?.to_owned())
+                }
+                _ => return Err(ImportError::new("invalid Clash WebSocket headers")),
+            };
+            VlessTransport::WebSocket { path, host }
+        }
+        "grpc" => {
+            if object.contains_key("ws-opts") {
+                return Err(ImportError::new("invalid Clash VLESS transport options"));
+            }
+            let options = object
+                .get("grpc-opts")
+                .and_then(Value::as_object)
+                .ok_or_else(|| ImportError::new("Clash VLESS grpc-opts are required"))?;
+            strict_keys(options, &["grpc-service-name"])?;
+            VlessTransport::Grpc {
+                service_name: required_str(options, "grpc-service-name")?.to_owned(),
+            }
+        }
+        _ => return Err(ImportError::new("unsupported Clash VLESS transport")),
+    };
+    let flow = match optional_str(object, "flow")? {
+        None | Some("") => None,
+        Some("xtls-rprx-vision") => Some(VlessFlow::Vision),
+        _ => return Err(ImportError::new("unsupported VLESS flow")),
+    };
+    let packet_encoding = match optional_str(object, "packet-encoding")? {
+        None | Some("") => None,
+        Some("packetaddr") => Some(PacketEncoding::PacketAddr),
+        Some("xudp") => Some(PacketEncoding::Xudp),
+        _ => return Err(ImportError::new("unsupported VLESS packet encoding")),
+    };
+    let reality = match object.get("reality-opts") {
+        None => None,
+        Some(Value::Object(value)) => {
+            strict_keys(value, &["public-key", "short-id"])?;
+            Some(RealityOptions {
+                public_key: secret(required_str(value, "public-key")?.to_owned())?,
+                short_id: Secret::new_allow_empty(
+                    optional_str(value, "short-id")?.unwrap_or("").to_owned(),
+                )
+                .map_err(|_| ImportError::new("REALITY short ID is invalid"))?,
+            })
+        }
+        _ => return Err(ImportError::new("invalid Clash REALITY options")),
+    };
+    let tls_enabled = optional_bool(object, "tls")?.unwrap_or(false) || reality.is_some();
+    let tls = TlsOptions {
+        enabled: tls_enabled,
+        server_name: optional_str(object, "servername")?.map(str::to_owned),
+        insecure: optional_bool(object, "skip-cert-verify")?.unwrap_or(false),
+        alpn: string_array(object.get("alpn"), "invalid TLS ALPN")?,
+        certificate_public_key_sha256: Vec::new(),
+        ech_config: Vec::new(),
+        utls_fingerprint: optional_str(object, "client-fingerprint")?.map(str::to_owned),
+        reality,
+    };
+    let name = required_str(object, "name")?.to_owned();
+    Node::create(
+        name,
+        server,
+        NodeProtocol::Vless(VlessNode {
+            server_port: port,
+            uuid: secret(uuid)?,
+            flow,
+            packet_encoding,
+            transport,
+            tls,
+        }),
+        SourceFormat::ClashYaml,
+        source_ordinal,
+    )
+    .map_err(|_| ImportError::new("invalid Clash VLESS node"))
+}
+
+fn parse_clash_hysteria(
+    object: &Map<String, Value>,
+    source_ordinal: usize,
+) -> Result<Node, ImportError> {
+    strict_keys(
+        object,
+        &[
+            "name",
+            "type",
+            "server",
+            "port",
+            "ports",
+            "password",
+            "obfs",
+            "obfs-password",
+            "sni",
+            "skip-cert-verify",
+            "alpn",
+        ],
+    )?;
+    let server = required_str(object, "server")?.to_owned();
+    let ports = match (object.get("port"), object.get("ports")) {
+        (Some(_), Some(_)) => return Err(ImportError::new("use either port or ports")),
+        (Some(_), None) => PortSelection::single(required_port(object, "port")?)
+            .map_err(|_| ImportError::new("invalid Hysteria2 port"))?,
+        (None, Some(Value::String(value))) => parse_clash_port_expression(value)?,
+        _ => return Err(ImportError::new("Hysteria2 port is required")),
+    };
+    let obfs = match optional_str(object, "obfs")? {
+        None | Some("") => {
+            if object.contains_key("obfs-password") {
+                return Err(ImportError::new("Hysteria2 obfs password has no obfs type"));
+            }
+            None
+        }
+        Some("salamander") => Some(HysteriaObfs {
+            kind: HysteriaObfsKind::Salamander,
+            password: secret(required_str(object, "obfs-password")?.to_owned())?,
+        }),
+        _ => return Err(ImportError::new("unsupported Hysteria2 obfuscation")),
+    };
+    let tls = TlsOptions {
+        enabled: true,
+        server_name: optional_str(object, "sni")?.map(str::to_owned),
+        insecure: optional_bool(object, "skip-cert-verify")?.unwrap_or(false),
+        alpn: string_array(object.get("alpn"), "invalid TLS ALPN")?,
+        certificate_public_key_sha256: Vec::new(),
+        ech_config: Vec::new(),
+        utls_fingerprint: None,
+        reality: None,
+    };
+    let name = required_str(object, "name")?.to_owned();
+    Node::create(
+        name,
+        server,
+        NodeProtocol::Hysteria2(Hysteria2Node {
+            ports,
+            hop_interval: None,
+            password: secret(required_str(object, "password")?.to_owned())?,
+            obfs,
+            tls,
+        }),
+        SourceFormat::ClashYaml,
+        source_ordinal,
+    )
+    .map_err(|_| ImportError::new("invalid Clash Hysteria2 node"))
+}
+
+fn parse_clash_port_expression(value: &str) -> Result<PortSelection, ImportError> {
+    if value.is_empty() || value.len() > 1_024 {
+        return Err(ImportError::new("invalid Hysteria2 port range"));
+    }
+    let values = value
+        .split(',')
+        .map(|part| {
+            if let Some((start, end)) = part.split_once('-') {
+                format!("{start}:{end}")
+            } else {
+                part.to_owned()
+            }
+        })
+        .collect();
+    PortSelection::ranges(values).map_err(|_| ImportError::new("invalid Hysteria2 port range"))
+}
+
+fn parse_json_outbound(value: &Value, source_ordinal: usize) -> Result<Node, ImportError> {
     let object = value
         .as_object()
         .ok_or_else(|| ImportError::new("outbound must be an object"))?;
     match required_str(object, "type")? {
-        "vless" => parse_json_vless(object),
-        "hysteria2" => parse_json_hysteria(object),
-        "naive" => parse_json_naive(object),
+        "vless" => parse_json_vless(object, source_ordinal),
+        "hysteria2" => parse_json_hysteria(object, source_ordinal),
+        "naive" => parse_json_naive(object, source_ordinal),
         _ => Err(ImportError::new("unsupported outbound type")),
     }
 }
 
-fn parse_json_vless(object: &Map<String, Value>) -> Result<Node, ImportError> {
+fn parse_json_vless(
+    object: &Map<String, Value>,
+    source_ordinal: usize,
+) -> Result<Node, ImportError> {
     strict_keys(
         object,
         &[
@@ -437,6 +808,7 @@ fn parse_json_vless(object: &Map<String, Value>) -> Result<Node, ImportError> {
             "flow",
             "packet_encoding",
             "tls",
+            "transport",
         ],
     )?;
     let server = required_str(object, "server")?.to_owned();
@@ -455,6 +827,7 @@ fn parse_json_vless(object: &Map<String, Value>) -> Result<Node, ImportError> {
         _ => return Err(ImportError::new("unsupported VLESS packet encoding")),
     };
     let tls = parse_json_tls(object.get("tls"), true, false)?;
+    let transport = parse_json_vless_transport(object.get("transport"))?;
     let name = json_name(object, "VLESS", &server, port)?;
     Node::create(
         name,
@@ -464,14 +837,57 @@ fn parse_json_vless(object: &Map<String, Value>) -> Result<Node, ImportError> {
             uuid: secret(uuid)?,
             flow,
             packet_encoding,
+            transport,
             tls,
         }),
         SourceFormat::SingBoxJson,
+        source_ordinal,
     )
     .map_err(|_| ImportError::new("invalid VLESS node"))
 }
 
-fn parse_json_hysteria(object: &Map<String, Value>) -> Result<Node, ImportError> {
+fn parse_json_vless_transport(value: Option<&Value>) -> Result<VlessTransport, ImportError> {
+    let Some(value) = value else {
+        return Ok(VlessTransport::Tcp);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| ImportError::new("VLESS transport must be an object"))?;
+    match required_str(object, "type")? {
+        "tcp" => {
+            strict_keys(object, &["type"])?;
+            Ok(VlessTransport::Tcp)
+        }
+        "ws" => {
+            strict_keys(object, &["type", "path", "headers"])?;
+            let path = optional_str(object, "path")?
+                .filter(|value| !value.is_empty())
+                .unwrap_or("/")
+                .to_owned();
+            let host = match object.get("headers") {
+                None => None,
+                Some(Value::Object(headers)) => {
+                    strict_keys(headers, &["Host"])?;
+                    Some(required_str(headers, "Host")?.to_owned())
+                }
+                _ => return Err(ImportError::new("invalid VLESS WebSocket headers")),
+            };
+            Ok(VlessTransport::WebSocket { path, host })
+        }
+        "grpc" => {
+            strict_keys(object, &["type", "service_name"])?;
+            Ok(VlessTransport::Grpc {
+                service_name: required_str(object, "service_name")?.to_owned(),
+            })
+        }
+        _ => Err(ImportError::new("unsupported VLESS transport")),
+    }
+}
+
+fn parse_json_hysteria(
+    object: &Map<String, Value>,
+    source_ordinal: usize,
+) -> Result<Node, ImportError> {
     strict_keys(
         object,
         &[
@@ -528,11 +944,15 @@ fn parse_json_hysteria(object: &Map<String, Value>) -> Result<Node, ImportError>
             tls,
         }),
         SourceFormat::SingBoxJson,
+        source_ordinal,
     )
     .map_err(|_| ImportError::new("invalid Hysteria2 node"))
 }
 
-fn parse_json_naive(object: &Map<String, Value>) -> Result<Node, ImportError> {
+fn parse_json_naive(
+    object: &Map<String, Value>,
+    source_ordinal: usize,
+) -> Result<Node, ImportError> {
     strict_keys(
         object,
         &[
@@ -600,6 +1020,7 @@ fn parse_json_naive(object: &Map<String, Value>) -> Result<Node, ImportError> {
             tls,
         }),
         SourceFormat::SingBoxJson,
+        source_ordinal,
     )
     .map_err(|_| ImportError::new("invalid Naive node"))
 }
@@ -962,6 +1383,137 @@ fn has_valid_percent_encoding(value: &str) -> bool {
     true
 }
 
+fn normalize_hysteria_authority(
+    line: &str,
+) -> Result<(Option<String>, Option<PortSelection>), ImportError> {
+    let Some((scheme, remainder)) = line.split_once("://") else {
+        return Ok((None, None));
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "hysteria2" | "hy2") {
+        return Ok((None, None));
+    }
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, value)| value);
+    let port_start = if host_port.starts_with('[') {
+        let close = host_port
+            .find(']')
+            .ok_or_else(|| ImportError::new("malformed Hysteria2 authority"))?;
+        match host_port.as_bytes().get(close + 1) {
+            Some(b':') => close + 2,
+            None => return Ok((None, None)),
+            _ => return Err(ImportError::new("malformed Hysteria2 authority")),
+        }
+    } else {
+        host_port
+            .rfind(':')
+            .map(|index| index + 1)
+            .unwrap_or(host_port.len())
+    };
+    if port_start == host_port.len() {
+        return Ok((None, None));
+    }
+    let expression = &host_port[port_start..];
+    if !expression.contains(',') && !expression.contains('-') {
+        return Ok((None, None));
+    }
+    if expression.len() > 1_024 {
+        return Err(ImportError::new("Hysteria2 port expression is too long"));
+    }
+    let mut ranges = Vec::new();
+    for part in expression.split(',') {
+        if part.is_empty() || ranges.len() >= 32 {
+            return Err(ImportError::new("invalid Hysteria2 port range"));
+        }
+        let normalized = if let Some((start, end)) = part.split_once('-') {
+            if end.contains('-') {
+                return Err(ImportError::new("invalid Hysteria2 port range"));
+            }
+            format!("{start}:{end}")
+        } else {
+            part.to_owned()
+        };
+        ranges.push(normalized);
+    }
+    let ports = PortSelection::ranges(ranges)
+        .map_err(|_| ImportError::new("invalid Hysteria2 port range"))?;
+    let primary = ports.primary_port();
+    let host_port_offset = authority.len() - host_port.len();
+    let absolute_port_start = scheme.len() + 3 + host_port_offset + port_start;
+    let absolute_port_end = scheme.len() + 3 + authority_end;
+    let mut normalized = String::with_capacity(line.len());
+    normalized.push_str(&line[..absolute_port_start]);
+    normalized.push_str(&primary.to_string());
+    normalized.push_str(&line[absolute_port_end..]);
+    Ok((Some(normalized), Some(ports)))
+}
+
+struct NoDuplicateJson(Value);
+
+impl<'de> Deserialize<'de> for NoDuplicateJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct JsonVisitor;
+        impl<'de> Visitor<'de> for JsonVisitor {
+            type Value = Value;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("JSON without duplicate object keys")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Value, E> {
+                Ok(Value::Bool(value))
+            }
+            fn visit_i64<E>(self, value: i64) -> Result<Value, E> {
+                Ok(Value::Number(value.into()))
+            }
+            fn visit_u64<E>(self, value: u64) -> Result<Value, E> {
+                Ok(Value::Number(value.into()))
+            }
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(Value::Number)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+            fn visit_str<E>(self, value: &str) -> Result<Value, E> {
+                Ok(Value::String(value.to_owned()))
+            }
+            fn visit_string<E>(self, value: String) -> Result<Value, E> {
+                Ok(Value::String(value))
+            }
+            fn visit_none<E>(self) -> Result<Value, E> {
+                Ok(Value::Null)
+            }
+            fn visit_unit<E>(self) -> Result<Value, E> {
+                Ok(Value::Null)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element::<NoDuplicateJson>()? {
+                    values.push(value.0);
+                }
+                Ok(Value::Array(values))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+                let mut values = Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(de::Error::custom("duplicate JSON object key"));
+                    }
+                    let value = map.next_value::<NoDuplicateJson>()?;
+                    values.insert(key, value.0);
+                }
+                Ok(Value::Object(values))
+            }
+        }
+        deserializer.deserialize_any(JsonVisitor).map(Self)
+    }
+}
+
 fn json_depth(value: &Value) -> usize {
     match value {
         Value::Array(values) => 1 + values.iter().map(json_depth).max().unwrap_or(0),
@@ -1115,5 +1667,165 @@ mod tests {
         let error = import_subscription(bad.as_bytes()).unwrap_err().to_string();
         assert!(!error.contains("unique-fixture-secret"));
         assert!(!error.contains("unique-query-secret"));
+    }
+
+    #[test]
+    fn rejects_duplicate_json_keys_at_every_security_sensitive_depth() {
+        let fixtures = [
+            format!(
+                r#"{{"type":"vless","type":"hysteria2","server":"example.test","server_port":443,"uuid":"{UUID}"}}"#
+            ),
+            format!(
+                r#"{{"type":"vless","server":"example.test","server_port":443,"uuid":"{UUID}","uuid":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}"#
+            ),
+            format!(
+                r#"{{"type":"vless","server":"example.test","server_port":443,"uuid":"{UUID}","tls":{{"enabled":true}},"tls":{{"enabled":false}}}}"#
+            ),
+            format!(
+                r#"{{"type":"vless","server":"example.test","server_port":443,"uuid":"{UUID}","tls":{{"enabled":true,"enabled":false}}}}"#
+            ),
+            format!(
+                r#"{{"type":"vless","server":"example.test","server_port":443,"uuid":"{UUID}","tls":{{"enabled":true,"insecure":false,"insecure":true}}}}"#
+            ),
+            format!(
+                r#"{{"type":"vless","server":"example.test","server_port":443,"uuid":"{UUID}","tls":{{"enabled":true,"reality":{{"enabled":true,"public_key":"abcdefghijklmnopqrstuvwxyzABCDEFGH123456789","public_key":"abcdefghijklmnopqrstuvwxyzABCDEFGH123456780","short_id":""}}}}}}"#
+            ),
+            r#"{"type":"naive","server":"example.test","server_port":443,"username":"user","password":"first","password":"second","tls":{"enabled":true}}"#.to_owned(),
+        ];
+        for fixture in fixtures {
+            assert_eq!(
+                import_subscription(fixture.as_bytes())
+                    .unwrap_err()
+                    .to_string(),
+                "invalid sing-box JSON"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_nodes_have_unique_instance_ids_and_shared_update_key() {
+        let input = format!(
+            "vless://{UUID}@example.test:443?encryption=none&type=tcp#same\nvless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@example.test:443?encryption=none&type=tcp#same"
+        );
+        let nodes = import_subscription(input.as_bytes()).unwrap().nodes;
+        assert_eq!(nodes[0].update_key(), nodes[1].update_key());
+        assert_ne!(nodes[0].id(), nodes[1].id());
+    }
+
+    #[test]
+    fn imports_vless_ws_grpc_and_hysteria_multiport() {
+        let input = format!(
+            "vless://{UUID}@example.test:443?security=tls&type=ws&path=%2Fsocket&host=cdn.test&sni=cover.test#WS\nvless://{UUID}@example.test:443?security=tls&type=grpc&serviceName=route&sni=cover.test#gRPC\nhysteria2://fixture@example.test:443,2000-2010?sni=example.test#HY2"
+        );
+        let nodes = import_subscription(input.as_bytes()).unwrap().nodes;
+        assert_eq!(nodes.len(), 3);
+        assert!(matches!(
+            nodes[0].protocol(),
+            NodeProtocol::Vless(VlessNode {
+                transport: VlessTransport::WebSocket { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            nodes[1].protocol(),
+            NodeProtocol::Vless(VlessNode {
+                transport: VlessTransport::Grpc { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            nodes[2].protocol(),
+            NodeProtocol::Hysteria2(Hysteria2Node {
+                ports: PortSelection::Ranges(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn hysteria_uri_ech_and_pin_sha_fail_closed() {
+        for parameter in ["ech=Zml4dHVyZQ==", "pinSHA256=fixture-pin"] {
+            let input = format!(
+                "hysteria2://fixture@example.test:443?sni=example.test&{parameter}#bad\nhysteria2://fixture@example.test:443?sni=example.test#good"
+            );
+            let report = import_subscription(input.as_bytes()).unwrap();
+            assert_eq!(report.nodes.len(), 1);
+            assert_eq!(report.rejected.len(), 1);
+        }
+    }
+
+    #[test]
+    fn imports_strict_clash_yaml_proxies_only() {
+        let yaml = format!(
+            "proxies:\n  - name: ws\n    type: vless\n    server: example.test\n    port: 443\n    uuid: {UUID}\n    network: ws\n    tls: true\n    servername: cover.test\n    ws-opts:\n      path: /socket\n      headers:\n        Host: cdn.test\n  - name: hy2\n    type: hysteria2\n    server: example.test\n    ports: 443,2000-2010\n    password: fixture\n    sni: example.test\n"
+        );
+        let report = import_subscription(yaml.as_bytes()).unwrap();
+        assert_eq!(report.nodes.len(), 2);
+        assert!(report
+            .nodes
+            .iter()
+            .all(|node| node.source_format() == SourceFormat::ClashYaml));
+    }
+
+    #[test]
+    fn clash_yaml_rejects_duplicates_extensions_and_anchors() {
+        let duplicate = "proxies:\n  - name: one\n    name: two\n    type: hysteria2\n    server: example.test\n    port: 443\n    password: fixture\n";
+        assert_eq!(
+            import_subscription(duplicate.as_bytes())
+                .unwrap_err()
+                .to_string(),
+            "invalid Clash YAML"
+        );
+        let extra = "proxies: []\nrules: []\n";
+        assert_eq!(
+            import_subscription(extra.as_bytes())
+                .unwrap_err()
+                .to_string(),
+            "unsupported top-level Clash field"
+        );
+        let anchor = "proxies: &nodes []\n";
+        assert_eq!(
+            import_subscription(anchor.as_bytes())
+                .unwrap_err()
+                .to_string(),
+            "invalid Clash YAML"
+        );
+        let custom_tag = "proxies: !include fixture.yaml\n";
+        assert_eq!(
+            import_subscription(custom_tag.as_bytes())
+                .unwrap_err()
+                .to_string(),
+            "invalid Clash YAML"
+        );
+        let multiple_documents = "---\nproxies: []\n---\nproxies: []\n";
+        assert_eq!(
+            import_subscription(multiple_documents.as_bytes())
+                .unwrap_err()
+                .to_string(),
+            "invalid Clash YAML"
+        );
+    }
+
+    #[test]
+    fn imports_json_ws_and_grpc_transport_shapes() {
+        let json = format!(
+            r#"[{{"type":"vless","server":"example.test","server_port":443,"uuid":"{UUID}","transport":{{"type":"ws","path":"/socket","headers":{{"Host":"cdn.test"}}}}}},{{"type":"vless","server":"example.test","server_port":443,"uuid":"{UUID}","transport":{{"type":"grpc","service_name":"route"}}}}]"#
+        );
+        let report = import_subscription(json.as_bytes()).unwrap();
+        assert_eq!(report.nodes.len(), 2);
+        assert!(matches!(
+            report.nodes[0].protocol(),
+            NodeProtocol::Vless(VlessNode {
+                transport: VlessTransport::WebSocket { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            report.nodes[1].protocol(),
+            NodeProtocol::Vless(VlessNode {
+                transport: VlessTransport::Grpc { .. },
+                ..
+            })
+        ));
     }
 }

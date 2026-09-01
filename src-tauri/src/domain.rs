@@ -53,6 +53,7 @@ pub enum SourceFormat {
     ShareLink,
     Base64List,
     SingBoxJson,
+    ClashYaml,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +67,7 @@ pub enum ProtocolKind {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Node {
     pub(crate) id: String,
+    pub(crate) update_key: String,
     pub(crate) display_name: String,
     pub(crate) server: String,
     pub(crate) protocol: NodeProtocol,
@@ -78,6 +80,7 @@ impl Node {
         server: String,
         protocol: NodeProtocol,
         source_format: SourceFormat,
+        source_ordinal: usize,
     ) -> Result<Self, DomainError> {
         validate_display_name(&display_name)?;
         let server = normalize_server(&server)?;
@@ -89,9 +92,11 @@ impl Node {
             display_name.trim().to_lowercase(),
             protocol.identity_components()
         );
-        let id = stable_id(identity.as_bytes());
+        let update_key = stable_id(identity.as_bytes());
+        let id = stable_id(format!("{update_key}|{source_format:?}|{source_ordinal}").as_bytes());
         Ok(Self {
             id,
+            update_key,
             display_name: display_name.trim().to_owned(),
             server,
             protocol,
@@ -105,6 +110,10 @@ impl Node {
 
     pub fn display_name(&self) -> &str {
         &self.display_name
+    }
+
+    pub fn update_key(&self) -> &str {
+        &self.update_key
     }
 
     pub fn server(&self) -> &str {
@@ -129,6 +138,7 @@ impl fmt::Debug for Node {
         formatter
             .debug_struct("Node")
             .field("id", &self.id)
+            .field("update_key", &self.update_key)
             .field("server", &self.server)
             .field("protocol", &self.protocol.kind())
             .field("source_format", &self.source_format)
@@ -152,6 +162,12 @@ impl NodeProtocol {
                 node.tls.validate()?;
                 if node.flow.is_some() && !node.tls.enabled {
                     return Err(DomainError::new("VLESS Vision requires TLS"));
+                }
+                node.transport.validate()?;
+                if node.flow.is_some() && node.transport != VlessTransport::Tcp {
+                    return Err(DomainError::new(
+                        "VLESS Vision is only supported with TCP transport",
+                    ));
                 }
             }
             Self::Hysteria2(node) => {
@@ -194,10 +210,11 @@ impl NodeProtocol {
     fn identity_components(&self) -> String {
         match self {
             Self::Vless(node) => format!(
-                "{}|{:?}|{:?}|{}",
+                "{}|{:?}|{:?}|{:?}|{}",
                 node.server_port,
                 node.flow,
                 node.packet_encoding,
+                node.transport,
                 node.tls.non_secret_identity()
             ),
             Self::Hysteria2(node) => format!(
@@ -236,7 +253,45 @@ pub struct VlessNode {
     pub(crate) uuid: Secret,
     pub(crate) flow: Option<VlessFlow>,
     pub(crate) packet_encoding: Option<PacketEncoding>,
+    pub(crate) transport: VlessTransport,
     pub(crate) tls: TlsOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VlessTransport {
+    Tcp,
+    WebSocket { path: String, host: Option<String> },
+    Grpc { service_name: String },
+}
+
+impl VlessTransport {
+    fn validate(&self) -> Result<(), DomainError> {
+        match self {
+            Self::Tcp => Ok(()),
+            Self::WebSocket { path, host } => {
+                if path.is_empty()
+                    || path.len() > 2_048
+                    || !path.starts_with('/')
+                    || path.chars().any(char::is_control)
+                {
+                    return Err(DomainError::new("invalid VLESS WebSocket path"));
+                }
+                if let Some(host) = host {
+                    normalize_server(host)?;
+                }
+                Ok(())
+            }
+            Self::Grpc { service_name } => {
+                if service_name.is_empty()
+                    || service_name.len() > 1_024
+                    || service_name.chars().any(char::is_control)
+                {
+                    return Err(DomainError::new("invalid VLESS gRPC service name"));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -650,10 +705,10 @@ pub(crate) fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(),
         {
             return Err(DomainError::new("duplicate extra header name"));
         }
-        if value
-            .chars()
-            .any(|character| matches!(character, '\r' | '\n' | '\0'))
-        {
+        if value.chars().any(|character| {
+            let code = character as u32;
+            (code <= 0x1f && character != '\t') || code == 0x7f
+        }) {
             return Err(DomainError::new(
                 "extra header contains a control character",
             ));
@@ -798,11 +853,17 @@ mod tests {
             ("x-fixture".into(), "second".into()),
         ]);
         assert!(validate_headers(&duplicate).is_err());
+        for control in ['\0', '\u{0001}', '\u{001f}', '\u{007f}'] {
+            let headers = BTreeMap::from([("X-Fixture".into(), format!("safe{control}unsafe"))]);
+            assert!(validate_headers(&headers).is_err());
+        }
+        let tab = BTreeMap::from([("X-Fixture".into(), "safe\tvalue".into())]);
+        validate_headers(&tab).unwrap();
     }
 
     #[test]
-    fn stable_node_id_excludes_credentials() {
-        let make = |uuid: &str| {
+    fn stable_update_key_excludes_credentials_and_instance_id_uses_ordinal() {
+        let make = |uuid: &str, ordinal: usize| {
             Node::create(
                 "Fixture node".into(),
                 "Example.COM".into(),
@@ -811,6 +872,7 @@ mod tests {
                     uuid: Secret::new(uuid.into()).unwrap(),
                     flow: Some(VlessFlow::Vision),
                     packet_encoding: Some(PacketEncoding::Xudp),
+                    transport: VlessTransport::Tcp,
                     tls: TlsOptions {
                         enabled: true,
                         server_name: Some("example.com".into()),
@@ -823,12 +885,14 @@ mod tests {
                     },
                 }),
                 SourceFormat::ShareLink,
+                ordinal,
             )
             .unwrap()
         };
-        let first = make("11111111-2222-3333-4444-555555555555");
-        let second = make("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
-        assert_eq!(first.id(), second.id());
+        let first = make("11111111-2222-3333-4444-555555555555", 0);
+        let second = make("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", 1);
+        assert_eq!(first.update_key(), second.update_key());
+        assert_ne!(first.id(), second.id());
         assert!(!format!("{first:?}").contains("11111111"));
     }
 }
