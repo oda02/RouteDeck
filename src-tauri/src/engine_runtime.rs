@@ -1237,6 +1237,31 @@ pub(crate) struct PortReservations {
     ports: LocalPorts,
 }
 
+pub(crate) struct LoopbackPortReservation {
+    listener: TcpListener,
+    port: u16,
+}
+
+impl LoopbackPortReservation {
+    pub(crate) fn reserve() -> Result<Self, RuntimeError> {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .map_err(|error| RuntimeError::new("reserve_ports", error.to_string()))?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| RuntimeError::new("reserve_ports", error.to_string()))?
+            .port();
+        Ok(Self { listener, port })
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub(crate) fn release(self) {
+        drop(self.listener);
+    }
+}
+
 impl PortReservations {
     pub(crate) fn reserve() -> Result<Self, RuntimeError> {
         let mut listeners = Vec::with_capacity(3);
@@ -1817,6 +1842,7 @@ struct PreparedVerification {
 }
 
 impl VerifiedEngineLauncher {
+    #[allow(dead_code)] // Kept as the sing-box-compatible constructor for internal callers.
     pub(crate) fn resolve() -> Result<Self, RuntimeError> {
         Self::resolve_for(EngineKind::SingBox)
     }
@@ -2397,10 +2423,13 @@ mod tests {
     #[test]
     fn reservations_are_distinct_and_occupy_loopback_ports() {
         let reservations = PortReservations::reserve().unwrap();
+        let bridge = LoopbackPortReservation::reserve().unwrap();
         let ports = reservations.ports();
         assert_ne!(ports.http, ports.socks);
         assert_ne!(ports.http, ports.health);
+        assert!(![ports.http, ports.socks, ports.health].contains(&bridge.port()));
         assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, ports.http)).is_err());
+        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, bridge.port())).is_err());
     }
 
     #[test]

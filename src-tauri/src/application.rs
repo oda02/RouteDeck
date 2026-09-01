@@ -10,14 +10,17 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{generate_config, CaptureMode, ConfigRequest},
+    config::{
+        generate_config, generate_socks_bridge_config, CaptureMode, ConfigRequest, SocksBridge,
+    },
     domain::{
         AppRoute, AppRouteAction, DefaultRoute, DnsPolicy, Ipv6Policy, LanPolicy, Node,
-        ProtocolKind, RoutePolicy,
+        NodeProtocol, ProtocolKind, RoutePolicy,
     },
     engine_runtime::{
-        random_hex, reconcile_stale_sessions, DiagnosticBuffer, EngineLauncher, ManagedChild,
-        PortReservations, RuntimeError, SessionConfig, VerifiedEngineLauncher,
+        random_hex, reconcile_stale_sessions, DiagnosticBuffer, EngineKind, EngineLauncher,
+        LoopbackPortReservation, ManagedChild, PortReservations, RuntimeError, SessionConfig,
+        VerifiedEngineLauncher,
     },
     health::{
         HealthRoute, HttpsTrafficProber, ListenerVerifier, TcpListenerVerifier, TrafficProber,
@@ -29,6 +32,7 @@ use crate::{
         SubscriptionFetchStage, SubscriptionFetcher,
     },
     system_proxy::{SystemProxyControl, SystemProxyManager, SystemProxyRestoreOutcome},
+    xray_config::{generate_xray_bridge_config, XrayBridgeRequest},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -283,14 +287,73 @@ impl SystemProxyRouting {
 }
 
 pub(crate) trait EngineProvider: Send + Sync {
-    fn create(&self) -> Result<Box<dyn EngineLauncher>, RuntimeError>;
+    fn create(&self, kind: EngineKind) -> Result<Box<dyn EngineLauncher>, RuntimeError>;
 }
 
 struct FixedEngineProvider;
 
 impl EngineProvider for FixedEngineProvider {
-    fn create(&self) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
-        Ok(Box::new(VerifiedEngineLauncher::resolve()?))
+    fn create(&self, kind: EngineKind) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
+        Ok(Box::new(VerifiedEngineLauncher::resolve_for(kind)?))
+    }
+}
+
+struct ProvisionalChild(Option<Box<dyn ManagedChild>>);
+
+impl ProvisionalChild {
+    fn new(child: Box<dyn ManagedChild>) -> Self {
+        Self(Some(child))
+    }
+
+    fn as_mut(&mut self) -> &mut dyn ManagedChild {
+        self.0.as_deref_mut().expect("provisional child missing")
+    }
+
+    fn take(mut self) -> Box<dyn ManagedChild> {
+        self.0.take().expect("provisional child missing")
+    }
+}
+
+impl Drop for ProvisionalChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.stop();
+        }
+    }
+}
+
+struct RealityProcessPair {
+    front: Box<dyn ManagedChild>,
+    sidecar: Box<dyn ManagedChild>,
+    sidecar_port: u16,
+    listener: Arc<dyn ListenerVerifier>,
+    _sidecar_config: SessionConfig,
+}
+
+impl ManagedChild for RealityProcessPair {
+    fn pid(&self) -> u32 {
+        self.front.pid()
+    }
+
+    fn is_alive(&mut self) -> Result<bool, RuntimeError> {
+        if !self.front.is_alive()? || !self.sidecar.is_alive()? {
+            return Ok(false);
+        }
+        self.listener
+            .verify_sidecar_owned_now(self.sidecar_port, self.sidecar.as_mut())?;
+        Ok(true)
+    }
+
+    fn stop(&mut self) -> Result<(), RuntimeError> {
+        self.front.stop()?;
+        self.sidecar.stop()
+    }
+}
+
+impl Drop for RealityProcessPair {
+    fn drop(&mut self) {
+        let _ = self.front.stop();
+        let _ = self.sidecar.stop();
     }
 }
 
@@ -1190,25 +1253,69 @@ impl ApplicationController {
         let reservations = PortReservations::reserve()?;
         let ports = reservations.ports();
         let password = random_hex(24)?;
+        let reality = matches!(
+            node.protocol(),
+            NodeProtocol::Vless(vless) if vless.tls.reality.is_some()
+        );
         let capture_mode = match mode {
             RuntimeMode::LocalOnly => CaptureMode::LocalProxy,
             RuntimeMode::SystemProxy => CaptureMode::SystemProxy,
         };
-        let generated = generate_config(ConfigRequest {
+        let request = || ConfigRequest {
             node,
             policy: &policy,
-            mode: capture_mode,
+            mode: capture_mode.clone(),
             ports,
             health_password: password.clone(),
             vpn_dns: None,
             insecure_approval: None,
-        })
-        .map_err(|error| RuntimeError::new("generate_config", error.to_string()))?;
+        };
+        let mut bridge_credentials = None;
+        let mut bridge_reservation = None;
+        let generated = if reality {
+            let reservation = LoopbackPortReservation::reserve()?;
+            let username = random_hex(24)?;
+            let bridge_password = random_hex(24)?;
+            let generated = generate_socks_bridge_config(
+                request(),
+                SocksBridge {
+                    server_port: reservation.port(),
+                    username: &username,
+                    password: &bridge_password,
+                },
+            )
+            .map_err(|error| RuntimeError::new("generate_config", error.to_string()))?;
+            bridge_credentials = Some((username, bridge_password));
+            bridge_reservation = Some(reservation);
+            generated
+        } else {
+            generate_config(request())
+                .map_err(|error| RuntimeError::new("generate_config", error.to_string()))?
+        };
         let session = SessionConfig::create(&self.session_root, generated.as_str())?;
-        let process_redactor = redactor
+        let mut process_redactor = redactor
             .clone()
             .with_secret(&password)
             .with_secret(&session.path().to_string_lossy());
+        let sidecar_session = if let (Some(reservation), Some((username, bridge_password))) =
+            (bridge_reservation.as_ref(), bridge_credentials.as_ref())
+        {
+            let generated = generate_xray_bridge_config(XrayBridgeRequest {
+                node,
+                listen_port: reservation.port(),
+                username,
+                password: bridge_password,
+            })
+            .map_err(|error| RuntimeError::new("generate_config", error.to_string()))?;
+            let sidecar = SessionConfig::create(&self.session_root, generated.as_str())?;
+            process_redactor = process_redactor
+                .with_secret(username)
+                .with_secret(bridge_password)
+                .with_secret(&sidecar.path().to_string_lossy());
+            Some(sidecar)
+        } else {
+            None
+        };
         Self::set_proof(state, ProofKind::EngineConfig, ProofState::Pending, None);
         self.update_status(
             state,
@@ -1216,9 +1323,24 @@ impl ApplicationController {
             Some(node.id().to_owned()),
             None,
         );
-        let launcher = self.services.engine.create()?;
-        let engine_version =
+        let launcher = self.services.engine.create(EngineKind::SingBox)?;
+        let sing_box_version =
             launcher.check(&session, process_redactor.clone(), self.diagnostics.clone())?;
+        let mut sidecar_launcher = if sidecar_session.is_some() {
+            Some(self.services.engine.create(EngineKind::Xray)?)
+        } else {
+            None
+        };
+        let sidecar_version = if let (Some(launcher), Some(sidecar)) =
+            (sidecar_launcher.as_ref(), sidecar_session.as_ref())
+        {
+            Some(launcher.check(sidecar, process_redactor.clone(), self.diagnostics.clone())?)
+        } else {
+            None
+        };
+        let engine_version = sidecar_version
+            .map(|version| format!("sing-box {sing_box_version} + Xray {version}"))
+            .unwrap_or(sing_box_version);
         let generation = random_hex(16)?;
         Self::set_proof(state, ProofKind::EngineConfig, ProofState::Passed, None);
         self.update_status(
@@ -1227,8 +1349,41 @@ impl ApplicationController {
             Some(node.id().to_owned()),
             None,
         );
+        let sidecar = if let (Some(reservation), Some(sidecar), Some(launcher)) =
+            (bridge_reservation, sidecar_session, sidecar_launcher.take())
+        {
+            let sidecar_port = reservation.port();
+            reservation.release();
+            let mut child = ProvisionalChild::new(launcher.start(
+                &sidecar,
+                process_redactor.clone(),
+                self.diagnostics.clone(),
+            )?);
+            self.services
+                .listener
+                .wait_until_sidecar_ready(sidecar_port, child.as_mut())?;
+            Some((child, sidecar, sidecar_port))
+        } else {
+            None
+        };
         reservations.release();
-        let child = launcher.start(&session, process_redactor, self.diagnostics.clone())?;
+        let front = ProvisionalChild::new(launcher.start(
+            &session,
+            process_redactor,
+            self.diagnostics.clone(),
+        )?);
+        let child: Box<dyn ManagedChild> =
+            if let Some((sidecar, sidecar_config, sidecar_port)) = sidecar {
+                Box::new(RealityProcessPair {
+                    front: front.take(),
+                    sidecar: sidecar.take(),
+                    sidecar_port,
+                    listener: Arc::clone(&self.services.listener),
+                    _sidecar_config: sidecar_config,
+                })
+            } else {
+                front.take()
+            };
         let health_route = HealthRoute::new(ports.health, password);
         state.active = Some(ActiveSession {
             child,
@@ -2177,8 +2332,10 @@ mod tests {
 
     use super::*;
     use crate::health::ProofResult;
+    use serde_json::Value;
 
     const NODE: &str = "hysteria2://fixture-secret@example.test:443?sni=example.test#fixture";
+    const REALITY_NODE: &str = "vless://11111111-2222-3333-4444-555555555555@example.test:443?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2#Reality";
 
     struct FakeProvider {
         check_fails: bool,
@@ -2263,7 +2420,7 @@ mod tests {
     }
 
     impl EngineProvider for FakeProvider {
-        fn create(&self) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
+        fn create(&self, _kind: EngineKind) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
             Ok(Box::new(FakeLauncher {
                 check_fails: self.check_fails,
                 stop_fails: self.stop_fails,
@@ -2283,7 +2440,7 @@ mod tests {
     struct RecoveryFailProvider;
 
     impl EngineProvider for RecoveryFailProvider {
-        fn create(&self) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
+        fn create(&self, _kind: EngineKind) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
             Ok(Box::new(RecoveryFailLauncher))
         }
     }
@@ -2374,6 +2531,181 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BridgeObservation {
+        sing_box: Option<(u16, String, String)>,
+        xray: Option<(u16, String, String)>,
+    }
+
+    struct DualEngineProvider {
+        events: Arc<Mutex<Vec<String>>>,
+        observation: Arc<Mutex<BridgeObservation>>,
+        sing_box_alive: Arc<AtomicBool>,
+        xray_alive: Arc<AtomicBool>,
+        fail_check: Option<EngineKind>,
+        fail_start: Option<EngineKind>,
+    }
+
+    impl DualEngineProvider {
+        fn new() -> Self {
+            Self {
+                events: Arc::new(Mutex::new(Vec::new())),
+                observation: Arc::new(Mutex::new(BridgeObservation::default())),
+                sing_box_alive: Arc::new(AtomicBool::new(false)),
+                xray_alive: Arc::new(AtomicBool::new(false)),
+                fail_check: None,
+                fail_start: None,
+            }
+        }
+    }
+
+    impl EngineProvider for DualEngineProvider {
+        fn create(&self, kind: EngineKind) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("create:{}", engine_label(kind)));
+            Ok(Box::new(DualEngineLauncher {
+                kind,
+                events: Arc::clone(&self.events),
+                observation: Arc::clone(&self.observation),
+                alive: if kind == EngineKind::SingBox {
+                    Arc::clone(&self.sing_box_alive)
+                } else {
+                    Arc::clone(&self.xray_alive)
+                },
+                fail_check: self.fail_check == Some(kind),
+                fail_start: self.fail_start == Some(kind),
+            }))
+        }
+    }
+
+    struct DualEngineLauncher {
+        kind: EngineKind,
+        events: Arc<Mutex<Vec<String>>>,
+        observation: Arc<Mutex<BridgeObservation>>,
+        alive: Arc<AtomicBool>,
+        fail_check: bool,
+        fail_start: bool,
+    }
+
+    impl EngineLauncher for DualEngineLauncher {
+        fn check(
+            &self,
+            config: &SessionConfig,
+            _redactor: Redactor,
+            _diagnostics: Arc<Mutex<DiagnosticBuffer>>,
+        ) -> Result<String, RuntimeError> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("check:{}", engine_label(self.kind)));
+            let value: Value =
+                serde_json::from_str(&std::fs::read_to_string(config.path()).unwrap())
+                    .expect("fixture config must be JSON");
+            let bridge = if self.kind == EngineKind::SingBox {
+                (
+                    value["outbounds"][0]["server_port"].as_u64().unwrap() as u16,
+                    value["outbounds"][0]["username"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                    value["outbounds"][0]["password"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                )
+            } else {
+                (
+                    value["inbounds"][0]["port"].as_u64().unwrap() as u16,
+                    value["inbounds"][0]["settings"]["users"][0]["user"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                    value["inbounds"][0]["settings"]["users"][0]["pass"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                )
+            };
+            let mut observation = self.observation.lock().unwrap();
+            if self.kind == EngineKind::SingBox {
+                observation.sing_box = Some(bridge);
+            } else {
+                observation.xray = Some(bridge);
+            }
+            if self.fail_check {
+                Err(RuntimeError::new(
+                    "config_check",
+                    "fixture engine rejected its generated configuration",
+                ))
+            } else {
+                Ok(match self.kind {
+                    EngineKind::SingBox => "1.13.19",
+                    EngineKind::Xray => "26.3.27",
+                }
+                .into())
+            }
+        }
+
+        fn start(
+            &self,
+            _config: &SessionConfig,
+            _redactor: Redactor,
+            _diagnostics: Arc<Mutex<DiagnosticBuffer>>,
+        ) -> Result<Box<dyn ManagedChild>, RuntimeError> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("start:{}", engine_label(self.kind)));
+            if self.fail_start {
+                return Err(RuntimeError::new(
+                    "start_engine",
+                    "fixture engine refused to start",
+                ));
+            }
+            self.alive.store(true, Ordering::SeqCst);
+            Ok(Box::new(DualEngineChild {
+                kind: self.kind,
+                events: Arc::clone(&self.events),
+                alive: Arc::clone(&self.alive),
+            }))
+        }
+    }
+
+    struct DualEngineChild {
+        kind: EngineKind,
+        events: Arc<Mutex<Vec<String>>>,
+        alive: Arc<AtomicBool>,
+    }
+
+    impl ManagedChild for DualEngineChild {
+        fn pid(&self) -> u32 {
+            std::process::id()
+        }
+
+        fn is_alive(&mut self) -> Result<bool, RuntimeError> {
+            Ok(self.alive.load(Ordering::SeqCst))
+        }
+
+        fn stop(&mut self) -> Result<(), RuntimeError> {
+            if self.alive.swap(false, Ordering::SeqCst) {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("stop:{}", engine_label(self.kind)));
+            }
+            Ok(())
+        }
+    }
+
+    fn engine_label(kind: EngineKind) -> &'static str {
+        match kind {
+            EngineKind::SingBox => "sing-box",
+            EngineKind::Xray => "xray",
+        }
+    }
+
     struct FakeListener(bool);
 
     impl ListenerVerifier for FakeListener {
@@ -2405,6 +2737,29 @@ mod tests {
                     "fixture listener ownership failed",
                 ))
             }
+        }
+
+        fn wait_until_sidecar_ready(
+            &self,
+            _port: u16,
+            child: &mut dyn ManagedChild,
+        ) -> Result<(), RuntimeError> {
+            if self.0 && child.is_alive()? {
+                Ok(())
+            } else {
+                Err(RuntimeError::new(
+                    "verify_listeners",
+                    "fixture sidecar listener did not open",
+                ))
+            }
+        }
+
+        fn verify_sidecar_owned_now(
+            &self,
+            port: u16,
+            child: &mut dyn ManagedChild,
+        ) -> Result<(), RuntimeError> {
+            self.wait_until_sidecar_ready(port, child)
         }
     }
 
@@ -2439,6 +2794,29 @@ mod tests {
                     "fixture listener ownership failed",
                 ))
             }
+        }
+
+        fn wait_until_sidecar_ready(
+            &self,
+            _port: u16,
+            child: &mut dyn ManagedChild,
+        ) -> Result<(), RuntimeError> {
+            if self.0.load(Ordering::SeqCst) && child.is_alive()? {
+                Ok(())
+            } else {
+                Err(RuntimeError::new(
+                    "verify_listeners",
+                    "fixture sidecar listener did not open",
+                ))
+            }
+        }
+
+        fn verify_sidecar_owned_now(
+            &self,
+            port: u16,
+            child: &mut dyn ManagedChild,
+        ) -> Result<(), RuntimeError> {
+            self.wait_until_sidecar_ready(port, child)
         }
     }
 
@@ -2728,10 +3106,197 @@ mod tests {
         )
     }
 
+    fn controller_with_dual_provider(
+        provider: Arc<DualEngineProvider>,
+        listener_ready: bool,
+    ) -> ApplicationController {
+        let root = std::env::temp_dir().join(format!(
+            "routedeck-reality-test-{}",
+            random_hex(8).expect("test random")
+        ));
+        ApplicationController::with_services(
+            root,
+            Arc::new(|_| {}),
+            provider,
+            Arc::new(FakeListener(listener_ready)),
+            Arc::new(FakeProber(true)),
+        )
+    }
+
     fn import_node(controller: &ApplicationController) -> String {
-        let preview = controller.preview_import_content(NODE.into()).unwrap();
+        import_node_from(controller, NODE)
+    }
+
+    fn import_node_from(controller: &ApplicationController, link: &str) -> String {
+        let preview = controller.preview_import_content(link.into()).unwrap();
         let confirmed = controller.confirm_import(&preview.preview_id).unwrap();
         confirmed.node_ids[0].clone()
+    }
+
+    #[test]
+    fn reality_uses_matching_private_bridge_and_ordered_dual_process_lifecycle() {
+        let provider = Arc::new(DualEngineProvider::new());
+        let controller = controller_with_dual_provider(Arc::clone(&provider), true);
+        let node = import_node_from(&controller, REALITY_NODE);
+
+        let status = controller
+            .start_local_proxy(&node, DefaultRoute::Vpn)
+            .unwrap();
+        assert_eq!(status.phase, RuntimePhase::LocalProxyReady);
+        assert_eq!(
+            status.engine_version.as_deref(),
+            Some("sing-box 1.13.19 + Xray 26.3.27")
+        );
+        let observation = provider.observation.lock().unwrap();
+        assert_eq!(observation.sing_box, observation.xray);
+        assert!(observation.sing_box.as_ref().unwrap().0 > 0);
+        drop(observation);
+
+        let events = provider.events.lock().unwrap().clone();
+        let xray_start = events
+            .iter()
+            .position(|event| event == "start:xray")
+            .unwrap();
+        let sing_box_start = events
+            .iter()
+            .position(|event| event == "start:sing-box")
+            .unwrap();
+        assert!(xray_start < sing_box_start);
+
+        controller.stop().unwrap();
+        let events = provider.events.lock().unwrap();
+        let sing_box_stop = events
+            .iter()
+            .position(|event| event == "stop:sing-box")
+            .unwrap();
+        let xray_stop = events
+            .iter()
+            .position(|event| event == "stop:xray")
+            .unwrap();
+        assert!(sing_box_stop < xray_stop);
+        assert!(!provider.sing_box_alive.load(Ordering::SeqCst));
+        assert!(!provider.xray_alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn reality_xray_check_failure_starts_neither_process() {
+        let mut configured = DualEngineProvider::new();
+        configured.fail_check = Some(EngineKind::Xray);
+        let provider = Arc::new(configured);
+        let controller = controller_with_dual_provider(Arc::clone(&provider), true);
+        let node = import_node_from(&controller, REALITY_NODE);
+
+        let error = controller
+            .start_local_proxy(&node, DefaultRoute::Vpn)
+            .unwrap_err();
+        assert_eq!(error.stage, PublicErrorStage::ConfigCheck);
+        assert_eq!(
+            controller.status().phase,
+            RuntimePhase::DisconnectedWithError
+        );
+        let events = provider.events.lock().unwrap();
+        assert!(events.iter().all(|event| !event.starts_with("start:")));
+        assert!(!provider.sing_box_alive.load(Ordering::SeqCst));
+        assert!(!provider.xray_alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn reality_sidecar_listener_failure_stops_xray_before_front_starts() {
+        let provider = Arc::new(DualEngineProvider::new());
+        let controller = controller_with_dual_provider(Arc::clone(&provider), false);
+        let node = import_node_from(&controller, REALITY_NODE);
+
+        let error = controller
+            .start_local_proxy(&node, DefaultRoute::Vpn)
+            .unwrap_err();
+        assert_eq!(error.stage, PublicErrorStage::VerifyListeners);
+        let events = provider.events.lock().unwrap();
+        assert!(events.iter().any(|event| event == "start:xray"));
+        assert!(events.iter().any(|event| event == "stop:xray"));
+        assert!(events.iter().all(|event| event != "start:sing-box"));
+        assert!(!provider.xray_alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn reality_front_start_failure_rolls_back_live_xray() {
+        let mut configured = DualEngineProvider::new();
+        configured.fail_start = Some(EngineKind::SingBox);
+        let provider = Arc::new(configured);
+        let controller = controller_with_dual_provider(Arc::clone(&provider), true);
+        let node = import_node_from(&controller, REALITY_NODE);
+
+        let error = controller
+            .start_local_proxy(&node, DefaultRoute::Vpn)
+            .unwrap_err();
+        assert_eq!(error.stage, PublicErrorStage::StartEngine);
+        let events = provider.events.lock().unwrap();
+        let xray_start = events
+            .iter()
+            .position(|event| event == "start:xray")
+            .unwrap();
+        let sing_box_start = events
+            .iter()
+            .position(|event| event == "start:sing-box")
+            .unwrap();
+        let xray_stop = events
+            .iter()
+            .position(|event| event == "stop:xray")
+            .unwrap();
+        assert!(xray_start < sing_box_start && sing_box_start < xray_stop);
+        assert!(!provider.xray_alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn reality_sidecar_death_invalidates_and_tears_down_front_session() {
+        let provider = Arc::new(DualEngineProvider::new());
+        let controller = controller_with_dual_provider(Arc::clone(&provider), true);
+        let node = import_node_from(&controller, REALITY_NODE);
+        controller
+            .start_local_proxy(&node, DefaultRoute::Vpn)
+            .unwrap();
+
+        provider.xray_alive.store(false, Ordering::SeqCst);
+        controller.monitor_tick();
+        assert_eq!(
+            controller.status().phase,
+            RuntimePhase::DisconnectedWithError
+        );
+        assert!(!provider.sing_box_alive.load(Ordering::SeqCst));
+        assert!(provider
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "stop:sing-box"));
+    }
+
+    #[test]
+    fn reality_system_proxy_restores_windows_before_stopping_both_engines() {
+        let provider = Arc::new(DualEngineProvider::new());
+        let proxy = Arc::new(FakeSystemProxy::new(Arc::clone(&provider.sing_box_alive)));
+        let root = std::env::temp_dir().join(format!(
+            "routedeck-reality-system-proxy-test-{}",
+            random_hex(8).expect("test random")
+        ));
+        let controller = ApplicationController::with_services_and_controls(
+            root,
+            Arc::new(|_| {}),
+            provider.clone(),
+            Arc::new(FakeListener(true)),
+            Arc::new(FakeProber(true)),
+            Arc::new(HttpsSubscriptionFetcher),
+            proxy.clone(),
+        );
+        let node = import_node_from(&controller, REALITY_NODE);
+
+        let status = controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Vpn))
+            .unwrap();
+        assert_eq!(status.phase, RuntimePhase::SystemProxyReady);
+        controller.stop().unwrap();
+        assert!(proxy.restore_saw_live_core.load(Ordering::SeqCst));
+        assert!(!provider.sing_box_alive.load(Ordering::SeqCst));
+        assert!(!provider.xray_alive.load(Ordering::SeqCst));
     }
 
     #[test]

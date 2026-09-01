@@ -257,6 +257,18 @@ pub(crate) trait ListenerVerifier: Send + Sync {
         ports: LocalPorts,
         child: &mut dyn ManagedChild,
     ) -> Result<(), RuntimeError>;
+
+    fn wait_until_sidecar_ready(
+        &self,
+        port: u16,
+        child: &mut dyn ManagedChild,
+    ) -> Result<(), RuntimeError>;
+
+    fn verify_sidecar_owned_now(
+        &self,
+        port: u16,
+        child: &mut dyn ManagedChild,
+    ) -> Result<(), RuntimeError>;
 }
 
 pub(crate) struct TcpListenerVerifier;
@@ -309,6 +321,53 @@ impl ListenerVerifier for TcpListenerVerifier {
             ))
         }
     }
+
+    fn wait_until_sidecar_ready(
+        &self,
+        port: u16,
+        child: &mut dyn ManagedChild,
+    ) -> Result<(), RuntimeError> {
+        let deadline = Instant::now() + LISTENER_TIMEOUT;
+        loop {
+            if !child.is_alive()? {
+                return Err(RuntimeError::new(
+                    "verify_listeners",
+                    "Xray exited before its private bridge became ready",
+                ));
+            }
+            if sidecar_listener_owned_now(port, child.pid())? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(RuntimeError::new(
+                    "verify_listeners",
+                    "the private Xray bridge listener did not become ready",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    }
+
+    fn verify_sidecar_owned_now(
+        &self,
+        port: u16,
+        child: &mut dyn ManagedChild,
+    ) -> Result<(), RuntimeError> {
+        if !child.is_alive()? {
+            return Err(RuntimeError::new(
+                "engine_process",
+                "Xray sidecar process is not running",
+            ));
+        }
+        if sidecar_listener_owned_now(port, child.pid())? {
+            Ok(())
+        } else {
+            Err(RuntimeError::new(
+                "verify_listeners",
+                "private Xray bridge ownership proof failed",
+            ))
+        }
+    }
 }
 
 fn listeners_owned_now(
@@ -323,7 +382,16 @@ fn listeners_owned_now(
         )
         .is_ok()
     });
-    Ok(accepting && loopback_ports_owned_by(ports, pid)?)
+    Ok(accepting && loopback_ports_owned_by(&[ports.http, ports.socks, ports.health], pid)?)
+}
+
+fn sidecar_listener_owned_now(port: u16, pid: u32) -> Result<bool, RuntimeError> {
+    let accepting = TcpStream::connect_timeout(
+        &SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
+        Duration::from_millis(100),
+    )
+    .is_ok();
+    Ok(accepting && loopback_ports_owned_by(&[port], pid)?)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,9 +401,9 @@ struct ListenerOwner {
     pid: u32,
 }
 
-fn owners_match(owners: &[ListenerOwner], ports: LocalPorts, pid: u32) -> bool {
+fn owners_match(owners: &[ListenerOwner], ports: &[u16], pid: u32) -> bool {
     let loopback = u32::from_ne_bytes([127, 0, 0, 1]);
-    [ports.http, ports.socks, ports.health].iter().all(|port| {
+    ports.iter().all(|port| {
         owners
             .iter()
             .any(|owner| owner.local_address == loopback && owner.port == *port && owner.pid == pid)
@@ -343,7 +411,7 @@ fn owners_match(owners: &[ListenerOwner], ports: LocalPorts, pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn loopback_ports_owned_by(ports: LocalPorts, pid: u32) -> Result<bool, RuntimeError> {
+fn loopback_ports_owned_by(ports: &[u16], pid: u32) -> Result<bool, RuntimeError> {
     use std::{mem::size_of, ptr};
     use windows_sys::Win32::{
         Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR},
@@ -425,7 +493,7 @@ fn loopback_ports_owned_by(ports: LocalPorts, pid: u32) -> Result<bool, RuntimeE
 }
 
 #[cfg(not(windows))]
-fn loopback_ports_owned_by(_ports: LocalPorts, _pid: u32) -> Result<bool, RuntimeError> {
+fn loopback_ports_owned_by(_ports: &[u16], _pid: u32) -> Result<bool, RuntimeError> {
     Ok(true)
 }
 
@@ -554,9 +622,11 @@ mod tests {
             port,
             pid: 42,
         });
-        assert!(owners_match(&owners, ports, 42));
+        let expected = [ports.http, ports.socks, ports.health];
+        assert!(owners_match(&owners, &expected, 42));
         owners[1].pid = 7;
-        assert!(!owners_match(&owners, ports, 42));
+        assert!(!owners_match(&owners, &expected, 42));
+        assert!(owners_match(&owners, &[ports.http], 42));
     }
 
     #[cfg(windows)]
@@ -573,9 +643,10 @@ mod tests {
             health: health.local_addr().unwrap().port(),
         };
         let pid = std::process::id();
+        let expected = [ports.http, ports.socks, ports.health];
         let mut owned = false;
         for _ in 0..20 {
-            if loopback_ports_owned_by(ports, pid).unwrap() {
+            if loopback_ports_owned_by(&expected, pid).unwrap() {
                 owned = true;
                 break;
             }
@@ -585,6 +656,6 @@ mod tests {
             owned,
             "current process listeners were not attributed to its PID"
         );
-        assert!(!loopback_ports_owned_by(ports, pid.wrapping_add(1)).unwrap());
+        assert!(!loopback_ports_owned_by(&expected, pid.wrapping_add(1)).unwrap());
     }
 }
