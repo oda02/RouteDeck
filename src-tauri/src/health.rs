@@ -46,51 +46,68 @@ pub(crate) struct ProofResult {
 
 pub(crate) trait TrafficProber: Send + Sync {
     fn prove(&self, route: &HealthRoute) -> Result<ProofResult, RuntimeError>;
+
+    fn prove_ordinary(&self, http_port: u16) -> Result<ProofResult, RuntimeError> {
+        self.prove(&HealthRoute::new(http_port, String::new()))
+    }
 }
 
 pub(crate) struct HttpsTrafficProber;
 
 impl TrafficProber for HttpsTrafficProber {
     fn prove(&self, route: &HealthRoute) -> Result<ProofResult, RuntimeError> {
-        let proxy_url = format!("http://127.0.0.1:{}", route.port);
-        let proxy = Proxy::all(&proxy_url)
-            .map_err(|_| RuntimeError::new("prove_traffic", "health proxy URL is invalid"))?
-            .basic_auth(HEALTH_PROXY_USERNAME, &route.password);
-        let client = Client::builder()
-            .no_proxy()
-            .proxy(proxy)
-            .redirect(Policy::none())
-            .timeout(STARTUP_PROOF_TIMEOUT)
-            .build()
-            .map_err(|error| RuntimeError::new("prove_traffic", error.to_string()))?;
-        let started = Instant::now();
-        let response = client
-            .get(PROOF_URL)
-            .header("accept", "*/*")
-            .header("cache-control", "no-store")
-            .send()
-            .map_err(|error| RuntimeError::new("prove_traffic", error.to_string()))?;
-        if response.status() != StatusCode::NO_CONTENT {
-            return Err(RuntimeError::new(
-                "prove_traffic",
-                format!("health endpoint returned HTTP {}", response.status()),
-            ));
-        }
-        let mut body = Vec::new();
-        response
-            .take((MAX_PROOF_BODY + 1) as u64)
-            .read_to_end(&mut body)
-            .map_err(|error| RuntimeError::new("prove_traffic", error.to_string()))?;
-        if body.len() > MAX_PROOF_BODY {
-            return Err(RuntimeError::new(
-                "prove_traffic",
-                "health response exceeded the body limit",
-            ));
-        }
-        Ok(ProofResult {
-            latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-        })
+        prove_via_http_proxy(route.port, Some(&route.password))
     }
+
+    fn prove_ordinary(&self, http_port: u16) -> Result<ProofResult, RuntimeError> {
+        prove_via_http_proxy(http_port, None)
+    }
+}
+
+fn prove_via_http_proxy(
+    port: u16,
+    health_password: Option<&str>,
+) -> Result<ProofResult, RuntimeError> {
+    let proxy_url = format!("http://127.0.0.1:{port}");
+    let mut proxy = Proxy::all(&proxy_url)
+        .map_err(|_| RuntimeError::new("prove_traffic", "local proof proxy URL is invalid"))?;
+    if let Some(password) = health_password {
+        proxy = proxy.basic_auth(HEALTH_PROXY_USERNAME, password);
+    }
+    let client = Client::builder()
+        .no_proxy()
+        .proxy(proxy)
+        .redirect(Policy::none())
+        .timeout(STARTUP_PROOF_TIMEOUT)
+        .build()
+        .map_err(|error| RuntimeError::new("prove_traffic", error.to_string()))?;
+    let started = Instant::now();
+    let response = client
+        .get(PROOF_URL)
+        .header("accept", "*/*")
+        .header("cache-control", "no-store")
+        .send()
+        .map_err(|error| RuntimeError::new("prove_traffic", error.to_string()))?;
+    if response.status() != StatusCode::NO_CONTENT {
+        return Err(RuntimeError::new(
+            "prove_traffic",
+            format!("traffic proof endpoint returned HTTP {}", response.status()),
+        ));
+    }
+    let mut body = Vec::new();
+    response
+        .take((MAX_PROOF_BODY + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|error| RuntimeError::new("prove_traffic", error.to_string()))?;
+    if body.len() > MAX_PROOF_BODY {
+        return Err(RuntimeError::new(
+            "prove_traffic",
+            "traffic proof response exceeded the body limit",
+        ));
+    }
+    Ok(ProofResult {
+        latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+    })
 }
 
 pub(crate) trait ListenerVerifier: Send + Sync {
@@ -304,6 +321,24 @@ mod tests {
             drop(stream);
         });
         let result = HttpsTrafficProber.prove(&HealthRoute::new(port, "fixture-secret".into()));
+        assert!(result.is_err());
+        accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn failed_explicit_ordinary_proxy_is_never_bypassed() {
+        use std::{net::TcpListener, sync::mpsc, thread};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            accepted_tx.send(()).unwrap();
+            drop(stream);
+        });
+        let result = HttpsTrafficProber.prove_ordinary(port);
         assert!(result.is_err());
         accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         server.join().unwrap();

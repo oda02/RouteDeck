@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeSet, VecDeque},
     ffi::OsStr,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     net::{Ipv4Addr, SocketAddrV4, TcpListener},
     path::{Path, PathBuf},
     sync::{mpsc, Arc, Mutex},
@@ -487,8 +487,43 @@ fn create_session_config(
         .map_err(|error| RuntimeError::new("session_storage", error.to_string()))?;
     reject_reparse(&config_path)
         .map_err(|error| RuntimeError::new("session_storage", error.message))?;
-    let guard = open_config_guard(&config_path)?;
+    let mut guard = open_config_guard(&config_path)?;
+    verify_config_contents(&mut guard, contents)?;
     Ok((config_path, guard))
+}
+
+fn verify_config_contents(file: &mut File, expected: &str) -> Result<(), RuntimeError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| RuntimeError::new("session_storage", error.to_string()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| RuntimeError::new("session_storage", error.to_string()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let actual = hasher.finalize();
+    let expected = Sha256::digest(expected.as_bytes());
+    let matches = actual
+        .iter()
+        .zip(expected.iter())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| RuntimeError::new("session_storage", error.to_string()))?;
+    if !matches {
+        return Err(RuntimeError::new(
+            "session_storage",
+            "session configuration contents changed before the protected handle was accepted",
+        ));
+    }
+    Ok(())
 }
 
 fn open_config_guard(path: &Path) -> Result<File, RuntimeError> {
@@ -1370,6 +1405,25 @@ mod tests {
         .expect("injected identity failure was accepted");
         assert_eq!(error.stage(), "session_storage");
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn reopened_config_contents_must_match_exact_generated_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "routedeck-config-content-fixture-{}",
+            random_hex(8).unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("config.json");
+        fs::write(&path, b"{\"secret\":\"changed\"}").unwrap();
+        let mut file = File::open(&path).unwrap();
+        let error = verify_config_contents(&mut file, "{\"secret\":\"expected\"}").unwrap_err();
+        assert_eq!(error.stage(), "session_storage");
+        assert!(!error.message().contains("secret"));
+        verify_config_contents(&mut file, "{\"secret\":\"changed\"}").unwrap();
+        drop(file);
+        fs::remove_file(path).unwrap();
         fs::remove_dir(root).unwrap();
     }
 

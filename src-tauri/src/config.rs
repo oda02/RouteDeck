@@ -287,6 +287,15 @@ fn validate_request(request: &ConfigRequest<'_>) -> Result<(), ConfigError> {
         .policy
         .validate()
         .map_err(|_| ConfigError::new("route policy is invalid"))?;
+    if matches!(request.mode, CaptureMode::LocalProxy)
+        && (request.policy.default != DefaultRoute::Vpn
+            || !request.policy.apps.is_empty()
+            || request.policy.lan != LanPolicy::FollowDefault)
+    {
+        return Err(ConfigError::new(
+            "local proxy runtime must route ordinary traffic through selected outbound",
+        ));
+    }
     if let CaptureMode::Tun(settings) = &request.mode {
         validate_tun_address(&settings.ipv4_address, false)?;
         if request.policy.ipv6 == Ipv6Policy::Enabled {
@@ -511,7 +520,7 @@ mod tests {
         RoutePolicy {
             default,
             apps: Vec::new(),
-            lan: LanPolicy::Direct,
+            lan: LanPolicy::FollowDefault,
             ipv6: Ipv6Policy::Enabled,
             dns: DnsPolicy::CurrentNetwork,
         }
@@ -534,11 +543,11 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_vless_config_forces_health_and_explicit_default() {
+    fn deterministic_vless_local_proxy_forces_all_ordinary_traffic_to_selected() {
         let link = "vless://11111111-2222-3333-4444-555555555555@example.test:443?encryption=none&security=tls&type=tcp&sni=cover.test&flow=xtls-rprx-vision";
         let node = node(link);
         assert_eq!(node.source_format(), SourceFormat::ShareLink);
-        let policy = policy(DefaultRoute::Direct);
+        let policy = policy(DefaultRoute::Vpn);
         let first = generate_config(request(&node, &policy)).unwrap();
         let second = generate_config(request(&node, &policy)).unwrap();
         assert_eq!(first.as_str(), second.as_str());
@@ -546,7 +555,7 @@ mod tests {
         validate_no_direct_health(&value).unwrap();
         assert_eq!(
             value.pointer("/route/final").and_then(Value::as_str),
-            Some("direct")
+            Some("selected")
         );
         assert_eq!(
             value.pointer("/outbounds/0/flow").and_then(Value::as_str),
@@ -562,6 +571,23 @@ mod tests {
         assert!(!first.as_str().contains("hop_interval_max"));
         assert!(!first.as_str().contains("\"engine\""));
         assert!(!format!("{first:?}").contains("fixture-health-secret"));
+    }
+
+    #[test]
+    fn local_proxy_rejects_renderer_routing_drafts() {
+        let node = node("hysteria2://fixture-password@example.test:443?sni=example.test#fixture");
+        let direct = policy(DefaultRoute::Direct);
+        assert!(generate_config(request(&node, &direct)).is_err());
+        let mut app_draft = policy(DefaultRoute::Vpn);
+        app_draft.apps.push(crate::domain::AppRoute {
+            process_path: r"C:\Apps\Browser.exe".into(),
+            process_name: Some("Browser.exe".into()),
+            action: AppRouteAction::Direct,
+        });
+        assert!(generate_config(request(&node, &app_draft)).is_err());
+        let mut lan_draft = policy(DefaultRoute::Vpn);
+        lan_draft.lan = LanPolicy::Direct;
+        assert!(generate_config(request(&node, &lan_draft)).is_err());
     }
 
     #[test]
@@ -696,6 +722,7 @@ mod tests {
         let node = node("hysteria2://fixture-password@example.test:443?sni=example.test");
         let mut policy = policy(DefaultRoute::Vpn);
         policy.ipv6 = Ipv6Policy::Disabled;
+        policy.lan = LanPolicy::Direct;
         policy.apps.push(crate::domain::AppRoute {
             process_path: r"C:\Apps\Browser.exe".into(),
             process_name: Some("Browser.exe".into()),

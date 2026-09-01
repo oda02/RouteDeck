@@ -73,7 +73,7 @@ pub enum ProofState {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProofRow {
     pub kind: ProofKind,
@@ -225,8 +225,66 @@ struct RuntimeServices {
 }
 
 struct PendingImport {
-    id: String,
     report: ImportReport,
+}
+
+const MAX_PENDING_IMPORT_PREVIEWS: usize = 4;
+
+struct PreviewSlot<'a> {
+    state: &'a Mutex<State>,
+    active: bool,
+}
+
+impl<'a> PreviewSlot<'a> {
+    fn reserve(state: &'a Mutex<State>) -> Result<Self, PublicError> {
+        let mut locked = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let occupied = locked.pending.len().saturating_add(locked.preview_inflight);
+        if occupied >= MAX_PENDING_IMPORT_PREVIEWS {
+            return Err(PublicError::fixed(
+                PublicErrorCode::ImportRejected,
+                PublicErrorStage::Import,
+                "Too many import previews are awaiting processing, confirmation, or discard",
+            ));
+        }
+        locked.preview_inflight += 1;
+        drop(locked);
+        Ok(Self {
+            state,
+            active: true,
+        })
+    }
+
+    fn commit(mut self, preview_id: String, report: ImportReport) -> Result<(), PublicError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.preview_inflight = state.preview_inflight.saturating_sub(1);
+        self.active = false;
+        if state.pending.contains_key(&preview_id) {
+            return Err(PublicError::fixed(
+                PublicErrorCode::RuntimeFailure,
+                PublicErrorStage::Import,
+                "Could not allocate a unique import preview token",
+            ));
+        }
+        state.pending.insert(preview_id, PendingImport { report });
+        Ok(())
+    }
+}
+
+impl Drop for PreviewSlot<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.preview_inflight = state.preview_inflight.saturating_sub(1);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -254,7 +312,8 @@ struct ActiveSession {
 #[derive(Default)]
 struct State {
     nodes: HashMap<String, StoredNode>,
-    pending: Option<PendingImport>,
+    pending: HashMap<String, PendingImport>,
+    preview_inflight: usize,
     active: Option<ActiveSession>,
     status: RuntimeStatus,
     recovery_required: bool,
@@ -337,6 +396,7 @@ impl ApplicationController {
     }
 
     pub fn preview_import_content(&self, content: String) -> Result<ImportPreview, PublicError> {
+        let slot = PreviewSlot::reserve(&self.state)?;
         let report = import_subscription(content.as_bytes()).map_err(|error| {
             PublicError::with_detail(
                 PublicErrorCode::ImportRejected,
@@ -348,28 +408,15 @@ impl ApplicationController {
         let preview_id =
             random_hex(16).map_err(|error| public_runtime_error(error, &Redactor::default()))?;
         let preview = preview_from_report(&preview_id, &report);
-        let mut state = self.lock_state();
-        state.pending = Some(PendingImport {
-            id: preview_id,
-            report,
-        });
+        slot.commit(preview_id, report)?;
         Ok(preview)
     }
 
     pub fn discard_import_preview(&self, preview_id: &str) -> Result<(), PublicError> {
         let discarded = {
             let mut state = self.lock_state();
-            let Some(pending) = state.pending.as_ref() else {
-                return Ok(());
-            };
-            if !constant_time_token_eq(&pending.id, preview_id) {
-                return Err(PublicError::fixed(
-                    PublicErrorCode::PreviewTokenInvalid,
-                    PublicErrorStage::Import,
-                    "Import preview token is invalid",
-                ));
-            }
-            state.pending.take()
+            matching_pending_key(&state.pending, preview_id)
+                .and_then(|key| state.pending.remove(&key))
         };
         drop(discarded);
         Ok(())
@@ -377,21 +424,41 @@ impl ApplicationController {
 
     pub fn confirm_import(&self, preview_id: &str) -> Result<ConfirmedImport, PublicError> {
         let mut state = self.lock_state();
-        let pending = state.pending.take().ok_or_else(|| {
+        if state.recovery_required {
+            return Err(PublicError::fixed(
+                PublicErrorCode::RecoveryRequired,
+                PublicErrorStage::Import,
+                "Import replacement is blocked until session recovery completes",
+            ));
+        }
+        if state.active.is_some() {
+            return Err(PublicError::fixed(
+                PublicErrorCode::ActiveSessionConflict,
+                PublicErrorStage::Import,
+                "Stop the active local proxy before replacing imported nodes",
+            ));
+        }
+        if state.pending.is_empty() {
+            return Err(PublicError::fixed(
+                PublicErrorCode::PreviewMissing,
+                PublicErrorStage::Import,
+                "No import preview is pending",
+            ));
+        }
+        let key = matching_pending_key(&state.pending, preview_id).ok_or_else(|| {
+            PublicError::fixed(
+                PublicErrorCode::PreviewTokenInvalid,
+                PublicErrorStage::Import,
+                "Import preview token is invalid",
+            )
+        })?;
+        let pending = state.pending.remove(&key).ok_or_else(|| {
             PublicError::fixed(
                 PublicErrorCode::PreviewMissing,
                 PublicErrorStage::Import,
                 "No import preview is pending",
             )
         })?;
-        if !constant_time_token_eq(&pending.id, preview_id) {
-            state.pending = Some(pending);
-            return Err(PublicError::fixed(
-                PublicErrorCode::PreviewTokenInvalid,
-                PublicErrorStage::Import,
-                "Import preview token is invalid",
-            ));
-        }
         let prepared = pending
             .report
             .nodes
@@ -413,9 +480,7 @@ impl ApplicationController {
             .iter()
             .map(|(node_id, _)| node_id.clone())
             .collect::<Vec<_>>();
-        for (node_id, stored) in prepared {
-            state.nodes.insert(node_id, stored);
-        }
+        state.nodes = prepared.into_iter().collect();
         Ok(ConfirmedImport {
             imported: node_ids.len(),
             node_ids,
@@ -425,8 +490,9 @@ impl ApplicationController {
     pub fn start_local_proxy(
         &self,
         node_id: &str,
-        default_route: DefaultRoute,
+        _default_route: DefaultRoute,
     ) -> Result<RuntimeStatus, PublicError> {
+        let effective_route = DefaultRoute::Vpn;
         let _operation = self
             .operation
             .lock()
@@ -456,14 +522,14 @@ impl ApplicationController {
         if state.active.is_some() {
             let exact = state.active.as_ref().is_some_and(|active| {
                 active.node_id == node_id
-                    && active.default_route == default_route
+                    && active.default_route == effective_route
                     && active.config_identity == stored.config_identity
             });
             if !exact {
                 return Err(PublicError::fixed(
                     PublicErrorCode::ActiveSessionConflict,
                     PublicErrorStage::Start,
-                    "Stop the active local proxy before changing node, route, or node revision",
+                    "Stop the active local proxy before changing node or node revision",
                 ));
             }
             let route = {
@@ -471,16 +537,21 @@ impl ApplicationController {
                 if !active.child.is_alive().unwrap_or(false) {
                     None
                 } else {
-                    Some(active.health_route.clone())
+                    Some((active.health_route.clone(), active.ports.http))
                 }
             };
             drop(state);
-            let validation = route.map(|route| self.services.prober.prove(&route));
+            let validation = route.map(|(route, http_port)| {
+                self.services
+                    .prober
+                    .prove(&route)
+                    .and_then(|_| self.services.prober.prove_ordinary(http_port))
+            });
             state = self.lock_state();
             if let Some(Ok(proof)) = validation {
                 if !state.active.as_ref().is_some_and(|active| {
                     active.node_id == node_id
-                        && active.default_route == default_route
+                        && active.default_route == effective_route
                         && active.config_identity == stored.config_identity
                 }) {
                     return Err(PublicError::fixed(
@@ -591,7 +662,7 @@ impl ApplicationController {
             &mut state,
             &node,
             config_identity,
-            default_route,
+            effective_route,
             redactor.clone(),
         );
         if let Err(error) = result {
@@ -682,9 +753,9 @@ impl ApplicationController {
         let ports = reservations.ports();
         let password = random_hex(24)?;
         let policy = RoutePolicy {
-            default: default_route,
+            default: DefaultRoute::Vpn,
             apps: Vec::new(),
-            lan: LanPolicy::Direct,
+            lan: LanPolicy::FollowDefault,
             ipv6: Ipv6Policy::Enabled,
             dns: DnsPolicy::CurrentNetwork,
         };
@@ -781,7 +852,11 @@ impl ApplicationController {
             Some(node.id().to_owned()),
             None,
         );
-        let proof = self.services.prober.prove(&health_route)?;
+        // The private authenticated health inbound must work first. The public proof row below
+        // is only passed after an ordinary request traverses the same selected outbound via the
+        // user-facing loopback HTTP inbound.
+        self.services.prober.prove(&health_route)?;
+        let proof = self.services.prober.prove_ordinary(ports.http)?;
         Self::set_proof(
             state,
             ProofKind::SelectedOutboundHttps,
@@ -964,11 +1039,15 @@ impl ApplicationController {
             generation: String,
             session_id: String,
             route: HealthRoute,
+            http_port: u16,
             redactor: Redactor,
             node_id: String,
         }
 
         let mut state = self.lock_state();
+        if state.recovery_required || state.status.phase == RuntimePhase::RecoveryRequired {
+            return;
+        }
         let Some(active) = state.active.as_mut() else {
             return;
         };
@@ -1022,13 +1101,21 @@ impl ApplicationController {
             generation: active.generation.clone(),
             session_id: active.session_id.clone(),
             route: active.health_route.clone(),
+            http_port: active.ports.http,
             redactor: active.redactor.clone(),
             node_id: active.node_id.clone(),
         };
         drop(state);
 
-        let proof = self.services.prober.prove(&snapshot.route);
+        let proof = self
+            .services
+            .prober
+            .prove(&snapshot.route)
+            .and_then(|_| self.services.prober.prove_ordinary(snapshot.http_port));
         state = self.lock_state();
+        if state.recovery_required || state.status.phase == RuntimePhase::RecoveryRequired {
+            return;
+        }
         let Some(active) = state.active.as_mut().filter(|active| {
             active.generation == snapshot.generation && active.session_id == snapshot.session_id
         }) else {
@@ -1110,13 +1197,14 @@ impl ApplicationController {
                 active.consecutive_probe_failures =
                     active.consecutive_probe_failures.saturating_add(1);
                 let threshold_reached = active.consecutive_probe_failures >= 2;
-                Self::set_proof(
-                    &mut state,
-                    ProofKind::SelectedOutboundHttps,
-                    ProofState::Failed,
-                    None,
-                );
                 if threshold_reached {
+                    state.status.route_check_ms = None;
+                    Self::set_proof(
+                        &mut state,
+                        ProofKind::SelectedOutboundHttps,
+                        ProofState::Failed,
+                        None,
+                    );
                     let public = public_runtime_error(error, &snapshot.redactor);
                     self.update_status(
                         &mut state,
@@ -1226,11 +1314,15 @@ fn preview_from_report(preview_id: &str, report: &ImportReport) -> ImportPreview
         nodes: report
             .nodes
             .iter()
-            .map(|node| PreviewNode {
-                id: node.id().to_owned(),
-                display_name: node.display_name().to_owned(),
-                protocol: node.protocol_kind(),
-                insecure_tls: node.requires_insecure_approval(),
+            .enumerate()
+            .map(|(index, node)| {
+                let protocol = node.protocol_kind();
+                PreviewNode {
+                    id: node.id().to_owned(),
+                    display_name: safe_preview_name(node, protocol, index),
+                    protocol,
+                    insecure_tls: node.requires_insecure_approval(),
+                }
             })
             .collect(),
         rejected: report
@@ -1247,6 +1339,33 @@ fn preview_from_report(preview_id: &str, report: &ImportReport) -> ImportPreview
             .map(|warning| (*warning).into())
             .collect(),
     }
+}
+
+fn safe_preview_name(node: &Node, protocol: ProtocolKind, index: usize) -> String {
+    let display_name = node.display_name();
+    if display_name
+        .to_lowercase()
+        .contains(&node.server().to_lowercase())
+    {
+        let label = match protocol {
+            ProtocolKind::Vless => "VLESS",
+            ProtocolKind::Hysteria2 => "Hysteria2",
+            ProtocolKind::Naive => "Naive",
+        };
+        format!("{label} server {}", index + 1)
+    } else {
+        display_name.to_owned()
+    }
+}
+
+fn matching_pending_key(
+    pending: &HashMap<String, PendingImport>,
+    preview_id: &str,
+) -> Option<String> {
+    pending
+        .keys()
+        .find(|candidate| constant_time_token_eq(candidate, preview_id))
+        .cloned()
 }
 
 fn default_proofs() -> Vec<ProofRow> {
@@ -1345,7 +1464,7 @@ fn constant_time_token_eq(left: &str, right: &str) -> bool {
 mod tests {
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc, Condvar,
+        mpsc, Barrier, Condvar,
     };
 
     use super::*;
@@ -1570,6 +1689,21 @@ mod tests {
         }
     }
 
+    struct OrdinaryFailProber;
+
+    impl TrafficProber for OrdinaryFailProber {
+        fn prove(&self, _route: &HealthRoute) -> Result<ProofResult, RuntimeError> {
+            Ok(ProofResult { latency_ms: 21 })
+        }
+
+        fn prove_ordinary(&self, _http_port: u16) -> Result<ProofResult, RuntimeError> {
+            Err(RuntimeError::new(
+                "prove_traffic",
+                "fixture ordinary proxy route failed",
+            ))
+        }
+    }
+
     struct BlockingProber {
         calls: AtomicUsize,
         gate: Arc<(Mutex<(bool, bool)>, Condvar)>,
@@ -1577,7 +1711,8 @@ mod tests {
 
     impl TrafficProber for BlockingProber {
         fn prove(&self, _route: &HealthRoute) -> Result<ProofResult, RuntimeError> {
-            if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+            // Startup proves both the private health inbound and the ordinary HTTP inbound.
+            if self.calls.fetch_add(1, Ordering::SeqCst) > 1 {
                 let (lock, wake) = &*self.gate;
                 let mut flags = lock.lock().unwrap();
                 flags.0 = true;
@@ -1785,6 +1920,19 @@ mod tests {
     }
 
     #[test]
+    fn private_health_success_cannot_hide_ordinary_proxy_failure() {
+        let (controller, stops, _) = controller_with_prober(Arc::new(OrdinaryFailProber));
+        let node = import_node(&controller);
+        let error = controller
+            .start_local_proxy(&node, DefaultRoute::Vpn)
+            .unwrap_err();
+        assert_eq!(error.stage, PublicErrorStage::ProveTraffic);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert_ne!(controller.status().phase, RuntimePhase::LocalProxyReady);
+        assert_eq!(controller.status().route_check_ms, None);
+    }
+
+    #[test]
     fn successful_proof_is_the_only_path_to_local_proxy_ready_and_stop_is_idempotent() {
         let (controller, stops, _) = controller(false, true, true);
         let node = import_node(&controller);
@@ -1820,10 +1968,10 @@ mod tests {
     fn import_preview_discard_is_exact_and_idempotent() {
         let (controller, _, _) = controller(false, true, true);
         let preview = controller.preview_import_content(NODE.into()).unwrap();
-        let mismatch = controller
+        controller
             .discard_import_preview("00000000000000000000000000000000")
-            .unwrap_err();
-        assert_eq!(mismatch.code, PublicErrorCode::PreviewTokenInvalid);
+            .unwrap();
+        assert_eq!(controller.lock_state().pending.len(), 1);
         controller
             .discard_import_preview(&preview.preview_id)
             .unwrap();
@@ -1835,12 +1983,188 @@ mod tests {
     }
 
     #[test]
+    fn repeated_discard_does_not_touch_another_pending_preview() {
+        let (controller, _, _) = controller(false, true, true);
+        let first = controller.preview_import_content(NODE.into()).unwrap();
+        let second = controller
+            .preview_import_content(
+                "hysteria2://second-secret@second.test:443?sni=cover.test#second".into(),
+            )
+            .unwrap();
+        controller
+            .discard_import_preview(&first.preview_id)
+            .unwrap();
+        controller
+            .discard_import_preview(&first.preview_id)
+            .unwrap();
+        assert!(controller
+            .lock_state()
+            .pending
+            .contains_key(&second.preview_id));
+    }
+
+    #[test]
     fn import_preview_omits_raw_server_authority() {
         let (controller, _, _) = controller(false, true, true);
         let preview = controller.preview_import_content(NODE.into()).unwrap();
         let serialized = serde_json::to_string(&preview).unwrap();
         assert!(!serialized.contains("example.test"));
         assert!(serialized.contains("fixture"));
+    }
+
+    #[test]
+    fn import_preview_masks_authority_fallbacks_without_user_labels() {
+        let (controller, _, _) = controller(false, true, true);
+        for content in [
+            "hysteria2://fixture-secret@raw-share-authority.test:443?sni=cover.test",
+            r#"{"type":"hysteria2","server":"raw-json-authority.test","server_port":443,"password":"fixture-secret","tls":{"enabled":true,"server_name":"cover.test"}}"#,
+        ] {
+            let preview = controller.preview_import_content(content.into()).unwrap();
+            let serialized = serde_json::to_string(&preview).unwrap();
+            assert!(!serialized.contains("raw-share-authority.test"));
+            assert!(!serialized.contains("raw-json-authority.test"));
+            assert_eq!(preview.nodes[0].display_name, "Hysteria2 server 1");
+            controller
+                .discard_import_preview(&preview.preview_id)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn pending_previews_are_token_indexed_and_bounded() {
+        let (controller, _, _) = controller(false, true, true);
+        let mut previews = Vec::new();
+        for index in 0..MAX_PENDING_IMPORT_PREVIEWS {
+            previews.push(
+                controller
+                    .preview_import_content(format!(
+                        "hysteria2://fixture-{index}@server-{index}.test:443?sni=cover.test"
+                    ))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            controller.lock_state().pending.len(),
+            MAX_PENDING_IMPORT_PREVIEWS
+        );
+        let overflow = controller.preview_import_content(NODE.into()).unwrap_err();
+        assert_eq!(overflow.code, PublicErrorCode::ImportRejected);
+        controller
+            .discard_import_preview(&previews[1].preview_id)
+            .unwrap();
+        assert!(
+            controller
+                .confirm_import(&previews[0].preview_id)
+                .unwrap()
+                .imported
+                > 0
+        );
+        assert_eq!(
+            controller.lock_state().pending.len(),
+            MAX_PENDING_IMPORT_PREVIEWS - 2
+        );
+    }
+
+    #[test]
+    fn inflight_preview_slots_reject_overload_before_parsing() {
+        let (controller, _, _) = controller(false, true, true);
+        let controller = Arc::new(controller);
+        let ready = Arc::new(Barrier::new(MAX_PENDING_IMPORT_PREVIEWS + 1));
+        let release = Arc::new(Barrier::new(MAX_PENDING_IMPORT_PREVIEWS + 1));
+        let reserved = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..MAX_PENDING_IMPORT_PREVIEWS {
+            let controller = controller.clone();
+            let ready = ready.clone();
+            let release = release.clone();
+            let reserved = reserved.clone();
+            workers.push(thread::spawn(move || {
+                let _slot = PreviewSlot::reserve(&controller.state).unwrap();
+                reserved.fetch_add(1, Ordering::SeqCst);
+                ready.wait();
+                release.wait();
+            }));
+        }
+        ready.wait();
+        assert_eq!(reserved.load(Ordering::SeqCst), MAX_PENDING_IMPORT_PREVIEWS);
+        assert_eq!(
+            controller.lock_state().preview_inflight,
+            MAX_PENDING_IMPORT_PREVIEWS
+        );
+        let overload = controller.preview_import_content(NODE.into()).unwrap_err();
+        assert_eq!(overload.code, PublicErrorCode::ImportRejected);
+        release.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(controller.lock_state().preview_inflight, 0);
+        let preview = controller.preview_import_content(NODE.into()).unwrap();
+        controller
+            .discard_import_preview(&preview.preview_id)
+            .unwrap();
+        assert!(controller
+            .preview_import_content("not a subscription".into())
+            .is_err());
+        assert_eq!(controller.lock_state().preview_inflight, 0);
+    }
+
+    #[test]
+    fn concurrent_preview_results_can_be_resolved_out_of_order() {
+        let (controller, _, _) = controller(false, true, true);
+        let controller = Arc::new(controller);
+        let first = {
+            let controller = controller.clone();
+            thread::spawn(move || {
+                controller
+                    .preview_import_content(
+                        "hysteria2://first-secret@first.test:443?sni=cover.test#first".into(),
+                    )
+                    .unwrap()
+            })
+        };
+        let second = {
+            let controller = controller.clone();
+            thread::spawn(move || {
+                controller
+                    .preview_import_content(
+                        "hysteria2://second-secret@second.test:443?sni=cover.test#second".into(),
+                    )
+                    .unwrap()
+            })
+        };
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert_eq!(controller.lock_state().pending.len(), 2);
+        assert_eq!(
+            controller
+                .confirm_import(&second.preview_id)
+                .unwrap()
+                .imported,
+            1
+        );
+        controller
+            .discard_import_preview(&first.preview_id)
+            .unwrap();
+        assert!(controller.lock_state().pending.is_empty());
+    }
+
+    #[test]
+    fn confirmed_import_atomically_replaces_obsolete_nodes() {
+        let (controller, _, _) = controller(false, true, true);
+        let obsolete = import_node(&controller);
+        let replacement = controller
+            .preview_import_content(
+                "hysteria2://replacement-secret@replacement.test:443?sni=cover.test#replacement"
+                    .into(),
+            )
+            .unwrap();
+        let confirmed = controller.confirm_import(&replacement.preview_id).unwrap();
+        assert_eq!(controller.lock_state().nodes.len(), 1);
+        assert_ne!(confirmed.node_ids[0], obsolete);
+        let error = controller
+            .start_local_proxy(&obsolete, DefaultRoute::Vpn)
+            .unwrap_err();
+        assert_eq!(error.code, PublicErrorCode::NodeNotFound);
     }
 
     #[test]
@@ -1914,6 +2238,27 @@ mod tests {
     }
 
     #[test]
+    fn recovery_required_is_sticky_across_monitor_ticks() {
+        let controller = controller_with_stop_failure();
+        let node = import_node(&controller);
+        controller
+            .start_local_proxy(&node, DefaultRoute::Vpn)
+            .unwrap();
+        controller.stop().unwrap_err();
+        let before = controller.status();
+        {
+            let mut state = controller.lock_state();
+            state.active.as_mut().unwrap().last_probe = Instant::now() - Duration::from_secs(11);
+        }
+        controller.monitor_tick();
+        let after = controller.status();
+        assert_eq!(after.phase, RuntimePhase::RecoveryRequired);
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.proofs, before.proofs);
+        assert!(controller.lock_state().active.is_some());
+    }
+
+    #[test]
     fn listener_failure_with_uncertain_rollback_retains_supervision() {
         let controller = controller_with_start_rollback_failure(false, true);
         let node = import_node(&controller);
@@ -1963,7 +2308,7 @@ mod tests {
     }
 
     #[test]
-    fn crash_data_preserves_ui_startup_and_blocks_only_connect_until_reviewed() {
+    fn crash_data_preserves_ui_startup_and_blocks_import_replacement_until_reviewed() {
         let root = std::env::temp_dir().join(format!(
             "routedeck-recovery-controller-{}",
             random_hex(8).expect("test random")
@@ -1973,11 +2318,10 @@ mod tests {
         std::fs::write(stale.join("config.json"), b"fixture-secret").unwrap();
         let controller = ApplicationController::production(root.clone(), Arc::new(|_| {})).unwrap();
         assert_eq!(controller.status().phase, RuntimePhase::RecoveryRequired);
-        let node = import_node(&controller);
-        let error = controller
-            .start_local_proxy(&node, DefaultRoute::Vpn)
-            .unwrap_err();
-        assert_eq!(error.stage, PublicErrorStage::SessionRecovery);
+        let preview = controller.preview_import_content(NODE.into()).unwrap();
+        let error = controller.confirm_import(&preview.preview_id).unwrap_err();
+        assert_eq!(error.code, PublicErrorCode::RecoveryRequired);
+        assert_eq!(error.stage, PublicErrorStage::Import);
         assert!(controller.retry_session_recovery().is_err());
         assert!(stale.join("config.json").exists());
 
@@ -1986,6 +2330,13 @@ mod tests {
         assert_eq!(
             controller.retry_session_recovery().unwrap().phase,
             RuntimePhase::Disconnected
+        );
+        assert_eq!(
+            controller
+                .confirm_import(&preview.preview_id)
+                .unwrap()
+                .imported,
+            1
         );
         drop(controller);
         std::fs::remove_dir(root).unwrap();
@@ -2000,13 +2351,33 @@ mod tests {
         controller
             .start_local_proxy(&node, DefaultRoute::Vpn)
             .unwrap();
+        let ready = controller.status();
         proof_enabled.store(false, Ordering::SeqCst);
-        for expected_phase in [RuntimePhase::LocalProxyReady, RuntimePhase::Degraded] {
-            controller.lock_state().active.as_mut().unwrap().last_probe =
-                Instant::now() - Duration::from_secs(11);
-            controller.monitor_tick();
-            assert_eq!(controller.status().phase, expected_phase);
-        }
+        controller.lock_state().active.as_mut().unwrap().last_probe =
+            Instant::now() - Duration::from_secs(11);
+        controller.monitor_tick();
+        let first_failure = controller.status();
+        assert_eq!(first_failure.phase, RuntimePhase::LocalProxyReady);
+        assert_eq!(first_failure.revision, ready.revision);
+        assert_eq!(first_failure.proofs, ready.proofs);
+        assert_eq!(first_failure.route_check_ms, ready.route_check_ms);
+
+        controller.lock_state().active.as_mut().unwrap().last_probe =
+            Instant::now() - Duration::from_secs(11);
+        controller.monitor_tick();
+        let degraded = controller.status();
+        assert_eq!(degraded.phase, RuntimePhase::Degraded);
+        assert!(degraded.revision > ready.revision);
+        assert_eq!(degraded.route_check_ms, None);
+        assert_eq!(
+            degraded
+                .proofs
+                .iter()
+                .find(|proof| proof.kind == ProofKind::SelectedOutboundHttps)
+                .unwrap()
+                .state,
+            ProofState::Failed
+        );
         proof_enabled.store(true, Ordering::SeqCst);
         controller.lock_state().active.as_mut().unwrap().last_probe =
             Instant::now() - Duration::from_secs(11);
@@ -2058,17 +2429,25 @@ mod tests {
     }
 
     #[test]
-    fn idempotency_requires_exact_route_identity() {
+    fn renderer_route_draft_is_ignored_for_local_proxy() {
         let (controller, _, _) = controller(false, true, true);
         let node = import_node(&controller);
         controller
             .start_local_proxy(&node, DefaultRoute::Vpn)
             .unwrap();
-        let error = controller
+        let status = controller
             .start_local_proxy(&node, DefaultRoute::Direct)
-            .unwrap_err();
-        assert_eq!(error.stage, PublicErrorStage::Start);
-        assert_eq!(controller.status().phase, RuntimePhase::LocalProxyReady);
+            .unwrap();
+        assert_eq!(status.phase, RuntimePhase::LocalProxyReady);
+        assert_eq!(
+            controller
+                .lock_state()
+                .active
+                .as_ref()
+                .unwrap()
+                .default_route,
+            DefaultRoute::Vpn
+        );
     }
 
     #[test]
@@ -2079,13 +2458,14 @@ mod tests {
             .start_local_proxy(&node, DefaultRoute::Vpn)
             .unwrap();
         let repeated = controller.preview_import_content(NODE.into()).unwrap();
-        controller.confirm_import(&repeated.preview_id).unwrap();
-        let error = controller
-            .start_local_proxy(&node, DefaultRoute::Vpn)
-            .unwrap_err();
+        let error = controller.confirm_import(&repeated.preview_id).unwrap_err();
         assert_eq!(error.code, PublicErrorCode::ActiveSessionConflict);
         let status = controller.status();
         assert_eq!(status.phase, RuntimePhase::LocalProxyReady);
         assert_eq!(status.session_id, first.session_id);
+        assert!(controller
+            .lock_state()
+            .pending
+            .contains_key(&repeated.preview_id));
     }
 }
