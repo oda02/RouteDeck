@@ -708,12 +708,25 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
 
 function Dialog({ title, description, focusKey, onClose, closeDisabled = false, children, actions }: { title: string; description?: string; focusKey?: string; onClose: () => void; closeDisabled?: boolean; children: ReactNode; actions: ReactNode }) {
   const dialogRef = useRef<HTMLDivElement>(null);
+  const previouslyFocusedRef = useRef<HTMLElement | null>(null);
+
   useEffect(() => {
-    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    previouslyFocusedRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    return () => previouslyFocusedRef.current?.focus({ preventScroll: true });
+  }, []);
+
+  useEffect(() => {
     const dialog = dialogRef.current;
-    const focusable = dialog?.querySelector<HTMLElement>("[data-autofocus]")
+    const focusable = closeDisabled
+      ? dialog?.querySelector<HTMLElement>("[data-dialog-busy-focus]")
+      : dialog?.querySelector<HTMLElement>("[data-autofocus]")
       ?? dialog?.querySelector<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)");
-    window.requestAnimationFrame(() => focusable?.focus());
+    const frame = window.requestAnimationFrame(() => focusable?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [closeDisabled, focusKey]);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
@@ -729,11 +742,8 @@ function Dialog({ title, description, focusKey, onClose, closeDisabled = false, 
       if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     };
     document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("keydown", onKeyDown);
-      previouslyFocused?.focus({ preventScroll: true });
-    };
-  }, [closeDisabled, focusKey, onClose]);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [closeDisabled, onClose]);
 
   return (
     <div className="dialog-scrim" role="presentation">
@@ -1111,7 +1121,7 @@ export default function App() {
           {subscriptionPreview ? (
             <section className="import-preview" aria-live="polite">
               {importError ? <p id="import-error" className="field-error" role="alert">{importError}</p> : null}
-              {confirmingImport ? <p className="persistent-hint" role="status"><InfoIcon size={17} />Импорт подтверждается локальным контроллером. Дождитесь результата — окно закроется только после согласования списка серверов.</p> : null}
+              {confirmingImport ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={0} data-dialog-busy-focus><InfoIcon size={17} />Импорт подтверждается локальным контроллером. Дождитесь результата — окно закроется только после согласования списка серверов.</p> : null}
               <p className="overline">Предпросмотр · данные ещё не сохранены</p>
               <h3>Найдено поддерживаемых узлов</h3>
               <p className="preview-source">Источник: {subscriptionPreview.sourceLabel}</p>

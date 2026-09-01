@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import { selectControllerRuntime } from "../src/runtimeSelection.ts";
@@ -42,6 +43,14 @@ test("release selection can never choose the demo controller", () => {
   assert.equal(selectControllerRuntime({ explicitDemo: true, isDevelopment: false, tauriIpcAvailable: true }), "tauri");
   assert.equal(selectControllerRuntime({ explicitDemo: true, isDevelopment: false, tauriIpcAvailable: false }), "unavailable");
   assert.equal(selectControllerRuntime({ explicitDemo: true, isDevelopment: true, tauriIpcAvailable: true }), "demo");
+});
+
+test("non-dismissible import keeps focus inside the mounted dialog", () => {
+  const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  assert.match(source, /previouslyFocusedRef\.current = document\.activeElement[\s\S]*return \(\) => previouslyFocusedRef\.current\?\.focus\([\s\S]*\}, \[\]\);/);
+  assert.match(source, /data-dialog-busy-focus/);
+  assert.match(source, /role="status" aria-live="polite" tabIndex=\{0\} data-dialog-busy-focus/);
+  assert.doesNotMatch(source, /previouslyFocused\?\.focus/);
 });
 
 test("local-only readiness never maps to global Connected", () => {
