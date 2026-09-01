@@ -56,4 +56,4 @@ Use `npm run tauri dev` only after dependencies have been reviewed and installed
 
 The first deliverable is a directory containing the RouteDeck executable, the reviewed `sing-box.exe`, its required companion files (including `libcronet.dll` when Naive is enabled), licenses, and configuration templates. `tauri build --no-bundle` produces the application executable without an installer. Distribution assembly and binary verification will be separate, explicit steps; the frontend build never downloads binaries.
 
-See [ADR-0001](docs/adr/0001-portable-system-proxy-and-uac-tun.md) for the privilege model.
+See [ADR-0001](docs/adr/0001-portable-system-proxy-and-uac-tun.md) for the privilege model. Public portable assembly is deliberately fail-closed; the [portable compliance evidence plan](docs/portable-compliance-plan.md) records the unresolved notice/source blockers and the reproducible gate required before distribution.
