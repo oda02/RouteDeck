@@ -58,6 +58,17 @@ test("non-dismissible import keeps focus inside the mounted dialog", () => {
   assert.doesNotMatch(source, /previouslyFocused\?\.focus/);
 });
 
+test("URL import failure focuses the enabled field before generic dialog autofocus", () => {
+  const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const errorTarget = source.indexOf('querySelector<HTMLElement>("[data-error-autofocus]:not(:disabled)")');
+  const genericTarget = source.indexOf('querySelector<HTMLElement>("[data-autofocus]")', errorTarget);
+  assert.ok(errorTarget >= 0 && genericTarget > errorTarget);
+  assert.match(source, /data-error-autofocus=\{importError \? "true" : undefined\}/);
+  assert.match(source, /focusKey=\{subscriptionPreview \? "preview" : `source-\$\{importMethod\}`\}/);
+  assert.doesNotMatch(source, /focusKey=\{[^\n]*importError/);
+  assert.match(source, /setImportError\(publicError\.message\);\s*if \(sourceType !== "url"\) focusImportInput\(\);/);
+});
+
 test("URL input is masked and cleared before the async preview action", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   assert.match(source, /id="subscription-url" type=\{subscriptionVisible \? "text" : "password"\}/);

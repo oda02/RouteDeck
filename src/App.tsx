@@ -683,7 +683,8 @@ function Dialog({ title, description, focusKey, onClose, busy = false, closeDisa
     const dialog = dialogRef.current;
     const focusable = busy || closeDisabled
       ? dialog?.querySelector<HTMLElement>("[data-dialog-busy-focus]")
-      : dialog?.querySelector<HTMLElement>("[data-autofocus]")
+      : dialog?.querySelector<HTMLElement>("[data-error-autofocus]:not(:disabled)")
+      ?? dialog?.querySelector<HTMLElement>("[data-autofocus]")
       ?? dialog?.querySelector<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)");
     const frame = window.requestAnimationFrame(() => focusable?.focus());
     return () => window.cancelAnimationFrame(frame);
@@ -721,7 +722,8 @@ function Dialog({ title, description, focusKey, onClose, busy = false, closeDisa
       if (!dialog || dialog.contains(event.target as Node | null)) return;
       const target = busy || closeDisabled
         ? dialog.querySelector<HTMLElement>("[data-dialog-busy-focus]")
-        : dialog.querySelector<HTMLElement>("[data-autofocus]")
+        : dialog.querySelector<HTMLElement>("[data-error-autofocus]:not(:disabled)")
+        ?? dialog.querySelector<HTMLElement>("[data-autofocus]")
         ?? dialog.querySelector<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)");
       target?.focus({ preventScroll: true });
     };
@@ -1021,7 +1023,7 @@ export default function App() {
           clearSubscriptionUrl();
         }
         setImportError(publicError.message);
-        focusImportInput();
+        if (sourceType !== "url") focusImportInput();
       },
       onSuccess: (preview) => {
         if (generation !== importGeneration.current) return;
@@ -1115,7 +1117,7 @@ export default function App() {
         <Dialog
           title="Импорт подписки"
           description="RouteDeck импортирует только поддерживаемые узлы и не выполняет чужие команды или настройки."
-          focusKey={subscriptionPreview ? "preview" : "source"}
+          focusKey={subscriptionPreview ? "preview" : `source-${importMethod}`}
           onClose={closeDialog}
           busy={importing}
           closeDisabled={confirmingImport}
@@ -1147,7 +1149,7 @@ export default function App() {
             />
             {importing ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><LoaderIcon size={17} />{importMethod === "url" ? "Безопасно загружаем подписку по HTTPS…" : "Проверяем содержимое подписки…"}</p> : null}
             {importMethod === "url" ? (
-              <div className="dialog-field"><label htmlFor="subscription-url">HTTPS URL подписки</label><span className="secret-input"><input ref={subscriptionInputRef} id="subscription-url" type={subscriptionVisible ? "text" : "password"} autoComplete="off" defaultValue="" disabled={importing} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-help"} placeholder="https://provider.example/••••" onInput={() => setImportError("")} /><button className="icon-button" type="button" disabled={importing} aria-label={subscriptionVisible ? "Скрыть URL" : "Показать URL"} title={subscriptionVisible ? "Скрыть URL" : "Показать URL"} onClick={() => setSubscriptionVisible((visible) => !visible)}><EyeIcon size={18} /></button></span><small id="import-help">Контроллер загрузит подписку по HTTPS, заблокирует опасные перенаправления и локальные адреса. URL очищается сразу после запуска и не попадает в диагностику.</small>{importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}</div>
+              <div className="dialog-field"><label htmlFor="subscription-url">HTTPS URL подписки</label><span className="secret-input"><input ref={subscriptionInputRef} id="subscription-url" type={subscriptionVisible ? "text" : "password"} autoComplete="off" defaultValue="" disabled={importing} data-error-autofocus={importError ? "true" : undefined} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-help"} placeholder="https://provider.example/••••" onInput={() => setImportError("")} /><button className="icon-button" type="button" disabled={importing} aria-label={subscriptionVisible ? "Скрыть URL" : "Показать URL"} title={subscriptionVisible ? "Скрыть URL" : "Показать URL"} onClick={() => setSubscriptionVisible((visible) => !visible)}><EyeIcon size={18} /></button></span><small id="import-help">Контроллер загрузит подписку по HTTPS, заблокирует опасные перенаправления и локальные адреса. URL очищается сразу после запуска и не попадает в диагностику.</small>{importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}</div>
             ) : (
               <div className="method-placeholder compact-placeholder">
                 <ImportIcon size={24} />
