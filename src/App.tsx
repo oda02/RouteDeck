@@ -969,13 +969,11 @@ export default function App() {
       onError: (publicError) => {
         if (generation !== importGeneration.current) return;
         setImportError(publicError.message);
-        focusImportInput();
       },
       onSuccess: (value) => {
         if (generation !== importGeneration.current) return;
         setClipboardSource(value);
         setImportError(value.trim() ? "" : "Буфер обмена пуст.");
-        if (!value.trim()) focusImportInput();
       },
     });
   };
@@ -1023,7 +1021,6 @@ export default function App() {
           clearSubscriptionUrl();
         }
         setImportError(publicError.message);
-        if (sourceType !== "url") focusImportInput();
       },
       onSuccess: (preview) => {
         if (generation !== importGeneration.current) return;
@@ -1123,7 +1120,7 @@ export default function App() {
           closeDisabled={confirmingImport}
           actions={subscriptionPreview ? <>
             <button className="secondary-button" type="button" data-autofocus disabled={confirmingImport} onClick={() => { invalidateImport(); setSubscriptionPreview(null); setImportError(""); }}>Назад</button>
-            <button className="primary-button dialog-primary" type="button" disabled={importing} aria-busy={importing} onClick={commitImport}>{importing ? <LoaderIcon size={19} /> : <ImportIcon size={19} />}{importing ? "Импортируем…" : "Подтвердить импорт"}</button>
+            <button className="primary-button dialog-primary" type="button" disabled={importing} data-error-autofocus={importError ? "true" : undefined} aria-busy={importing} aria-describedby={importError ? "import-error" : undefined} onClick={commitImport}>{importing ? <LoaderIcon size={19} /> : <ImportIcon size={19} />}{importing ? "Импортируем…" : "Подтвердить импорт"}</button>
           </> : <>
             <button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Отмена</button>
             <button className="primary-button dialog-primary" type="button" disabled={importing || importMethod === "file"} aria-busy={importing} onClick={previewImport}>{importing ? <LoaderIcon size={19} /> : <ImportIcon size={19} />}{importing ? (importMethod === "url" ? "Загружаем по HTTPS…" : "Проверяем содержимое…") : (importMethod === "url" ? "Безопасно загрузить по HTTPS" : "Проверить содержимое")}</button>
@@ -1155,8 +1152,8 @@ export default function App() {
                 <ImportIcon size={24} />
                 <strong>{clipboardSource ? "Подписка прочитана и скрыта" : "Буфер не читается автоматически"}</strong>
                 <p>Нажмите кнопку сами — только это действие запрашивает clipboard API.</p>
-                <button ref={clipboardButtonRef} className="secondary-button full-width" type="button" disabled={importing} onClick={readClipboardSource}>Прочитать буфер обмена</button>
-                {importError ? <small className="field-error" role="alert">{importError}</small> : null}
+                <button ref={clipboardButtonRef} className="secondary-button full-width" type="button" disabled={importing} data-error-autofocus={importError ? "true" : undefined} aria-describedby={importError ? "import-error" : undefined} onClick={readClipboardSource}>Прочитать буфер обмена</button>
+                {importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}
               </div>
             )}
             <p className="file-adapter-note"><InfoIcon size={17} />Локальный файл будет доступен после подключения безопасного Tauri dialog adapter; fake-импорт отключён.</p>

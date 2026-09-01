@@ -58,15 +58,17 @@ test("non-dismissible import keeps focus inside the mounted dialog", () => {
   assert.doesNotMatch(source, /previouslyFocused\?\.focus/);
 });
 
-test("URL import failure focuses the enabled field before generic dialog autofocus", () => {
+test("every import failure focuses its enabled source or recovery control", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const errorTarget = source.indexOf('querySelector<HTMLElement>("[data-error-autofocus]:not(:disabled)")');
   const genericTarget = source.indexOf('querySelector<HTMLElement>("[data-autofocus]")', errorTarget);
   assert.ok(errorTarget >= 0 && genericTarget > errorTarget);
-  assert.match(source, /data-error-autofocus=\{importError \? "true" : undefined\}/);
+  assert.match(source, /id="subscription-url"[^\n]*data-error-autofocus=\{importError \? "true" : undefined\}/);
+  assert.match(source, /ref=\{clipboardButtonRef\}[^\n]*data-error-autofocus=\{importError \? "true" : undefined\}[^\n]*onClick=\{readClipboardSource\}/);
+  assert.match(source, /data-error-autofocus=\{importError \? "true" : undefined\}[^\n]*onClick=\{commitImport\}/);
   assert.match(source, /focusKey=\{subscriptionPreview \? "preview" : `source-\$\{importMethod\}`\}/);
   assert.doesNotMatch(source, /focusKey=\{[^\n]*importError/);
-  assert.match(source, /setImportError\(publicError\.message\);\s*if \(sourceType !== "url"\) focusImportInput\(\);/);
+  assert.equal(source.match(/\bfocusImportInput\(\);/g)?.length, 1, "only synchronous empty-source validation may schedule direct focus");
 });
 
 test("URL input is masked and cleared before the async preview action", () => {
