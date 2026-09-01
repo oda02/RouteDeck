@@ -1,4 +1,6 @@
 import { RouteDeckError } from "./model";
+import { hasTauriIpc, selectControllerRuntime } from "./runtimeSelection";
+import { TauriController } from "./tauriController";
 import type {
   AppNotice,
   ConnectionMode,
@@ -453,6 +455,15 @@ class BackendUnavailableController implements RouteDeckController {
   getSanitizedReport = () => "RouteDeck production report\nbackend=unavailable\nstatus=fail-closed";
 }
 
-export const controller: RouteDeckController = import.meta.env.DEV
+const explicitDemo = ["1", "true"].includes(import.meta.env.VITE_ROUTEDECK_DEMO?.toLowerCase() ?? "");
+const runtimeKind = selectControllerRuntime({
+  explicitDemo,
+  isDevelopment: import.meta.env.DEV,
+  tauriIpcAvailable: hasTauriIpc(typeof window === "undefined" ? undefined : window),
+});
+
+export const controller: RouteDeckController = runtimeKind === "demo"
   ? new DevelopmentDemoController()
-  : new BackendUnavailableController();
+  : runtimeKind === "tauri"
+    ? new TauriController()
+    : new BackendUnavailableController();

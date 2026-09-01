@@ -111,10 +111,20 @@ function toPublicActionError(error: unknown): PublicActionError {
     switch (error.code) {
       case "backend-unavailable":
         return { message: "Backend RouteDeck недоступен. Действие безопасно заблокировано." };
+      case "backend-response-invalid":
+        return { message: "Backend вернул неожиданные данные. Сетевые действия безопасно заблокированы." };
+      case "capability-unavailable":
+        return { message: "Эта возможность ещё не подключена к проверенному Windows-backend." };
+      case "runtime-failure":
+        return { message: "Локальный backend не завершил действие. Откройте безопасную диагностику и повторите попытку." };
+      case "node-not-selected":
+        return { message: "Сначала импортируйте и выберите сервер." };
       case "invalid-subscription-url":
         return { message: "Проверьте формат URL подписки." };
       case "insecure-subscription-url":
         return { message: "Для подписки требуется защищённый HTTPS URL." };
+      case "subscription-url-fetch-unavailable":
+        return { message: "Загрузка HTTPS-подписки ещё не подключена. Пока импортируйте её содержимое через буфер обмена." };
       case "empty-subscription-source":
         return { message: "Источник подписки пуст." };
       case "stale-subscription-preview":
@@ -307,6 +317,7 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
       ? snapshot.phase === "blocked-by-conflict" ? "Остановить локальный прокси" : "Отключить"
       : snapshot.phase === "failed" ? "Повторить" : "Подключить";
   const visibleProofs = snapshot.proofs.filter((proof) => proof.id !== "config");
+  const boundaryNotice = snapshot.notice?.id === "backend-unavailable" || snapshot.notice?.id === "backend-response-invalid";
   const vpnApps = snapshot.routing.apps.filter((app) => app.route === "vpn");
   const directApps = snapshot.routing.apps.filter((app) => app.route === "direct");
   const routeSummary = snapshot.routing.defaultRoute === "direct"
@@ -373,8 +384,8 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
       {snapshot.notice ? (
         <OpaqueNotice
           notice={snapshot.notice}
-          onClose={snapshot.notice.id === "backend-unavailable" ? undefined : controller.dismissNotice}
-          primaryAction={snapshot.notice.id === "backend-unavailable" ? undefined : { label: "Повторить проверку", onClick: onRetry }}
+          onClose={boundaryNotice ? undefined : controller.dismissNotice}
+          primaryAction={boundaryNotice ? undefined : { label: "Повторить проверку", onClick: onRetry }}
           secondaryAction={{ label: "Открыть диагностику", onClick: () => onNavigate("diagnostics") }}
         />
       ) : null}
@@ -958,7 +969,13 @@ export default function App() {
         setImportError(publicError.message);
         focusImportInput();
       },
-      onSuccess: (preview) => setSubscriptionPreview(preview),
+      onSuccess: (preview) => {
+        // The raw URL/share-list is a secret and is no longer needed after the
+        // backend has converted it into a masked preview token.
+        setSubscriptionSource("");
+        setSubscriptionVisible(false);
+        setSubscriptionPreview(preview);
+      },
     });
   };
 

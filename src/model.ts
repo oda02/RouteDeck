@@ -138,8 +138,13 @@ export interface SubscriptionPreview {
 
 export type RouteDeckErrorCode =
   | "backend-unavailable"
+  | "backend-response-invalid"
+  | "capability-unavailable"
+  | "runtime-failure"
+  | "node-not-selected"
   | "invalid-subscription-url"
   | "insecure-subscription-url"
+  | "subscription-url-fetch-unavailable"
   | "empty-subscription-source"
   | "stale-subscription-preview";
 
@@ -170,4 +175,5 @@ export interface RouteDeckController {
   runDiagnostics: () => Promise<void>;
   resetLocalState: () => Promise<void>;
   getSanitizedReport: () => string;
+  dispose?: () => void;
 }
