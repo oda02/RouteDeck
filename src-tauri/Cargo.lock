@@ -2451,8 +2451,14 @@ dependencies = [
 name = "routedeck"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
+ "url",
 ]
 
 [[package]]

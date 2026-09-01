@@ -1,3 +1,8 @@
+pub mod config;
+pub mod domain;
+pub mod redaction;
+pub mod subscription;
+
 #[tauri::command]
 fn application_status() -> &'static str {
     "idle"
