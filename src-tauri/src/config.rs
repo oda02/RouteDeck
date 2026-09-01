@@ -183,7 +183,9 @@ pub fn generate_config(request: ConfigRequest<'_>) -> Result<GeneratedConfig, Co
     }
 
     let root = json!({
-        "log": { "disabled": true },
+        // Runtime failures must remain diagnosable. The controller captures stderr into a
+        // bounded buffer and applies the session redactor before storing any line.
+        "log": { "level": "error", "timestamp": false },
         "dns": {
             "servers": dns_servers,
             "final": dns_final,
@@ -567,6 +569,15 @@ mod tests {
                 .and_then(Value::as_str),
             Some(crate::runtime_constants::HEALTH_PROXY_USERNAME)
         );
+        assert_eq!(
+            value.pointer("/log/level").and_then(Value::as_str),
+            Some("error")
+        );
+        assert_eq!(
+            value.pointer("/log/timestamp").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(value.pointer("/log/disabled").is_none());
         assert!(!first.as_str().contains("dns_mode"));
         assert!(!first.as_str().contains("hop_interval_max"));
         assert!(!first.as_str().contains("\"engine\""));

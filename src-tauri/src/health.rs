@@ -1,4 +1,5 @@
 use std::{
+    error::Error as _,
     io::Read,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
     time::{Duration, Instant},
@@ -16,6 +17,40 @@ const PROOF_URL: &str = "https://www.gstatic.com/generate_204";
 const STARTUP_PROOF_TIMEOUT: Duration = Duration::from_secs(8);
 const LISTENER_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_PROOF_BODY: usize = 1024;
+const MAX_ERROR_SIGNAL_BYTES: usize = 2 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeFailureClass {
+    Timeout,
+    ProxyAuthentication,
+    ProxyTunnelRejected,
+    TunnelClosed,
+    TlsHandshake,
+    LoopbackConnect,
+    ResponseBody,
+    Request,
+}
+
+impl ProbeFailureClass {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Timeout => "timed out while the selected outbound was establishing HTTPS",
+            Self::ProxyAuthentication => {
+                "the authenticated loopback proxy rejected the proof credentials"
+            }
+            Self::ProxyTunnelRejected => {
+                "the loopback proxy could not establish an HTTPS tunnel through the selected outbound"
+            }
+            Self::TunnelClosed => {
+                "the HTTPS tunnel closed before the proof endpoint responded; the selected outbound or protocol handshake failed"
+            }
+            Self::TlsHandshake => "the HTTPS proof handshake failed after the proxy tunnel opened",
+            Self::LoopbackConnect => "the verified RouteDeck loopback proxy stopped accepting connections",
+            Self::ResponseBody => "the HTTPS proof response could not be read",
+            Self::Request => "the HTTPS proof request failed for an unclassified transport reason",
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct HealthRoute {
@@ -87,7 +122,7 @@ fn prove_via_http_proxy(
         .header("accept", "*/*")
         .header("cache-control", "no-store")
         .send()
-        .map_err(|error| RuntimeError::new("prove_traffic", error.to_string()))?;
+        .map_err(|error| proof_request_error(error, health_password.is_some()))?;
     if response.status() != StatusCode::NO_CONTENT {
         return Err(RuntimeError::new(
             "prove_traffic",
@@ -108,6 +143,93 @@ fn prove_via_http_proxy(
     Ok(ProofResult {
         latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
     })
+}
+
+fn proof_request_error(error: reqwest::Error, authenticated: bool) -> RuntimeError {
+    let mut signals = String::new();
+    let mut source = error.source();
+    for _ in 0..12 {
+        let Some(cause) = source else {
+            break;
+        };
+        if !signals.is_empty() {
+            signals.push(' ');
+        }
+        append_bounded_signal(&mut signals, &cause.to_string());
+        if signals.len() >= MAX_ERROR_SIGNAL_BYTES {
+            break;
+        }
+        source = cause.source();
+    }
+    let class = classify_error_signals(
+        error.is_timeout(),
+        error.is_connect(),
+        error.is_body() || error.is_decode(),
+        &signals,
+    );
+    let proxy_kind = if authenticated {
+        "private health proxy"
+    } else {
+        "ordinary local proxy"
+    };
+    RuntimeError::new(
+        "prove_traffic",
+        format!("{proxy_kind}: {}", class.description()),
+    )
+}
+
+fn append_bounded_signal(target: &mut String, source: &str) {
+    for character in source.chars() {
+        if target.len().saturating_add(character.len_utf8()) > MAX_ERROR_SIGNAL_BYTES {
+            break;
+        }
+        target.push(character);
+    }
+}
+
+fn classify_error_signals(
+    timed_out: bool,
+    connect_error: bool,
+    body_error: bool,
+    source_chain: &str,
+) -> ProbeFailureClass {
+    let signal = source_chain.to_ascii_lowercase();
+    if timed_out || signal.contains("timed out") || signal.contains("timeout") {
+        return ProbeFailureClass::Timeout;
+    }
+    if signal.contains("407")
+        || signal.contains("proxy authentication")
+        || signal.contains("proxy-authenticate")
+    {
+        return ProbeFailureClass::ProxyAuthentication;
+    }
+    if signal.contains("unsuccessful tunnel")
+        || signal.contains("proxy connect")
+        || signal.contains("connect tunnel")
+    {
+        return ProbeFailureClass::ProxyTunnelRejected;
+    }
+    if signal.contains("connection closed")
+        || signal.contains("connection reset")
+        || signal.contains("unexpected eof")
+        || signal.contains("broken pipe")
+    {
+        return ProbeFailureClass::TunnelClosed;
+    }
+    if signal.contains("tls")
+        || signal.contains("certificate")
+        || signal.contains("handshake")
+        || signal.contains("invalid peer")
+    {
+        return ProbeFailureClass::TlsHandshake;
+    }
+    if connect_error {
+        return ProbeFailureClass::LoopbackConnect;
+    }
+    if body_error {
+        return ProbeFailureClass::ResponseBody;
+    }
+    ProbeFailureClass::Request
 }
 
 pub(crate) trait ListenerVerifier: Send + Sync {
@@ -306,6 +428,66 @@ mod tests {
         let debug = format!("{route:?}");
         assert!(!debug.contains("fixture-secret"));
         assert!(!debug.contains("direct"));
+    }
+
+    #[test]
+    fn request_failure_classifier_is_finite_and_actionable() {
+        assert_eq!(
+            classify_error_signals(true, true, false, "certificate failure"),
+            ProbeFailureClass::Timeout
+        );
+        assert_eq!(
+            classify_error_signals(false, true, false, "proxy returned HTTP 407"),
+            ProbeFailureClass::ProxyAuthentication
+        );
+        assert_eq!(
+            classify_error_signals(false, true, false, "unsuccessful tunnel"),
+            ProbeFailureClass::ProxyTunnelRejected
+        );
+        assert_eq!(
+            classify_error_signals(
+                false,
+                true,
+                false,
+                "connection closed before message completed"
+            ),
+            ProbeFailureClass::TunnelClosed
+        );
+        assert_eq!(
+            classify_error_signals(false, true, false, "TLS handshake EOF"),
+            ProbeFailureClass::TlsHandshake
+        );
+        assert_eq!(
+            classify_error_signals(false, true, false, "invalid peer certificate"),
+            ProbeFailureClass::TlsHandshake
+        );
+        assert_eq!(
+            classify_error_signals(false, true, false, "connection refused"),
+            ProbeFailureClass::LoopbackConnect
+        );
+        assert_eq!(
+            classify_error_signals(false, false, true, "body decode"),
+            ProbeFailureClass::ResponseBody
+        );
+        for class in [
+            ProbeFailureClass::Timeout,
+            ProbeFailureClass::ProxyAuthentication,
+            ProbeFailureClass::ProxyTunnelRejected,
+            ProbeFailureClass::TunnelClosed,
+            ProbeFailureClass::TlsHandshake,
+            ProbeFailureClass::LoopbackConnect,
+            ProbeFailureClass::ResponseBody,
+            ProbeFailureClass::Request,
+        ] {
+            let description = class.description();
+            assert!(description.len() < 200);
+            assert!(!description.contains("https://"));
+            assert!(!description.contains("secret"));
+        }
+        let mut bounded = String::new();
+        append_bounded_signal(&mut bounded, &"э".repeat(MAX_ERROR_SIGNAL_BYTES));
+        assert!(bounded.len() <= MAX_ERROR_SIGNAL_BYTES);
+        assert!(bounded.is_char_boundary(bounded.len()));
     }
 
     #[test]
