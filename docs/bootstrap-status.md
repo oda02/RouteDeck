@@ -4,26 +4,28 @@ Checked on 2026-09-01 in the local Windows workspace.
 
 ## Completed
 
-- `Cargo.lock` generated from the existing local Cargo cache with `--offline`.
+- Direct JavaScript and Rust dependencies are exactly pinned; `package-lock.json` and `Cargo.lock` are present.
+- JavaScript dependencies were installed with lifecycle scripts disabled.
+- `npm run build` passes with Node.js on `PATH` (TypeScript and Vite production build).
+- Visual Studio 2022 Build Tools 17.14.39 with the x64 MSVC toolchain is installed.
+- `cargo check --locked --offline` passes from an x64 Visual Studio Developer Command Prompt.
 - `cargo fmt --check` passes.
 - `git diff --check` passes.
-- The repository was initialized on branch `main`; no commit has been created.
-- No binary was downloaded or executed, and no Windows proxy, route, registry, service, adapter, or VPN process was touched.
+- The Tauri application icon is generated locally from `scripts/generate-icon.ps1`; the generator uses only Windows/.NET `System.Drawing` and performs no network access.
+- No Windows proxy, route, registry, service, adapter, or VPN process was touched by scaffold verification.
 
-## Blocked locally
+## Current limitations
 
-- `cargo check --locked --offline` reached compilation but cannot run Rust dependency build scripts because the MSVC linker `link.exe` is not installed or not available in this shell.
-- A JavaScript lockfile could not be generated offline because npm has no cached registry metadata for `@tauri-apps/api`. The direct dependency versions remain exactly pinned in `package.json`; do not commit resolved JavaScript dependencies until a reviewed `package-lock.json` has been generated.
-- Frontend type-check/build was not run because this clean project has no `node_modules`. No package install or lifecycle script was executed.
+- The shell does not yet include or execute `sing-box`, WinTUN, a proxy controller, or privileged code.
+- `cargo check` must run through `VsDevCmd.bat` (or another shell where MSVC tools including `link.exe` are already on `PATH`).
+- The current verification covers compilation only; Windows integration and privileged tests remain intentionally out of scope.
 
-## Next safe dependency step
+## Reproduce the checks
 
-After approving registry access, generate the lockfile without executing lifecycle scripts, inspect the diff and integrity records, then perform a clean install:
+Use the committed lockfiles and keep npm lifecycle scripts disabled:
 
 ```powershell
-npm install --package-lock-only --ignore-scripts
 npm ci --ignore-scripts
 npm run build
+cmd /d /s /c 'call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 && cargo check --locked --offline --manifest-path src-tauri\Cargo.toml'
 ```
-
-Run `cargo check --locked` after Visual Studio Build Tools with the Desktop development with C++ workload is available.
