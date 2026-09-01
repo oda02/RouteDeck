@@ -16,7 +16,22 @@ pub async fn preview_import_content(
     content: String,
 ) -> Result<ImportPreview, PublicError> {
     let controller = Arc::clone(controller.inner());
-    tauri::async_runtime::spawn_blocking(move || controller.preview_import_content(content))
+    let slot = controller.reserve_preview_slot()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        controller.preview_import_content_reserved(content, slot)
+    })
+    .await
+    .map_err(command_join_error)?
+}
+
+#[tauri::command]
+pub async fn preview_import_url(
+    controller: State<'_, Arc<ApplicationController>>,
+    url: String,
+) -> Result<ImportPreview, PublicError> {
+    let controller = Arc::clone(controller.inner());
+    let slot = controller.reserve_preview_slot()?;
+    tauri::async_runtime::spawn_blocking(move || controller.preview_import_url_reserved(url, slot))
         .await
         .map_err(command_join_error)?
 }

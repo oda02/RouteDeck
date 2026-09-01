@@ -69,18 +69,21 @@ restore, and termination or reconfiguration of another VPN are forbidden in ever
 
 | ID | Tier | Case | Expected result |
 | --- | --- | --- | --- |
-| SF-01 | U | `https` URL with encoded bearer/query secret | Accepted model; all logs show redacted URL. |
+| SF-01 | U | `https` URL with encoded bearer/query secret | Accepted for request lifetime; raw URL is absent from errors, diagnostics, preview DTOs, logs, and retained pending state. |
 | SF-02 | U | `file:`, `ftp:`, `gopher:`, UNC, bare path, `data:`, custom scheme | Rejected before request. |
-| SF-03 | C | Three legal redirects | Success; target policy rechecked each hop. |
-| SF-04 | C | Fourth redirect or redirect loop | Bounded failure. |
-| SF-05 | C | Redirect to loopback, private, link-local, IPv6 link-local, or metadata address | Rejected unless explicit LAN-source opt-in; redirect target remains redacted. |
-| SF-06 | C | DNS changes from public to blocked address between validation/connect | Connection-layer address policy rejects rebinding. |
-| SF-07 | C | Slow headers/body past total timeout | Cancellation; previous subscription snapshot preserved. |
-| SF-08 | C | Compressed body >5 MiB or decoded >10 MiB | Abort without partial import. |
-| SF-09 | U | Invalid UTF-8/HTML login page | Useful parse error; no link sniff from HTML. |
+| SF-03 | U | Three legal redirects through fake resolver/transport | Success; HTTPS URL and fresh pinned address policy rechecked each hop. |
+| SF-04 | U | Fourth redirect, loop, missing Location, or HTTPS→HTTP downgrade | Stable policy-blocked failure. |
+| SF-05 | U | Initial or redirected destination resolves to loopback, private, CGNAT, link-local, unspecified, multicast, documentation, benchmark, transition, or reserved IPv4/IPv6 | Entire answer rejected; no LAN-source exception exists in v1. |
+| SF-06 | U | First DNS answer is public, next answer for the same redirect host is private or mixed | Second request is never issued; each connection uses only its validated pinned set. |
+| SF-07 | U | DNS/connect/read/overall timeout injected by fake boundary | Stable timeout code/key; preview slot released and prior subscription preserved. |
+| SF-08 | U | Identity body is >10 MiB; any gzip/br/zstd/deflate response | Oversize or unsupported encoding fails without partial import; no decoder dependency runs. |
+| SF-09 | U | Invalid UTF-8/HTML login page | Invalid encoding has a finite error; HTML is rejected by the importer and never link-sniffed. |
 | SF-10 | U | Failed refresh after valid prior snapshot | Prior snapshot remains active atomically. |
-| SF-11 | C | v2rayN System Proxy active while fetch policy is Direct | Request path does not inherit Windows proxy implicitly. |
-| SF-12 | C | Fetch through active RouteDeck selected explicitly | Uses an authenticated internal path and succeeds/fails visibly. |
+| SF-11 | U/C | v2rayN/System Proxy/environment proxy is configured while fetch policy is v1 Direct | Client has proxy discovery disabled and uses only policy-validated pinned destinations. |
+| SF-12 | U | User requests fetch through active RouteDeck in v1 | Not representable; only the explicit direct/current-network fetch boundary exists. |
+| SF-13 | U | URL is oversized, has userinfo/fragment, lexical localhost/.local name, an IP literal in a blocked class, or >16 DNS answers | Rejected before transport (or immediately after the bounded DNS result). |
+| SF-14 | U | Four concurrent URL previews occupy fetch slots | Fifth request is rejected before URL parsing/DNS/network work; RAII releases every failed slot. |
+| SF-15 | U | TLS/connect/HTTP failure includes a secret query in the original or redirect URL | Public error contains only finite code/stage/localization key and `detail=null`. |
 
 ### 4.2 Share links and lists
 
@@ -299,7 +302,7 @@ Real server credentials are never committed or printed. W uses dedicated test cr
 | SE-01 | U | Corpus places secrets in URI userinfo/query/fragment, JSON/YAML fields, headers, nested errors | Redacted before log/event/export. |
 | SE-02 | U | Mixed-case and percent-encoded secret keys | Redacted after safe parse without revealing decoded value. |
 | SE-03 | U | sing-box stderr repeats UUID/password/server URI | Structured sanitizer removes it before persistence/UI. |
-| SE-04 | U | Subscription fetch error contains full URL | User sees host/status/category only; URL secret absent. |
+| SE-04 | U | Subscription fetch error contains full URL | User sees only a finite code, stage, and localization key; URL, host, status text, and secret are absent. |
 | SE-05 | W | At-rest node/subscription files inspected as another user | DPAPI/ACL prevents useful disclosure. |
 | SE-06 | W | Runtime config ACL and lifecycle | Current user/elevated helper only; removed after stop when possible. |
 | SE-07 | U | Redacted diagnostics export | Contains version/hash prefix/stages/errors, never credentials/raw configs/captured IP. |

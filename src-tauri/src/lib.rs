@@ -7,6 +7,7 @@ pub mod health;
 pub mod redaction;
 mod runtime_constants;
 pub mod subscription;
+pub mod subscription_fetch;
 #[cfg(windows)]
 mod windows_process;
 
@@ -31,6 +32,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::preview_import_content,
+            commands::preview_import_url,
             commands::discard_import_preview,
             commands::confirm_import,
             commands::start_local_proxy,

@@ -33,18 +33,18 @@ The reviewed YAML graph is `serde-saphyr 1.2.0` → `granit-parser 1.2.0`, `anno
 
 ### `reqwest = 0.13.4` with `default-features = false`, `blocking`, `rustls`
 
-- Provenance: widely used HTTP client from the `seanmonstar/reqwest` project. Its sources were already available in the local cache; this change adds the exact resolved graph to the committed lockfile.
-- Purpose: two bounded HTTPS 204 proofs: a private prerequisite through the authenticated, loopback-only `health-in` proxy, followed by the public readiness proof through the ordinary user-facing loopback HTTP proxy. Local-only configuration forces both ordinary HTTP/SOCKS traffic and `health-in` through the selected outbound; the runtime never offers a direct fallback client.
-- Surface reduction: default features are disabled; native TLS/OpenSSL and system-proxy discovery are not enabled. Only the blocking API and Rustls TLS backend are selected.
+- Provenance: widely used HTTP client from the `seanmonstar/reqwest` project. Its exact resolved graph was already reviewed and committed for traffic proof, and its sources are available in the local cache.
+- Purpose: two bounded HTTPS 204 traffic proofs plus direct HTTPS subscription retrieval. The fetch boundary manually validates redirects and passes a separately resolved, policy-checked address set to reqwest while retaining the hostname for TLS verification.
+- Surface reduction: default features are disabled; native TLS/OpenSSL, cookie storage, automatic redirects, compression decoders, and system/environment proxy discovery are not enabled. Only the blocking API and Rustls TLS backend are selected. Subscription requests additionally set no proxy, no Referer, no retry, HTTPS-only, fixed DNS overrides, and bounded timeouts.
 - Build/lifecycle: no download hook or executable is fetched at build/start. The selected Rustls provider includes `aws-lc-rs 1.16.3` / `aws-lc-sys 0.40.0`; its reviewed build script uses locked `cc 1.2.61`, `cmake 0.1.58`, `dunce 1.0.5`, and `fs_extra 1.3.0` to compile the vendored AWS-LC C/assembly sources locally. It does not invoke a package manager or network downloader.
-- Transitives: Hyper, rustls, AWS-LC, webpki/platform verifier, Tokio support, URL/HTTP primitives, and compression-free response plumbing. Bodies, redirects, status, and total time are bounded by RouteDeck. `cargo tree --locked --offline -i openssl-sys` confirms that native OpenSSL is absent.
+- Transitives: Hyper, rustls, AWS-LC, webpki/platform verifier, Tokio support, URL/HTTP primitives, and compression-free response plumbing. No dependency or lockfile change was needed for subscription fetching. Identity bodies, redirects, status, address count, and DNS/connect/read/overall time are bounded by RouteDeck; non-identity encodings fail closed. `cargo tree --locked --offline -i openssl-sys` confirms that native OpenSSL is absent.
 - Advisory review: no RustSec advisory was present in the locally available advisory/security checks for this exact pin. Re-run the repository security job when the lock changes.
 - crates.io checksum: `219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3`.
 
 ### `windows-sys = 0.61.2` (Windows target only)
 
 - Provenance: official Microsoft `windows-rs` projection crate, already present transitively.
-- Purpose: narrow Win32 calls for protected session files/directories, local-volume and opened-file identity/owner/DACL/reparse checks, restricted child pipes/handle inheritance, suspended process creation, a kill-on-close Job Object, and exact-PID ownership checks for the three loopback listeners.
+- Purpose: narrow Win32 calls for protected session files/directories, local-volume and opened-file identity/owner/DACL/reparse checks, bounded `GetAddrInfoExW` DNS resolution, restricted child pipes/handle inheritance, suspended process creation, a kill-on-close Job Object, and exact-PID ownership checks for the three loopback listeners.
 - Enabled namespaces: Foundation, Security/Authorization, Storage FileSystem, NetworkManagement/IpHelper, Networking/WinSock, JobObjects, Memory, Pipes, SystemInformation, and Threading only.
 - Build/lifecycle: generated FFI bindings; no runtime, installer, network access, or build download.
 - crates.io checksum: `ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc`.
@@ -53,14 +53,14 @@ The reviewed YAML graph is `serde-saphyr 1.2.0` → `granit-parser 1.2.0`, `anno
 
 - `sha2 = 0.10.9`: hashes already pinned engine files from open handles.
 - `serde` / `serde_json`: parse the embedded, reviewed engine lock and serialize typed command/event DTOs.
-- `tauri`: typed command/state/event wiring only; an `AppManifest` generates permissions for the eight named commands, and the main capability grants only those commands plus event listen/unlisten. The renderer cannot supply an executable, configuration path, arguments, environment, or health URL.
+- `tauri`: typed command/state/event wiring only; an `AppManifest` generates permissions for the nine named commands, and the main capability grants only those commands plus event listen/unlisten. `preview_import_url` accepts one bounded secret URL string; the renderer still cannot supply request headers, a proxy, executable/configuration paths, arguments, environment, or health URL.
 
 ## Deliberately not added
 
 - No shell/process helper crate: the Windows boundary calls `CreateProcessW` directly with a closed internal action enum, fixed arguments, explicit application/current-directory paths, an allow-listed environment with no `PATH`, and an explicit inherited-handle list.
 - No async runtime direct dependency: serialized operations run behind the controller boundary; Tauri owns command dispatch.
 - No temporary-file/ACL convenience crate: session files use a fixed application-data root, random private directory, restrictive Windows DACL, atomic rename, and best-effort deletion.
-- No native OpenSSL backend, updater, archive extractor, engine downloader, telemetry, DNS client, or arbitrary URL configuration.
+- No native OpenSSL backend, updater, archive extractor, engine downloader, telemetry, third-party DNS client, compression decoder, cookie jar, or arbitrary request configuration. Windows DNS is called through the already reviewed `windows-sys` binding with a timeout; tests use a fake resolver/transport and never contact the network.
 
 ## Residual risks
 

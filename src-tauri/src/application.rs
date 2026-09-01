@@ -20,6 +20,10 @@ use crate::{
     },
     redaction::Redactor,
     subscription::{import_subscription, ImportReport},
+    subscription_fetch::{
+        HttpsSubscriptionFetcher, SubscriptionFetchError, SubscriptionFetchErrorKind,
+        SubscriptionFetchStage, SubscriptionFetcher,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -127,6 +131,12 @@ pub struct PublicPorts {
 #[serde(rename_all = "snake_case")]
 pub enum PublicErrorCode {
     ImportRejected,
+    SubscriptionUrlInvalid,
+    SubscriptionPolicyBlocked,
+    SubscriptionFetchFailed,
+    SubscriptionResponseTooLarge,
+    SubscriptionFetchTimeout,
+    SubscriptionInvalidEncoding,
     PreviewMissing,
     PreviewTokenInvalid,
     RecoveryRequired,
@@ -141,6 +151,10 @@ pub enum PublicErrorCode {
 #[serde(rename_all = "snake_case")]
 pub enum PublicErrorStage {
     Import,
+    SubscriptionUrl,
+    SubscriptionDns,
+    SubscriptionFetch,
+    SubscriptionResponse,
     SessionRecovery,
     Start,
     GenerateConfig,
@@ -222,6 +236,7 @@ struct RuntimeServices {
     engine: Arc<dyn EngineProvider>,
     listener: Arc<dyn ListenerVerifier>,
     prober: Arc<dyn TrafficProber>,
+    subscription_fetcher: Arc<dyn SubscriptionFetcher>,
 }
 
 struct PendingImport {
@@ -230,13 +245,13 @@ struct PendingImport {
 
 const MAX_PENDING_IMPORT_PREVIEWS: usize = 4;
 
-struct PreviewSlot<'a> {
-    state: &'a Mutex<State>,
+pub(crate) struct PreviewSlot {
+    state: Arc<Mutex<State>>,
     active: bool,
 }
 
-impl<'a> PreviewSlot<'a> {
-    fn reserve(state: &'a Mutex<State>) -> Result<Self, PublicError> {
+impl PreviewSlot {
+    fn reserve(state: &Arc<Mutex<State>>) -> Result<Self, PublicError> {
         let mut locked = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -251,7 +266,7 @@ impl<'a> PreviewSlot<'a> {
         locked.preview_inflight += 1;
         drop(locked);
         Ok(Self {
-            state,
+            state: Arc::clone(state),
             active: true,
         })
     }
@@ -275,7 +290,7 @@ impl<'a> PreviewSlot<'a> {
     }
 }
 
-impl Drop for PreviewSlot<'_> {
+impl Drop for PreviewSlot {
     fn drop(&mut self) {
         if self.active {
             let mut state = self
@@ -323,7 +338,7 @@ struct State {
 type EventSink = Arc<dyn Fn(RuntimeStatus) + Send + Sync>;
 
 pub struct ApplicationController {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     operation: Mutex<()>,
     services: RuntimeServices,
     session_root: PathBuf,
@@ -381,13 +396,32 @@ impl ApplicationController {
         listener: Arc<dyn ListenerVerifier>,
         prober: Arc<dyn TrafficProber>,
     ) -> Self {
+        Self::with_services_and_fetcher(
+            session_root,
+            event_sink,
+            engine,
+            listener,
+            prober,
+            Arc::new(HttpsSubscriptionFetcher),
+        )
+    }
+
+    fn with_services_and_fetcher(
+        session_root: PathBuf,
+        event_sink: EventSink,
+        engine: Arc<dyn EngineProvider>,
+        listener: Arc<dyn ListenerVerifier>,
+        prober: Arc<dyn TrafficProber>,
+        subscription_fetcher: Arc<dyn SubscriptionFetcher>,
+    ) -> Self {
         Self {
-            state: Mutex::new(State::default()),
+            state: Arc::new(Mutex::new(State::default())),
             operation: Mutex::new(()),
             services: RuntimeServices {
                 engine,
                 listener,
                 prober,
+                subscription_fetcher,
             },
             session_root,
             diagnostics: Arc::new(Mutex::new(DiagnosticBuffer::default())),
@@ -396,7 +430,15 @@ impl ApplicationController {
     }
 
     pub fn preview_import_content(&self, content: String) -> Result<ImportPreview, PublicError> {
-        let slot = PreviewSlot::reserve(&self.state)?;
+        let slot = self.reserve_preview_slot()?;
+        self.preview_import_content_reserved(content, slot)
+    }
+
+    pub(crate) fn preview_import_content_reserved(
+        &self,
+        content: String,
+        slot: PreviewSlot,
+    ) -> Result<ImportPreview, PublicError> {
         let report = import_subscription(content.as_bytes()).map_err(|error| {
             PublicError::with_detail(
                 PublicErrorCode::ImportRejected,
@@ -405,6 +447,44 @@ impl ApplicationController {
                 Redactor::default().redact(&error.to_string()),
             )
         })?;
+        self.commit_import_preview(slot, report)
+    }
+
+    pub fn preview_import_url(&self, url: String) -> Result<ImportPreview, PublicError> {
+        let slot = self.reserve_preview_slot()?;
+        self.preview_import_url_reserved(url, slot)
+    }
+
+    pub(crate) fn reserve_preview_slot(&self) -> Result<PreviewSlot, PublicError> {
+        PreviewSlot::reserve(&self.state)
+    }
+
+    pub(crate) fn preview_import_url_reserved(
+        &self,
+        url: String,
+        slot: PreviewSlot,
+    ) -> Result<ImportPreview, PublicError> {
+        let content = self
+            .services
+            .subscription_fetcher
+            .fetch(&url)
+            .map_err(public_subscription_fetch_error)?;
+        drop(url);
+        let report = import_subscription(content.as_bytes()).map_err(|_| {
+            PublicError::fixed(
+                PublicErrorCode::ImportRejected,
+                PublicErrorStage::Import,
+                "subscription.content.rejected",
+            )
+        })?;
+        self.commit_import_preview(slot, report)
+    }
+
+    fn commit_import_preview(
+        &self,
+        slot: PreviewSlot,
+        report: ImportReport,
+    ) -> Result<ImportPreview, PublicError> {
         let preview_id =
             random_hex(16).map_err(|error| public_runtime_error(error, &Redactor::default()))?;
         let preview = preview_from_report(&preview_id, &report);
@@ -1308,6 +1388,34 @@ impl ApplicationController {
     }
 }
 
+fn public_subscription_fetch_error(error: SubscriptionFetchError) -> PublicError {
+    let code = match error.kind() {
+        SubscriptionFetchErrorKind::UrlInvalid => PublicErrorCode::SubscriptionUrlInvalid,
+        SubscriptionFetchErrorKind::PolicyBlocked => PublicErrorCode::SubscriptionPolicyBlocked,
+        SubscriptionFetchErrorKind::FetchFailed => PublicErrorCode::SubscriptionFetchFailed,
+        SubscriptionFetchErrorKind::ResponseTooLarge => {
+            PublicErrorCode::SubscriptionResponseTooLarge
+        }
+        SubscriptionFetchErrorKind::Timeout => PublicErrorCode::SubscriptionFetchTimeout,
+        SubscriptionFetchErrorKind::InvalidEncoding => PublicErrorCode::SubscriptionInvalidEncoding,
+    };
+    let stage = match error.stage() {
+        SubscriptionFetchStage::Url => PublicErrorStage::SubscriptionUrl,
+        SubscriptionFetchStage::Dns => PublicErrorStage::SubscriptionDns,
+        SubscriptionFetchStage::Fetch => PublicErrorStage::SubscriptionFetch,
+        SubscriptionFetchStage::Response => PublicErrorStage::SubscriptionResponse,
+    };
+    let localization_key = match error.kind() {
+        SubscriptionFetchErrorKind::UrlInvalid => "subscription.url.invalid",
+        SubscriptionFetchErrorKind::PolicyBlocked => "subscription.policy_blocked",
+        SubscriptionFetchErrorKind::FetchFailed => "subscription.fetch_failed",
+        SubscriptionFetchErrorKind::ResponseTooLarge => "subscription.response_too_large",
+        SubscriptionFetchErrorKind::Timeout => "subscription.timeout",
+        SubscriptionFetchErrorKind::InvalidEncoding => "subscription.invalid_encoding",
+    };
+    PublicError::fixed(code, stage, localization_key)
+}
+
 fn preview_from_report(preview_id: &str, report: &ImportReport) -> ImportPreview {
     ImportPreview {
         preview_id: preview_id.to_owned(),
@@ -1709,6 +1817,29 @@ mod tests {
         gate: Arc<(Mutex<(bool, bool)>, Condvar)>,
     }
 
+    struct FakeSubscriptionFetcher {
+        result: Result<String, SubscriptionFetchError>,
+    }
+
+    impl SubscriptionFetcher for FakeSubscriptionFetcher {
+        fn fetch(&self, _raw_url: &str) -> Result<String, SubscriptionFetchError> {
+            self.result.clone()
+        }
+    }
+
+    struct BlockingSubscriptionFetcher {
+        ready: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl SubscriptionFetcher for BlockingSubscriptionFetcher {
+        fn fetch(&self, _raw_url: &str) -> Result<String, SubscriptionFetchError> {
+            self.ready.wait();
+            self.release.wait();
+            Ok(NODE.into())
+        }
+    }
+
     impl TrafficProber for BlockingProber {
         fn prove(&self, _route: &HealthRoute) -> Result<ProofResult, RuntimeError> {
             // Startup proves both the private health inbound and the ordinary HTTP inbound.
@@ -1851,6 +1982,26 @@ mod tests {
             Arc::new(RecoveryFailProvider),
             Arc::new(FakeListener(true)),
             Arc::new(FakeProber(true)),
+        )
+    }
+
+    fn controller_with_fetcher(fetcher: Arc<dyn SubscriptionFetcher>) -> ApplicationController {
+        let root = std::env::temp_dir().join(format!(
+            "routedeck-test-{}",
+            random_hex(8).expect("test random")
+        ));
+        ApplicationController::with_services_and_fetcher(
+            root,
+            Arc::new(|_| {}),
+            Arc::new(FakeProvider {
+                check_fails: false,
+                stop_fails: false,
+                alive: Arc::new(AtomicBool::new(false)),
+                stops: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(FakeListener(true)),
+            Arc::new(FakeProber(true)),
+            fetcher,
         )
     }
 
@@ -2106,6 +2257,75 @@ mod tests {
             .preview_import_content("not a subscription".into())
             .is_err());
         assert_eq!(controller.lock_state().preview_inflight, 0);
+    }
+
+    #[test]
+    fn url_preview_reserves_slot_before_network_work_and_commits_masked_report() {
+        let ready = Arc::new(Barrier::new(MAX_PENDING_IMPORT_PREVIEWS + 1));
+        let release = Arc::new(Barrier::new(MAX_PENDING_IMPORT_PREVIEWS + 1));
+        let controller = Arc::new(controller_with_fetcher(Arc::new(
+            BlockingSubscriptionFetcher {
+                ready: ready.clone(),
+                release: release.clone(),
+            },
+        )));
+        let mut workers = Vec::new();
+        for index in 0..MAX_PENDING_IMPORT_PREVIEWS {
+            let controller = controller.clone();
+            workers.push(thread::spawn(move || {
+                controller.preview_import_url(format!(
+                    "https://subscriptions.test/list?token=secret-{index}"
+                ))
+            }));
+        }
+        ready.wait();
+        assert_eq!(
+            controller.lock_state().preview_inflight,
+            MAX_PENDING_IMPORT_PREVIEWS
+        );
+        let overload = controller
+            .preview_import_url("https://subscriptions.test/overflow?token=secret".into())
+            .unwrap_err();
+        assert_eq!(overload.code, PublicErrorCode::ImportRejected);
+        release.wait();
+        let previews = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(controller.lock_state().preview_inflight, 0);
+        assert_eq!(
+            controller.lock_state().pending.len(),
+            MAX_PENDING_IMPORT_PREVIEWS
+        );
+        for preview in previews {
+            let serialized = serde_json::to_string(&preview).unwrap();
+            assert!(!serialized.contains("example.test"));
+            assert!(!serialized.contains("subscriptions.test"));
+            controller
+                .discard_import_preview(&preview.preview_id)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn url_fetch_errors_emit_only_finite_localization_contract() {
+        let error = SubscriptionFetchError::new(
+            SubscriptionFetchErrorKind::PolicyBlocked,
+            SubscriptionFetchStage::Dns,
+        );
+        let controller =
+            controller_with_fetcher(Arc::new(FakeSubscriptionFetcher { result: Err(error) }));
+        let raw_url = "https://secret-host.test/list?token=never-emit";
+        let public = controller.preview_import_url(raw_url.into()).unwrap_err();
+        assert_eq!(public.code, PublicErrorCode::SubscriptionPolicyBlocked);
+        assert_eq!(public.stage, PublicErrorStage::SubscriptionDns);
+        assert_eq!(public.message, "subscription.policy_blocked");
+        assert!(public.detail.is_none());
+        let serialized = serde_json::to_string(&public).unwrap();
+        assert!(!serialized.contains("never-emit"));
+        assert!(!serialized.contains("secret-host"));
+        assert_eq!(controller.lock_state().preview_inflight, 0);
+        assert!(controller.lock_state().pending.is_empty());
     }
 
     #[test]

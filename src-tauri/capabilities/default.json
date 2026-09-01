@@ -5,6 +5,7 @@
   "windows": ["main"],
   "permissions": [
     "allow-preview-import-content",
+    "allow-preview-import-url",
     "allow-discard-import-preview",
     "allow-confirm-import",
     "allow-start-local-proxy",

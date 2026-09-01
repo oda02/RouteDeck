@@ -1,6 +1,7 @@
 fn main() {
     const COMMANDS: &[&str] = &[
         "preview_import_content",
+        "preview_import_url",
         "discard_import_preview",
         "confirm_import",
         "start_local_proxy",

@@ -87,7 +87,7 @@ Authenticode may be recorded as additional evidence if present, but the reviewed
 | --- | --- |
 | Malicious or malformed subscription | Bounded download/decode/parse; no raw config execution; strict protocol allow-list; reject unsupported fields rather than silently weakening them. |
 | YAML aliases/deep nesting/base64 bomb | Disable or cap aliases; maximum depth, scalar length, node count, decoded size, and total nodes. |
-| Subscription URL redirects or local metadata access | `https`/`http` only; redirect and timeout caps; resolve and block link-local/metadata/loopback/private destinations by default; explicit advanced opt-in for LAN subscription servers. |
+| Subscription URL redirects or local metadata access | HTTPS only in v1; manual redirect and timeout caps; every hop resolves first, rejects any non-public/mixed answer, and pins the validated addresses into the TLS request. |
 | Tampered bundled engine/library | Exact archive and extracted-file SHA-256 pins; runtime verification before launch. |
 | Local port squatting | Bind only `127.0.0.1`/`::1`; preflight ports; fail if occupied; random credentials on internal health listener. |
 | UI/webview compromise | GUI remains unprivileged; narrow typed commands; no arbitrary command/path/env/registry/root accepted by elevated component. |
@@ -189,12 +189,13 @@ Validation rules include DNS-name/IP syntax, port `1..65535`, UUID syntax, bound
 
 ### 6.1 Fetch boundary
 
-- Accept only `https://` and, behind an explicit insecure warning, `http://` subscription URLs.
-- Do not use the Windows System Proxy implicitly. The user may choose `Direct/current network` or `through active RouteDeck`; this makes behavior deterministic when v2rayN is present.
-- Limit redirects to 3; only `http`/`https` targets; re-run address policy after every redirect.
-- Suggested limits: 15 s total, 5 MiB compressed body, 10 MiB decoded text, 2,000 nodes, 64 KiB per line/scalar, nesting depth 32.
+- V1 accepts only bounded `https://` URLs without userinfo or fragments. HTTP and LAN-source opt-ins are not implemented.
+- Do not use Windows, environment, or application proxy discovery implicitly. V1 subscription fetch is direct/current-network only; routing it through active RouteDeck requires a later explicit design and consent path.
+- Resolve every hostname separately on every hop with a bounded DNS timeout and answer count. Reject the whole answer when any IPv4/IPv6 result is loopback, private, CGNAT, link-local, unspecified, multicast, documentation, benchmarking, transition, or reserved. Pin only the validated answer set into the connection so a second resolver lookup cannot rebind it; keep the original hostname for TLS SNI/certificate verification.
+- Disable automatic redirects and follow at most 3 manually. Every target is parsed and revalidated as a new HTTPS URL; never forward cookies, authorization, caller headers, or a Referer.
+- Use bounded DNS/connect/read/overall timeouts. Read at most 10 MiB plus one sentinel byte from the response stream regardless of `Content-Length`. V1 does not request compression and rejects every non-identity `Content-Encoding`, avoiding an unreviewed decoder/decompression-bomb surface.
 - Reject invalid UTF-8 except an optional UTF-8 BOM. Never execute content sniffed as HTML.
-- Parse in memory, commit the new node set atomically only after the full parse/validation result is available. A failed refresh retains the prior working snapshot.
+- Reserve the same bounded preview slot before URL validation, DNS, fetch, and parse. Parse in memory and retain only the typed pending preview; the raw URL is never stored, logged, placed in diagnostics/errors/command lines, or emitted to the renderer after the request returns. Commit the new node set atomically only after confirmation. A failed refresh retains the prior working snapshot.
 
 ### 6.2 Format detection order
 
