@@ -71,27 +71,27 @@ restore, and termination or reconfiguration of another VPN are forbidden in ever
 | --- | --- | --- | --- |
 | SF-01 | U | `https` URL with encoded bearer/query secret | Accepted for request lifetime; raw URL is absent from errors, diagnostics, preview DTOs, logs, and retained pending state. |
 | SF-02 | U | `file:`, `ftp:`, `gopher:`, UNC, bare path, `data:`, custom scheme | Rejected before request. |
-| SF-03 | U | Three legal redirects through fake resolver/transport | Success; HTTPS URL and fresh pinned address policy rechecked each hop. |
+| SF-03 | U | Three legal HTTPS redirects through the fake transport | Success; URL policy is rechecked on every hop. Direct requests also resolve and validate each destination before connecting. |
 | SF-04 | U | Fourth redirect, loop, missing Location, or HTTPS→HTTP downgrade | Stable policy-blocked failure. |
-| SF-05 | U | Initial or redirected destination resolves to loopback, private, CGNAT, link-local, unspecified, multicast, documentation, benchmark, transition, or reserved IPv4/IPv6 | Entire answer rejected; no LAN-source exception exists in v1. |
-| SF-06 | U | First DNS answer is public, next answer for the same redirect host is private or mixed | Second request is never issued; each connection uses only its validated pinned set. |
+| SF-05 | U | A direct initial or redirected destination resolves to loopback, private, CGNAT, link-local, unspecified, multicast, documentation, benchmark, transition, or reserved IPv4/IPv6 | Entire local DNS answer is rejected; no LAN-source exception exists in v1. |
+| SF-06 | U | Direct path first resolves publicly, then returns a private or mixed answer for the same redirected host | Second request is never issued. This assertion applies to the direct path, not DNS performed by a system proxy. |
 | SF-07 | U | DNS/connect/read/overall timeout injected by fake boundary | Stable timeout code/key; preview slot released and prior subscription preserved. |
 | SF-08 | U | Identity body is >10 MiB; any gzip/br/zstd/deflate response | Oversize or unsupported encoding fails without partial import; no decoder dependency runs. |
 | SF-09 | U | Invalid UTF-8/HTML login page | Invalid encoding has a finite error; HTML is rejected by the importer and never link-sniffed. |
 | SF-10 | U | Failed refresh after valid prior snapshot | Prior snapshot remains active atomically. |
-| SF-11 | U/C | v2rayN/System Proxy/environment proxy is configured while fetch policy is v1 Direct | Client has proxy discovery disabled and uses only policy-validated pinned destinations. |
-| SF-12 | U | User explicitly selects current loopback System Proxy | Backend receives the closed transport enum; there is no ambient or direct fallback. |
+| SF-11 | U/C | A supported current loopback Windows System Proxy is configured | The ordinary URL import uses it automatically; the UI does not ask the user to choose a transport. |
+| SF-12 | U | No supported current loopback System Proxy is available | The ordinary URL import connects directly. The renderer sends only the URL and exposes no transport enum or proxy endpoint. |
 | SF-13 | U | URL is oversized, has userinfo/fragment, lexical localhost/.local name, an IP literal in a blocked class, or >16 DNS answers | Rejected before transport (or immediately after the bounded DNS result). |
 | SF-14 | U | Four concurrent URL previews occupy fetch slots | Fifth request is rejected before URL parsing/DNS/network work; RAII releases every failed slot. |
 | SF-15 | U | DNS timeout or TLS/connect/HTTP failure includes a secret query in the original or redirect URL | Public error contains only finite code/stage/localization key and `detail=null`; a DNS timeout retains the `subscription_dns` stage. |
-| SF-16 | U | WinINet flags select one bare all-protocol loopback endpoint, or a map containing a static `https=127/8` / `https=[::1]` endpoint with valid port | Accepted as a private request-local endpoint; an `http=`-only map is rejected because it does not define the HTTPS proxy; the endpoint is never serialized or logged. |
-| SF-17 | U | PAC/WPAD, active RAS, credentials/URI syntax, list, duplicate/unknown scheme, non-loopback endpoint, port zero, unknown flags | Stable unavailable/policy-blocked error; no request and no settings write. |
-| SF-18 | U | Fake loopback proxy/TLS boundary receives an HTTPS subscription request | CONNECT authority is the validated pinned public IP; original hostname is absent from CONNECT but retained as TLS SNI and origin Host. |
-| SF-19 | U | Loopback proxy returns 407, malformed/folded/oversized headers, HTTP/2 line, duplicate framing, invalid chunk, or timeout | Strict bounded failure with finite proxy stage/code; no auth retry or direct fallback. |
-| SF-20 | U | Proxy-mode redirect changes hostname and DNS answer | Every hop is freshly resolved/validated; each CONNECT uses only that hop's pinned public IP and original-hop SNI/Host. |
-| SF-21 | U | Proxy-mode DNS answer mixes public and blocked addresses | Rejected before any CONNECT is sent to the loopback proxy. |
-| SF-22 | U | Proxy-mode identity/chunked body, duplicate compression including gzip, more than 4,096 chunks / 64 KiB chunk framing, or body beyond 10 MiB | Valid bounded identity body succeeds; compressed/ambiguous/oversized framing fails closed. |
-| SF-23 | U | Proxy/TLS error contains secret URL and proxy port fixture | Public/debug error is finite and contains neither URL/host/query nor proxy endpoint. |
+| SF-16 | U | WinINet exposes one supported static loopback proxy endpoint for HTTPS | It is selected automatically for this request and is never serialized to the renderer or logged. Unsupported or ambiguous proxy state is ignored and the request uses the direct path. |
+| SF-17 | U | The selected loopback proxy refuses authentication, cannot connect, or times out | Standard `reqwest` failure maps to a finite public fetch/timeout error; no Windows setting is changed. |
+| SF-18 | U | Fake loopback proxy receives an HTTPS subscription request | It receives the standard HTTPS proxy flow and resolves the origin normally; RouteDeck makes no pinned-IP CONNECT claim for this path. |
+| SF-19 | U | Proxy response is malformed or the proxy closes the connection | The standard client rejects the request and returns a finite fetch error; no custom HTTP parser behavior is claimed. |
+| SF-20 | U | Proxy-mode redirect changes hostname | The redirect remains HTTPS and passes the normal URL checks; origin DNS remains the proxy's responsibility. |
+| SF-21 | U | A public hostname resolves to a local address inside the proxy | This is not advertised as blocked by RouteDeck. The proxy path follows normal proxy DNS behavior; the test records the limitation without accessing a real local endpoint. |
+| SF-22 | U | Proxy-mode body is valid identity content, compressed, or beyond 10 MiB | Valid bounded identity body succeeds; unsupported encoding and oversized bodies fail without partial import. |
+| SF-23 | U | Proxy/TLS error occurs for a URL containing a secret query | Public/debug error is finite and does not include the raw URL or query. |
 | SF-24 | W | Read current WinINet/RAS state on an isolated fixture account | `InternetQueryOptionW`/`RasEnumConnectionsW` only; before/after proxy and registry snapshots are byte-for-byte unchanged. |
 
 ### 4.2 Share links and lists

@@ -23,11 +23,11 @@ export function toPublicActionError(error: unknown): PublicActionError {
       case "insecure-subscription-url":
         return { message: "Для подписки требуется защищённый HTTPS URL." };
       case "subscription-policy-blocked":
-        return { message: "Адрес подписки или перенаправление заблокированы политикой безопасности. Используйте публичный HTTPS URL без перехода в локальную сеть." };
+        return { message: "Ссылка подписки или её перенаправление не поддерживается. Используйте обычный публичный HTTPS URL." };
       case "subscription-fetch-failed":
-        return { message: "Не удалось безопасно загрузить HTTPS-подписку через текущий сетевой путь Windows. Проверьте доступность адреса и повторно введите URL." };
+        return { message: "Не удалось загрузить подписку через текущий сетевой путь Windows. Проверьте ссылку и повторите попытку." };
       case "subscription-response-too-large":
-        return { message: "Ответ подписки превышает безопасный размер. Используйте более компактную подписку." };
+        return { message: "Ответ подписки превышает допустимый размер. Используйте более компактную подписку." };
       case "subscription-fetch-timeout":
         return { message: "Сервер подписки не ответил за отведённое время через текущий сетевой путь Windows. Повторите попытку позже." };
       case "subscription-invalid-encoding":

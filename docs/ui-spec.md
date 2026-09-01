@@ -430,8 +430,10 @@ Variants: info, warning, error, success. All use fully opaque semantic backgroun
 
 - Initial focus is the dialog title or first method control. Methods: URL, clipboard,
   local file. Each has a visible label.
-- URL is treated as a secret: mask user info/query in previews and never echo it into an
-  error. Clipboard is read only after explicit button activation.
+- URL import has one ordinary `Загрузить` action and no network-transport selector. It
+  follows the current Windows network path automatically, with normal timeout and size
+  limits. The URL is cleared from the form after loading and is not echoed in errors.
+  Clipboard is read only after explicit button activation.
 - Validate, then show counts by supported/unsupported protocol before the user confirms.
 - Error belongs next to the failing field and the first invalid field receives focus on
   submit. Escape/Cancel always remains available before commit.

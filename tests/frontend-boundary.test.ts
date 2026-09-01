@@ -85,14 +85,16 @@ test("URL input is masked and cleared before the async preview action", () => {
   assert.match(source, /retry: sourceType === "url" \? undefined : previewImport/);
 });
 
-test("URL import delegates transport selection to the backend without a renderer selector", () => {
+test("URL import uses automatic backend transport without a renderer selector", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const model = readFileSync(new URL("../src/model.ts", import.meta.url), "utf8");
   const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
   assert.doesNotMatch(source, /SubscriptionFetchTransport|subscriptionTransport|Транспорт HTTPS-загрузки|subscription-transport-help|current_loopback_system_proxy/);
   assert.doesNotMatch(model, /SubscriptionFetchTransport|current_loopback_system_proxy/);
   assert.doesNotMatch(styles, /subscription-transport/);
-  assert.match(source, /загрузит подписку по HTTPS через текущий сетевой путь Windows/);
+  assert.match(source, /загрузится по HTTPS через текущий сетевой путь Windows/);
+  assert.match(source, /importMethod === "url" \? "Загрузить"/);
+  assert.doesNotMatch(source, /Безопасно загрузить|опасные перенаправления|заблокирует .*локальные адреса/);
 });
 
 test("local-only readiness never maps to global Connected", () => {
@@ -186,9 +188,9 @@ test("subscription fetch errors require the exact finite contract", () => {
     detail: null,
   }));
   assert.throws(() => parsePublicError({
-    code: "subscription_proxy_unavailable",
-    stage: "subscription_proxy",
-    message: "subscription.proxy.unavailable",
+    code: "unknown_subscription_error",
+    stage: "subscription_fetch",
+    message: "subscription.unknown",
     detail: null,
   }), ContractViolation);
   assert.doesNotThrow(() => parsePublicError({
@@ -327,8 +329,8 @@ test("HTTPS URL preview uses the exact typed command and retains no secret", asy
   controller.dispose();
 });
 
-test("automatic URL fetch failure sends the secret once without renderer fallback", async () => {
-  const secret = "https://provider.example/subscription?token=automatic-no-fallback";
+test("automatic URL fetch failure performs one backend request", async () => {
+  const secret = "https://provider.example/subscription?token=single-request";
   const calls: Array<{ command: string; arguments_?: Record<string, unknown> }> = [];
   const transport: TauriTransport = {
     listen: async () => () => undefined,

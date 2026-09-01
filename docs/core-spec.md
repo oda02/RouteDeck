@@ -87,7 +87,7 @@ Authenticode may be recorded as additional evidence if present, but the reviewed
 | --- | --- |
 | Malicious or malformed subscription | Bounded download/decode/parse; no raw config execution; strict protocol allow-list; reject unsupported fields rather than silently weakening them. |
 | YAML aliases/deep nesting/base64 bomb | Disable or cap aliases; maximum depth, scalar length, node count, decoded size, and total nodes. |
-| Subscription URL redirects or local metadata access | HTTPS only in v1; manual redirect and timeout caps; every hop resolves first, rejects any non-public/mixed answer, and pins the validated addresses into the TLS request. |
+| Malformed or unexpectedly large subscription response | HTTPS only in v1; redirect, timeout, response-size, encoding, and parser limits; imported content is data, never executable configuration. |
 | Tampered bundled engine/library | Exact archive and extracted-file SHA-256 pins; runtime verification before launch. |
 | Local port squatting | Bind only `127.0.0.1`/`::1`; preflight ports; fail if occupied; random credentials on internal health listener. |
 | UI/webview compromise | GUI remains unprivileged; narrow typed commands; no arbitrary command/path/env/registry/root accepted by elevated component. |
@@ -190,13 +190,9 @@ Validation rules include DNS-name/IP syntax, port `1..65535`, UUID syntax, bound
 ### 6.1 Fetch boundary
 
 - V1 accepts only bounded `https://` URLs without userinfo or fragments. HTTP and LAN-source opt-ins are not implemented.
-- Every URL import carries a closed transport choice: `Direct/current network` or `Current loopback System Proxy`. Direct never uses Windows, environment, or application proxy discovery. The proxy choice performs a read-only WinINet/RAS snapshot for that request and never changes proxy, registry, VPN, or process state.
-- `Current loopback System Proxy` accepts only an enabled static HTTP/HTTPS proxy whose selected endpoint is a numeric `127.0.0.0/8` or `[::1]` address with a nonzero port. PAC, WPAD, RAS, proxy credentials/URIs, lists, duplicate/unknown schemes, non-loopback endpoints, and ambiguous flags fail closed. It does not send proxy authentication or consult a credential store.
-- The proxy must never resolve the subscription hostname. RouteDeck resolves and validates the hostname itself on every hop, sends `CONNECT <pinned-public-IP>:<port>` to the loopback proxy, then performs Rustls TLS over that tunnel using the original hostname for SNI, `Host`, and normal Windows platform certificate validation. The CONNECT authority contains only the pinned public IP, but a tunnel proxy can observe the destination IP and plaintext TLS SNI hostname. TLS encrypts the URL path/query, HTTP `Host` and other headers, and response body against an ordinary tunnel proxy; it does not protect them from a proxy that holds a certificate chaining to a root trusted by the user's Windows trust store. Hostname secrecy would require a separately reviewed ECH design. There is no direct fallback.
-- Resolve every hostname separately on every hop with a bounded DNS timeout and answer count. Reject the whole answer when any IPv4/IPv6 result is loopback, private, CGNAT, link-local, unspecified, multicast, documentation, benchmarking, transition, or reserved. Pin only the validated answer set into the connection so a second resolver lookup cannot rebind it; keep the original hostname for TLS SNI/certificate verification.
-- Disable automatic redirects and follow at most 3 manually. Every target is parsed and revalidated as a new HTTPS URL; never forward cookies, authorization, caller headers, or a Referer.
-- Use bounded DNS/connect/read/overall timeouts. Read at most 10 MiB plus one sentinel byte from the response stream regardless of `Content-Length`. V1 does not request compression and rejects every non-identity `Content-Encoding`, avoiding an unreviewed decoder/decompression-bomb surface.
-- The explicit proxy path uses a bounded strict HTTP/1.1 CONNECT and origin-response parser: fixed header/line/count/trailer limits, status `200` for CONNECT, no folded headers, one framing mode, bounded chunk sizes, and HTTP/1.1 ALPN only. Redirect and non-200 bodies are not consumed.
+- The UI offers one ordinary load action. The backend automatically uses a supported current loopback Windows System Proxy when one is active; otherwise it connects directly. There is no transport selector and the import never changes Windows proxy, registry, VPN, or process state.
+- Both paths use the standard `reqwest` HTTPS client and the Windows trust policy. Direct requests resolve the origin locally and bind the request to the validated public address set. When a system proxy is used, normal proxy behavior applies: the proxy resolves the origin and can observe the usual CONNECT destination metadata. RouteDeck does not claim that proxy-side DNS prevents rebinding or access to local destinations.
+- Disable automatic redirects and follow at most 3 manually. Every target must remain a valid HTTPS URL. Use bounded DNS/connect/overall timeouts and read at most 10 MiB plus one sentinel byte. V1 does not request compression and rejects non-identity `Content-Encoding`.
 - Reject invalid UTF-8 except an optional UTF-8 BOM. Never execute content sniffed as HTML.
 - Reserve the same bounded preview slot before URL validation, DNS, fetch, and parse. Parse in memory and retain only the typed pending preview; the raw URL is never stored, logged, placed in diagnostics/errors/command lines, or emitted to the renderer after the request returns. Commit the new node set atomically only after confirmation. A failed refresh retains the prior working snapshot.
 
@@ -514,9 +510,9 @@ foreign state.
 
 v2rayN in System Proxy-only mode does not inherently prevent RouteDeck's local listeners
 or TUN core from starting, but its global proxy ownership may conflict with RouteDeck
-System Proxy must not be inherited accidentally. Subscription fetch can use it only through
-the explicit read-only verified-loopback transport above; ordinary requests never inherit it. A
-foreign System Proxy also makes TUN per-app results unreliable for proxy-aware apps: the
+System Proxy mode. Runtime health probes must not inherit it accidentally. Subscription
+import may use a supported current loopback proxy automatically and read-only; ordinary
+runtime requests never inherit it. A foreign System Proxy also makes TUN per-app results unreliable for proxy-aware apps: the
 TUN may observe the foreign proxy core instead of the browser process. The UI labels this
 nested/best-effort and never silently disables the foreign proxy.
 
