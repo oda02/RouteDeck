@@ -7,6 +7,8 @@ pub mod health;
 pub mod redaction;
 mod runtime_constants;
 pub mod subscription;
+#[cfg(windows)]
+mod windows_process;
 
 use std::sync::Arc;
 
@@ -14,7 +16,7 @@ use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .setup(|app| {
             let session_root = app.path().app_local_data_dir()?.join("sessions");
             let handle = app.handle().clone();
@@ -28,7 +30,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::import_preview,
+            commands::preview_import_content,
+            commands::discard_import_preview,
             commands::confirm_import,
             commands::start_local_proxy,
             commands::runtime_status,
@@ -36,6 +39,17 @@ pub fn run() {
             commands::retry_session_recovery,
             commands::runtime_diagnostics,
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run RouteDeck");
+        .build(tauri::generate_context!())
+        .expect("failed to build RouteDeck");
+    app.run(|handle, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            if let Some(controller) = handle.try_state::<Arc<application::ApplicationController>>()
+            {
+                controller.shutdown();
+            }
+        }
+    });
 }

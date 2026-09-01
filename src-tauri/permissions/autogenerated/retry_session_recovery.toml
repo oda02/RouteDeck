@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-retry-session-recovery"
+description = "Enables the retry_session_recovery command without any pre-configured scope."
+commands.allow = ["retry_session_recovery"]
+
+[[permission]]
+identifier = "deny-retry-session-recovery"
+description = "Denies the retry_session_recovery command without any pre-configured scope."
+commands.deny = ["retry_session_recovery"]

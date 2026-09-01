@@ -5,20 +5,28 @@ use tauri::State;
 use crate::{
     application::{
         ApplicationController, ConfirmedImport, Diagnostics, ImportPreview, PublicError,
-        RuntimeStatus,
+        PublicErrorCode, PublicErrorStage, RuntimeStatus,
     },
     domain::DefaultRoute,
 };
 
 #[tauri::command]
-pub async fn import_preview(
+pub async fn preview_import_content(
     controller: State<'_, Arc<ApplicationController>>,
-    input: String,
+    content: String,
 ) -> Result<ImportPreview, PublicError> {
     let controller = Arc::clone(controller.inner());
-    tauri::async_runtime::spawn_blocking(move || controller.import_preview(input))
+    tauri::async_runtime::spawn_blocking(move || controller.preview_import_content(content))
         .await
         .map_err(command_join_error)?
+}
+
+#[tauri::command]
+pub fn discard_import_preview(
+    controller: State<'_, Arc<ApplicationController>>,
+    preview_id: String,
+) -> Result<(), PublicError> {
+    controller.discard_import_preview(&preview_id)
 }
 
 #[tauri::command]
@@ -83,7 +91,9 @@ pub fn runtime_diagnostics(controller: State<'_, Arc<ApplicationController>>) ->
 
 fn command_join_error(_error: impl std::fmt::Display) -> PublicError {
     PublicError {
-        stage: "command".into(),
+        code: PublicErrorCode::CommandFailed,
+        stage: PublicErrorStage::Command,
         message: "Runtime command failed unexpectedly".into(),
+        detail: None,
     }
 }

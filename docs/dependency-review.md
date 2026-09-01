@@ -44,8 +44,8 @@ The reviewed YAML graph is `serde-saphyr 1.2.0` → `granit-parser 1.2.0`, `anno
 ### `windows-sys = 0.61.2` (Windows target only)
 
 - Provenance: official Microsoft `windows-rs` projection crate, already present transitively.
-- Purpose: narrow Win32 calls for protected session directories, reparse/file flags, a kill-on-close Job Object, and exact-PID ownership checks for the three loopback listeners.
-- Enabled namespaces: Foundation, Security/Authorization, Storage FileSystem, NetworkManagement/IpHelper, Networking/WinSock, JobObjects, Memory, and Threading only.
+- Purpose: narrow Win32 calls for protected session files/directories, opened-file identity and ACL checks, restricted child pipes/handle inheritance, suspended process creation, a kill-on-close Job Object, and exact-PID ownership checks for the three loopback listeners.
+- Enabled namespaces: Foundation, Security/Authorization, Storage FileSystem, NetworkManagement/IpHelper, Networking/WinSock, JobObjects, Memory, Pipes, SystemInformation, and Threading only.
 - Build/lifecycle: generated FFI bindings; no runtime, installer, network access, or build download.
 - crates.io checksum: `ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc`.
 
@@ -53,20 +53,20 @@ The reviewed YAML graph is `serde-saphyr 1.2.0` → `granit-parser 1.2.0`, `anno
 
 - `sha2 = 0.10.9`: hashes already pinned engine files from open handles.
 - `serde` / `serde_json`: parse the embedded, reviewed engine lock and serialize typed command/event DTOs.
-- `tauri`: typed command/state/event wiring only; the renderer cannot supply an executable, configuration path, arguments, environment, or health URL.
+- `tauri`: typed command/state/event wiring only; an `AppManifest` generates permissions for the eight named commands, and the main capability grants only those commands plus event listen/unlisten. The renderer cannot supply an executable, configuration path, arguments, environment, or health URL.
 
 ## Deliberately not added
 
-- No shell/process helper crate: `std::process::Command` is constrained to fixed arguments and a verified app-owned binary.
+- No shell/process helper crate: the Windows boundary calls `CreateProcessW` directly with a closed internal action enum, fixed arguments, explicit application/current-directory paths, an allow-listed environment with no `PATH`, and an explicit inherited-handle list.
 - No async runtime direct dependency: serialized operations run behind the controller boundary; Tauri owns command dispatch.
 - No temporary-file/ACL convenience crate: session files use a fixed application-data root, random private directory, restrictive Windows DACL, atomic rename, and best-effort deletion.
 - No native OpenSSL backend, updater, archive extractor, engine downloader, telemetry, DNS client, or arbitrary URL configuration.
 
 ## Residual risks
 
-Holding engine and DLL handles without write/delete sharing materially narrows verify-to-launch replacement, and the runtime re-verifies immediately before each process creation. Windows process creation still names the fixed executable path; a malicious process running as the same user is not a strong isolation boundary and remains a documented TOCTOU residual until packaging supplies a package-private ACL plus file-identity revalidation/handle-based launch acceptable to independent Windows security review.
+Each check/run launch opens the engine directory without delete sharing, rejects every unlocked entry, hashes the exact executable and companion DLL through non-write/non-delete-shared handles, and keeps those directory/file handles alive for the child lifetime. The native boundary creates the fixed executable suspended, assigns it to a kill-on-close Job Object, starts the bounded stderr reader, then resumes it; all pre-resume failure paths terminate the suspended process. The configuration is created with an explicit protected DACL, its opened disk-file identity and security descriptor are recorded, and a freshly opened non-reparse handle must match immediately before both check and run. That handle and the guarded session directory remain alive with the child.
 
-The standard-library process launcher starts the child before RouteDeck can assign it to the configured Job Object. RouteDeck fails closed if assignment fails and holds verified artifact/config handles, but the pre-assignment execution window remains a release-blocking hardening item for hostile same-user scenarios. A native suspended `CreateProcess` → assign Job → resume path requires independent Windows security review before the local runtime is called fully hardened.
+This prevents replacement of the verified files and the former spawn-before-Job gap under normal Windows sharing semantics. A directory handle does **not** prevent the same user from creating a new, differently named file inside a writable portable engine directory after enumeration; nor is the runtime a boundary against pre-existing privileged handles or debugger rights. Release packaging must therefore apply and verify a package-private ACL before live-engine acceptance, and hostile late-DLL-creation/handle-inheritance tests remain a Windows-VM release gate. Windows still launches by the verified fixed path because `CreateProcessW` has no supported launch-by-file-handle API.
 
 Session construction failure deletes only the fresh random directory created by that same operation. Startup recovery deliberately does not infer ownership from a directory name or expected filenames: if any previous session entry exists, RouteDeck preserves it, starts the UI in typed `RecoveryRequired` state, and blocks Connect. The explicit `retry_session_recovery` command only rechecks that the user-reviewed directory is empty; it never deletes files. Any future automated deletion requires a durable product marker plus owner/DACL and opened-file identity revalidation.
 

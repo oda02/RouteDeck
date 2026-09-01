@@ -3,5 +3,16 @@
   "identifier": "default",
   "description": "Minimal capability set for the main RouteDeck window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "allow-preview-import-content",
+    "allow-discard-import-preview",
+    "allow-confirm-import",
+    "allow-start-local-proxy",
+    "allow-runtime-status",
+    "allow-stop-local-proxy",
+    "allow-retry-session-recovery",
+    "allow-runtime-diagnostics",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
 }

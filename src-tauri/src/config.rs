@@ -17,7 +17,7 @@ pub struct LocalPorts {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureMode {
-    SystemProxy,
+    LocalProxy,
     Tun(TunSettings),
 }
 
@@ -521,7 +521,7 @@ mod tests {
         ConfigRequest {
             node,
             policy,
-            mode: CaptureMode::SystemProxy,
+            mode: CaptureMode::LocalProxy,
             ports: LocalPorts {
                 http: 18080,
                 socks: 18081,

@@ -57,6 +57,7 @@ impl TrafficProber for HttpsTrafficProber {
             .map_err(|_| RuntimeError::new("prove_traffic", "health proxy URL is invalid"))?
             .basic_auth(HEALTH_PROXY_USERNAME, &route.password);
         let client = Client::builder()
+            .no_proxy()
             .proxy(proxy)
             .redirect(Policy::none())
             .timeout(STARTUP_PROOF_TIMEOUT)
@@ -98,6 +99,12 @@ pub(crate) trait ListenerVerifier: Send + Sync {
         ports: LocalPorts,
         child: &mut dyn ManagedChild,
     ) -> Result<(), RuntimeError>;
+
+    fn verify_owned_now(
+        &self,
+        ports: LocalPorts,
+        child: &mut dyn ManagedChild,
+    ) -> Result<(), RuntimeError>;
 }
 
 pub(crate) struct TcpListenerVerifier;
@@ -117,14 +124,7 @@ impl ListenerVerifier for TcpListenerVerifier {
                     "sing-box exited before listeners became ready",
                 ));
             }
-            if expected.iter().all(|port| {
-                TcpStream::connect_timeout(
-                    &SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, *port)),
-                    Duration::from_millis(100),
-                )
-                .is_ok()
-            }) && loopback_ports_owned_by(ports, child.pid())?
-            {
+            if listeners_owned_now(expected, ports, child.pid())? {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -136,6 +136,42 @@ impl ListenerVerifier for TcpListenerVerifier {
             std::thread::sleep(Duration::from_millis(40));
         }
     }
+
+    fn verify_owned_now(
+        &self,
+        ports: LocalPorts,
+        child: &mut dyn ManagedChild,
+    ) -> Result<(), RuntimeError> {
+        if !child.is_alive()? {
+            return Err(RuntimeError::new(
+                "engine_process",
+                "sing-box process is not running",
+            ));
+        }
+        if listeners_owned_now([ports.http, ports.socks, ports.health], ports, child.pid())? {
+            Ok(())
+        } else {
+            Err(RuntimeError::new(
+                "verify_listeners",
+                "loopback listener ownership proof failed",
+            ))
+        }
+    }
+}
+
+fn listeners_owned_now(
+    expected: [u16; 3],
+    ports: LocalPorts,
+    pid: u32,
+) -> Result<bool, RuntimeError> {
+    let accepting = expected.iter().all(|port| {
+        TcpStream::connect_timeout(
+            &SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, *port)),
+            Duration::from_millis(100),
+        )
+        .is_ok()
+    });
+    Ok(accepting && loopback_ports_owned_by(ports, pid)?)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +289,24 @@ mod tests {
         let debug = format!("{route:?}");
         assert!(!debug.contains("fixture-secret"));
         assert!(!debug.contains("direct"));
+    }
+
+    #[test]
+    fn failed_explicit_health_proxy_is_never_bypassed() {
+        use std::{net::TcpListener, sync::mpsc, thread};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            accepted_tx.send(()).unwrap();
+            drop(stream);
+        });
+        let result = HttpsTrafficProber.prove(&HealthRoute::new(port, "fixture-secret".into()));
+        assert!(result.is_err());
+        accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        server.join().unwrap();
     }
 
     #[test]

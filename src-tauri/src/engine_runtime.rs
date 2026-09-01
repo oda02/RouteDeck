@@ -5,8 +5,7 @@ use std::{
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddrV4, TcpListener},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -15,6 +14,8 @@ use getrandom::fill as fill_random;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+#[cfg(windows)]
+use crate::windows_process::{create_suspended_engine, EngineAction, PlatformProcess};
 use crate::{config::LocalPorts, redaction::Redactor};
 
 const EMBEDDED_ENGINE_LOCK: &str = include_str!("../../engine/sing-box.lock.json");
@@ -22,6 +23,7 @@ const ENGINE_DIRECTORY: &str = "engine";
 const ENGINE_EXE: &str = "sing-box.exe";
 const CRONET_DLL: &str = "libcronet.dll";
 const CHECK_TIMEOUT: Duration = Duration::from_secs(8);
+const CHECK_READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_CHECK_STDERR: usize = 64 * 1024;
 const MAX_DIAGNOSTIC_LINES: usize = 128;
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
@@ -113,6 +115,7 @@ impl FixedEngineLayout {
 }
 
 struct VerifiedFiles {
+    _directory: File,
     _executable: File,
     _cronet: File,
 }
@@ -131,6 +134,7 @@ impl FixedEngineLayout {
                 "embedded engine identity is unsupported",
             ));
         }
+        let held_directory = open_engine_directory_guard(&self.engine_dir)?;
         reject_unlocked_binaries(&self.engine_dir, &lock.runtime_files)?;
         let mut held_executable = None;
         let mut held_cronet = None;
@@ -167,6 +171,7 @@ impl FixedEngineLayout {
             }
         }
         let files = VerifiedFiles {
+            _directory: held_directory,
             _executable: held_executable.ok_or_else(|| {
                 RuntimeError::new("engine_integrity", "locked executable is missing")
             })?,
@@ -178,32 +183,70 @@ impl FixedEngineLayout {
     }
 }
 
+fn open_engine_directory_guard(path: &Path) -> Result<File, RuntimeError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options
+        .open(path)
+        .map_err(|error| RuntimeError::new("engine_integrity", error.to_string()))
+}
+
 fn reject_unlocked_binaries(
     engine_dir: &Path,
     locked_files: &[LockedFile],
 ) -> Result<(), RuntimeError> {
-    let allowed: BTreeSet<String> = locked_files
+    let allowed_exact: BTreeSet<String> = locked_files
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect();
+    let allowed_folded: BTreeSet<String> = locked_files
         .iter()
         .map(|entry| entry.path.to_ascii_lowercase())
         .collect();
-    if allowed.len() != locked_files.len() {
+    if allowed_exact.len() != locked_files.len() || allowed_folded.len() != locked_files.len() {
         return Err(RuntimeError::new(
             "engine_integrity",
             "engine lock contains duplicate runtime paths",
         ));
     }
+    let mut seen_folded = BTreeSet::new();
+    let mut entry_count = 0_usize;
     for entry in fs::read_dir(engine_dir)
         .map_err(|error| RuntimeError::new("engine_integrity", error.to_string()))?
     {
         let entry =
             entry.map_err(|error| RuntimeError::new("engine_integrity", error.to_string()))?;
         reject_reparse(&entry.path())?;
-        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        entry_count = entry_count.saturating_add(1);
+        let file_name = entry.file_name();
+        let name = file_name.to_str().ok_or_else(|| {
+            RuntimeError::new(
+                "engine_integrity",
+                "engine directory contains a non-Unicode runtime name",
+            )
+        })?;
+        let folded = name.to_ascii_lowercase();
         if !entry
             .file_type()
             .map_err(|error| RuntimeError::new("engine_integrity", error.to_string()))?
             .is_file()
-            || !allowed.contains(&name)
+            || !accept_runtime_entry_name(
+                name,
+                &folded,
+                &allowed_exact,
+                &allowed_folded,
+                &mut seen_folded,
+            )
         {
             return Err(RuntimeError::new(
                 "engine_integrity",
@@ -211,7 +254,25 @@ fn reject_unlocked_binaries(
             ));
         }
     }
+    if entry_count != locked_files.len() || seen_folded.len() != locked_files.len() {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "engine directory does not exactly match the embedded lock",
+        ));
+    }
     Ok(())
+}
+
+fn accept_runtime_entry_name(
+    name: &str,
+    folded: &str,
+    allowed_exact: &BTreeSet<String>,
+    allowed_folded: &BTreeSet<String>,
+    seen_folded: &mut BTreeSet<String>,
+) -> bool {
+    allowed_exact.contains(name)
+        && allowed_folded.contains(folded)
+        && seen_folded.insert(folded.to_owned())
 }
 
 fn reject_reparse(path: &Path) -> Result<(), RuntimeError> {
@@ -332,28 +393,57 @@ pub(crate) struct SessionConfig {
     directory: PathBuf,
     config_path: PathBuf,
     guard: Option<File>,
+    directory_guard: Option<File>,
+    identity: ConfigIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigIdentity {
+    #[cfg(windows)]
+    volume_serial: u64,
+    #[cfg(windows)]
+    file_id: [u8; 16],
+    #[cfg(windows)]
+    security_descriptor: Vec<u8>,
+    #[cfg(not(windows))]
+    length: u64,
 }
 
 impl SessionConfig {
     pub(crate) fn create(root: &Path, contents: &str) -> Result<Self, RuntimeError> {
+        Self::create_with_identity(root, contents, config_identity)
+    }
+
+    fn create_with_identity(
+        root: &Path,
+        contents: &str,
+        identity_reader: impl FnOnce(&File) -> Result<ConfigIdentity, RuntimeError>,
+    ) -> Result<Self, RuntimeError> {
         fs::create_dir_all(root)
             .map_err(|error| RuntimeError::new("session_storage", error.to_string()))?;
         reject_reparse(root)?;
         let session_id = random_hex(16)?;
         let directory = root.join(format!("session-{session_id}"));
         create_private_directory(&directory)?;
-        let result = create_session_config(&directory, contents);
-        match result {
-            Ok((config_path, guard)) => Ok(Self {
-                directory,
+        let result = (|| {
+            let directory_guard = open_session_directory_guard(&directory)?;
+            let (config_path, guard) = create_session_config(&directory, contents)?;
+            let identity = identity_reader(&guard)?;
+            Ok(Self {
+                directory: directory.clone(),
                 config_path,
                 guard: Some(guard),
-            }),
+                directory_guard: Some(directory_guard),
+                identity,
+            })
+        })();
+        match result {
+            Ok(session) => Ok(session),
             Err(error) => {
                 let cleanup = cleanup_session_directory(&directory);
                 if cleanup.is_err() {
                     return Err(RuntimeError::new(
-                        "session_storage",
+                        "session_recovery",
                         "session configuration failed and partial secret cleanup was incomplete",
                     ));
                 }
@@ -365,6 +455,21 @@ impl SessionConfig {
     pub(crate) fn path(&self) -> &Path {
         &self.config_path
     }
+
+    pub(crate) fn revalidate_for_launch(&self) -> Result<File, RuntimeError> {
+        reject_reparse(&self.directory)
+            .map_err(|error| RuntimeError::new("session_storage", error.message))?;
+        reject_reparse(&self.config_path)
+            .map_err(|error| RuntimeError::new("session_storage", error.message))?;
+        let reopened = open_config_guard(&self.config_path)?;
+        if config_identity(&reopened)? != self.identity {
+            return Err(RuntimeError::new(
+                "session_storage",
+                "session configuration identity or ACL changed before launch",
+            ));
+        }
+        Ok(reopened)
+    }
 }
 
 fn create_session_config(
@@ -373,11 +478,7 @@ fn create_session_config(
 ) -> Result<(PathBuf, File), RuntimeError> {
     let temporary = directory.join("config.tmp");
     let config_path = directory.join("config.json");
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|error| RuntimeError::new("session_storage", error.to_string()))?;
+    let mut file = create_private_config_file(&temporary)?;
     file.write_all(contents.as_bytes())
         .and_then(|_| file.sync_all())
         .map_err(|error| RuntimeError::new("session_storage", error.to_string()))?;
@@ -386,22 +487,26 @@ fn create_session_config(
         .map_err(|error| RuntimeError::new("session_storage", error.to_string()))?;
     reject_reparse(&config_path)
         .map_err(|error| RuntimeError::new("session_storage", error.message))?;
-    let mut guard_options = OpenOptions::new();
-    guard_options.read(true);
+    let guard = open_config_guard(&config_path)?;
+    Ok((config_path, guard))
+}
+
+fn open_config_guard(path: &Path) -> Result<File, RuntimeError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
         };
-        guard_options
+        options
             .share_mode(FILE_SHARE_READ)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let guard = guard_options
-        .open(&config_path)
-        .map_err(|error| RuntimeError::new("session_storage", error.to_string()))?;
-    Ok((config_path, guard))
+    options
+        .open(path)
+        .map_err(|error| RuntimeError::new("session_storage", error.to_string()))
 }
 
 pub(crate) fn reconcile_stale_sessions(root: &Path) -> Result<(), RuntimeError> {
@@ -454,9 +559,205 @@ fn cleanup_session_directory(directory: &Path) -> Result<(), RuntimeError> {
 impl Drop for SessionConfig {
     fn drop(&mut self) {
         self.guard.take();
+        self.directory_guard.take();
         let _ = fs::remove_file(&self.config_path);
         let _ = fs::remove_dir(&self.directory);
     }
+}
+
+#[cfg(windows)]
+fn open_session_directory_guard(path: &Path) -> Result<File, RuntimeError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| RuntimeError::new("session_storage", error.to_string()))
+}
+
+#[cfg(not(windows))]
+fn open_session_directory_guard(path: &Path) -> Result<File, RuntimeError> {
+    File::open(path).map_err(|error| RuntimeError::new("session_storage", error.to_string()))
+}
+
+#[cfg(windows)]
+fn create_private_config_file(path: &Path) -> Result<File, RuntimeError> {
+    use std::{mem::size_of, os::windows::ffi::OsStrExt, os::windows::io::FromRawHandle, ptr};
+    use windows_sys::Win32::{
+        Foundation::{LocalFree, GENERIC_READ, GENERIC_WRITE},
+        Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            },
+            PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+        },
+        Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ},
+    };
+
+    let descriptor_text: Vec<u16> = OsStr::new("D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            descriptor_text.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(RuntimeError::new(
+            "session_storage",
+            "could not construct private configuration ACL",
+        ));
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            ptr::null_mut(),
+        )
+    };
+    unsafe {
+        LocalFree(descriptor);
+    }
+    if handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return Err(RuntimeError::new(
+            "session_storage",
+            "could not create private session configuration",
+        ));
+    }
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+#[cfg(not(windows))]
+fn create_private_config_file(path: &Path) -> Result<File, RuntimeError> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| RuntimeError::new("session_storage", error.to_string()))
+}
+
+#[cfg(windows)]
+fn config_identity(file: &File) -> Result<ConfigIdentity, RuntimeError> {
+    use std::{mem::size_of, os::windows::io::AsRawHandle, ptr, slice};
+    use windows_sys::Win32::{
+        Foundation::{LocalFree, ERROR_SUCCESS},
+        Security::{
+            Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
+            GetSecurityDescriptorControl, GetSecurityDescriptorLength, DACL_SECURITY_INFORMATION,
+            GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+            SE_DACL_PROTECTED,
+        },
+        Storage::FileSystem::{
+            FileIdInfo, GetFileInformationByHandleEx, GetFileType, FILE_ID_INFO, FILE_TYPE_DISK,
+        },
+    };
+
+    if !file
+        .metadata()
+        .map_err(|error| RuntimeError::new("session_storage", error.to_string()))?
+        .is_file()
+    {
+        return Err(RuntimeError::new(
+            "session_storage",
+            "session configuration is not a regular file",
+        ));
+    }
+    let handle = file.as_raw_handle();
+    if unsafe { GetFileType(handle) } != FILE_TYPE_DISK {
+        return Err(RuntimeError::new(
+            "session_storage",
+            "session configuration is not a disk file",
+        ));
+    }
+    let mut information = FILE_ID_INFO::default();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&mut information as *mut FILE_ID_INFO).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(RuntimeError::new(
+            "session_storage",
+            "could not read session configuration identity",
+        ));
+    }
+
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() {
+        return Err(RuntimeError::new(
+            "session_storage",
+            "could not read session configuration ACL",
+        ));
+    }
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    let control_ok =
+        unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
+    let descriptor_length = unsafe { GetSecurityDescriptorLength(descriptor) } as usize;
+    if control_ok == 0 || descriptor_length == 0 || control & SE_DACL_PROTECTED == 0 {
+        unsafe {
+            LocalFree(descriptor);
+        }
+        return Err(RuntimeError::new(
+            "session_storage",
+            "session configuration ACL is not protected",
+        ));
+    }
+    let security_descriptor =
+        unsafe { slice::from_raw_parts(descriptor.cast(), descriptor_length) }.to_vec();
+    unsafe {
+        LocalFree(descriptor);
+    }
+    Ok(ConfigIdentity {
+        volume_serial: information.VolumeSerialNumber,
+        file_id: information.FileId.Identifier,
+        security_descriptor,
+    })
+}
+
+#[cfg(not(windows))]
+fn config_identity(file: &File) -> Result<ConfigIdentity, RuntimeError> {
+    let length = file
+        .metadata()
+        .map_err(|error| RuntimeError::new("session_storage", error.to_string()))?
+        .len();
+    Ok(ConfigIdentity { length })
 }
 
 #[cfg(windows)]
@@ -473,10 +774,11 @@ fn create_private_directory(path: &Path) -> Result<(), RuntimeError> {
         Storage::FileSystem::CreateDirectoryW,
     };
 
-    let descriptor_text: Vec<u16> = OsStr::new("D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)")
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
+    let descriptor_text: Vec<u16> =
+        OsStr::new("D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
     let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
     let converted = unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -562,14 +864,14 @@ pub(crate) trait ManagedChild: Send {
 pub(crate) trait EngineLauncher: Send + Sync {
     fn check(
         &self,
-        config: &Path,
+        config: &SessionConfig,
         redactor: Redactor,
         diagnostics: Arc<Mutex<DiagnosticBuffer>>,
     ) -> Result<String, RuntimeError>;
 
     fn start(
         &self,
-        config: &Path,
+        config: &SessionConfig,
         redactor: Redactor,
         diagnostics: Arc<Mutex<DiagnosticBuffer>>,
     ) -> Result<Box<dyn ManagedChild>, RuntimeError>;
@@ -577,12 +879,20 @@ pub(crate) trait EngineLauncher: Send + Sync {
 
 pub(crate) struct VerifiedEngineLauncher {
     layout: FixedEngineLayout,
+    prepared: Mutex<Option<PreparedVerification>>,
+}
+
+struct PreparedVerification {
+    config_path: PathBuf,
+    verified_files: VerifiedFiles,
+    _config_guard: File,
 }
 
 impl VerifiedEngineLauncher {
     pub(crate) fn resolve() -> Result<Self, RuntimeError> {
         Ok(Self {
             layout: FixedEngineLayout::resolve()?,
+            prepared: Mutex::new(None),
         })
     }
 }
@@ -590,41 +900,52 @@ impl VerifiedEngineLauncher {
 impl EngineLauncher for VerifiedEngineLauncher {
     fn check(
         &self,
-        config: &Path,
+        config: &SessionConfig,
         redactor: Redactor,
         diagnostics: Arc<Mutex<DiagnosticBuffer>>,
     ) -> Result<String, RuntimeError> {
         let (_check_guards, version) = self.layout.verify()?;
-        let mut check = fixed_command(
-            &self.layout,
-            &[OsStr::new("check"), OsStr::new("-c"), config.as_os_str()],
-        );
-        let mut child = check
-            .spawn()
-            .map_err(|error| RuntimeError::new("config_check", error.to_string()))?;
-        let _check_job = KillOnDropJob::assign(&mut child)?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            RuntimeError::new("config_check", "engine check stderr was unavailable")
-        })?;
-        let reader = thread::spawn(move || read_bounded(stderr, MAX_CHECK_STDERR));
+        let _config_guard = config.revalidate_for_launch()?;
+        let mut suspended = create_suspended_engine(
+            &self.layout.executable,
+            &self.layout.engine_dir,
+            EngineAction::Check,
+            config.path(),
+        )
+        .map_err(as_config_check_error)?;
+        let stderr = suspended.take_stderr().map_err(as_config_check_error)?;
+        let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
+        let _reader = thread::Builder::new()
+            .name("routedeck-check-stderr".into())
+            .spawn(move || {
+                let _ = stderr_tx.send(read_bounded(stderr, MAX_CHECK_STDERR));
+            })
+            .map_err(|_| RuntimeError::new("config_check", "could not start stderr reader"))?;
+        let mut child = suspended.resume().map_err(as_config_check_error)?;
         let deadline = Instant::now() + CHECK_TIMEOUT;
-        let status = loop {
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|error| RuntimeError::new("config_check", error.to_string()))?
-            {
-                break status;
+        let exit_code = loop {
+            if let Some(exit_code) = child.try_wait().map_err(as_config_check_error)? {
+                break exit_code;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                child
+                    .terminate_tree(Duration::from_secs(1))
+                    .map_err(as_config_check_error)?;
                 return Err(RuntimeError::new("config_check", "engine check timed out"));
             }
             thread::sleep(Duration::from_millis(20));
         };
-        let raw = reader
-            .join()
-            .unwrap_or_else(|_| "stderr reader failed".into());
+        child
+            .terminate_tree(Duration::from_secs(1))
+            .map_err(as_config_check_error)?;
+        let raw = stderr_rx
+            .recv_timeout(CHECK_READER_DRAIN_TIMEOUT)
+            .map_err(|_| {
+                RuntimeError::new(
+                    "config_check",
+                    "engine diagnostic pipe did not close after check",
+                )
+            })?;
         let sanitized = redactor.redact(&raw);
         if !sanitized.trim().is_empty() {
             diagnostics
@@ -632,7 +953,7 @@ impl EngineLauncher for VerifiedEngineLauncher {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(sanitized.clone());
         }
-        if !status.success() {
+        if exit_code != 0 {
             return Err(RuntimeError::new(
                 "config_check",
                 if sanitized.trim().is_empty() {
@@ -643,63 +964,66 @@ impl EngineLauncher for VerifiedEngineLauncher {
             ));
         }
 
+        let (verified_files, _) = self.layout.verify()?;
+        let config_guard = config.revalidate_for_launch()?;
+        *self
+            .prepared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PreparedVerification {
+            config_path: config.path().to_owned(),
+            verified_files,
+            _config_guard: config_guard,
+        });
+
         Ok(version)
     }
 
     fn start(
         &self,
-        config: &Path,
+        config: &SessionConfig,
         redactor: Redactor,
         diagnostics: Arc<Mutex<DiagnosticBuffer>>,
     ) -> Result<Box<dyn ManagedChild>, RuntimeError> {
-        let (launch_guards, _launch_version) = self.layout.verify()?;
-        let mut command = fixed_command(
-            &self.layout,
-            &[OsStr::new("run"), OsStr::new("-c"), config.as_os_str()],
-        );
-        let mut child = command
-            .spawn()
-            .map_err(|error| RuntimeError::new("start_engine", error.to_string()))?;
-        let job = KillOnDropJob::assign(&mut child)?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            let _ = child.kill();
-            RuntimeError::new("start_engine", "engine stderr was unavailable")
-        })?;
+        let prepared = self
+            .prepared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .filter(|prepared| prepared.config_path == config.path())
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    "start_engine",
+                    "engine launch was not prepared by the matching configuration check",
+                )
+            })?;
+        let config_guard = config.revalidate_for_launch()?;
+        let mut suspended = create_suspended_engine(
+            &self.layout.executable,
+            &self.layout.engine_dir,
+            EngineAction::Run,
+            config.path(),
+        )?;
+        let stderr = suspended.take_stderr()?;
         let diagnostic_target = diagnostics.clone();
         let stderr_redactor = redactor.clone();
-        let stderr_thread = thread::spawn(move || {
-            capture_stderr(stderr, &stderr_redactor, &diagnostic_target);
-        });
+        let stderr_thread = thread::Builder::new()
+            .name("routedeck-engine-stderr".into())
+            .spawn(move || {
+                capture_stderr(stderr, &stderr_redactor, &diagnostic_target);
+            })
+            .map_err(|_| RuntimeError::new("start_engine", "could not start stderr reader"))?;
+        let child = suspended.resume()?;
         Ok(Box::new(RealManagedChild {
             child,
-            job: Some(job),
             stderr_thread: Some(stderr_thread),
-            _verified_files: launch_guards,
+            _verified_files: prepared.verified_files,
+            _config_guard: config_guard,
         }))
     }
 }
 
-fn fixed_command(layout: &FixedEngineLayout, arguments: &[&OsStr]) -> Command {
-    let mut command = Command::new(&layout.executable);
-    command
-        .args(arguments)
-        .current_dir(&layout.engine_dir)
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    for name in ["SystemRoot", "WINDIR", "TEMP", "TMP", "LOCALAPPDATA"] {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    command
+fn as_config_check_error(error: RuntimeError) -> RuntimeError {
+    RuntimeError::new("config_check", error.message().to_owned())
 }
 
 fn read_bounded(reader: impl Read, limit: usize) -> String {
@@ -767,168 +1091,37 @@ fn push_redacted_bytes(
 }
 
 struct RealManagedChild {
-    child: Child,
-    job: Option<KillOnDropJob>,
+    child: PlatformProcess,
     stderr_thread: Option<thread::JoinHandle<()>>,
     _verified_files: VerifiedFiles,
+    _config_guard: File,
 }
 
 impl ManagedChild for RealManagedChild {
     fn pid(&self) -> u32 {
-        self.child.id()
+        self.child.pid()
     }
 
     fn is_alive(&mut self) -> Result<bool, RuntimeError> {
-        self.child
-            .try_wait()
-            .map(|status| status.is_none())
-            .map_err(|error| RuntimeError::new("engine_process", error.to_string()))
+        self.child.try_wait().map(|status| status.is_none())
     }
 
     fn stop(&mut self) -> Result<(), RuntimeError> {
-        if self
-            .child
-            .try_wait()
-            .map_err(|error| RuntimeError::new("stop_engine", error.to_string()))?
-            .is_none()
-        {
-            if let Err(error) = self.child.kill() {
-                if self
-                    .child
-                    .try_wait()
-                    .map_err(|wait_error| RuntimeError::new("stop_engine", wait_error.to_string()))?
-                    .is_none()
-                {
-                    return Err(RuntimeError::new("stop_engine", error.to_string()));
-                }
-            }
-        }
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let mut exited = loop {
-            if self
-                .child
-                .try_wait()
-                .map_err(|error| RuntimeError::new("stop_engine", error.to_string()))?
-                .is_some()
-            {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            thread::sleep(Duration::from_millis(20));
-        };
-        self.job.take();
-        if !exited {
-            let job_deadline = Instant::now() + Duration::from_secs(1);
-            loop {
-                if self
-                    .child
-                    .try_wait()
-                    .map_err(|error| RuntimeError::new("stop_engine", error.to_string()))?
-                    .is_some()
-                {
-                    exited = true;
-                    break;
-                }
-                if Instant::now() >= job_deadline {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-        if exited {
+        let stopped = self.child.terminate_tree(Duration::from_secs(4));
+        if stopped.is_ok() {
             if let Some(reader) = self.stderr_thread.take() {
                 let _ = reader.join();
             }
-            Ok(())
         } else {
             self.stderr_thread.take();
-            Err(RuntimeError::new(
-                "stop_engine",
-                "engine did not exit within the shutdown deadline",
-            ))
         }
+        stopped
     }
 }
 
 impl Drop for RealManagedChild {
     fn drop(&mut self) {
         let _ = self.stop();
-    }
-}
-
-#[cfg(windows)]
-struct KillOnDropJob(windows_sys::Win32::Foundation::HANDLE);
-
-// A Job Object HANDLE has no thread affinity. This wrapper owns the handle and
-// closes it exactly once, so transferring ownership with the managed child is safe.
-#[cfg(windows)]
-unsafe impl Send for KillOnDropJob {}
-
-#[cfg(windows)]
-impl KillOnDropJob {
-    fn assign(child: &mut Child) -> Result<Self, RuntimeError> {
-        use std::{mem::size_of, os::windows::io::AsRawHandle, ptr};
-        use windows_sys::Win32::{
-            Foundation::CloseHandle,
-            System::JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-                SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            },
-        };
-        let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-        if handle.is_null() {
-            let _ = child.kill();
-            return Err(RuntimeError::new(
-                "start_engine",
-                "could not create engine Job Object",
-            ));
-        }
-        let mut information: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let configured = unsafe {
-            SetInformationJobObject(
-                handle,
-                JobObjectExtendedLimitInformation,
-                &information as *const _ as *const _,
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        let assigned = if configured != 0 {
-            unsafe { AssignProcessToJobObject(handle, child.as_raw_handle() as _) }
-        } else {
-            0
-        };
-        if assigned == 0 {
-            let _ = child.kill();
-            unsafe { CloseHandle(handle) };
-            return Err(RuntimeError::new(
-                "start_engine",
-                "could not assign engine to kill-on-close Job Object",
-            ));
-        }
-        Ok(Self(handle))
-    }
-}
-
-#[cfg(windows)]
-impl Drop for KillOnDropJob {
-    fn drop(&mut self) {
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.0);
-        }
-    }
-}
-
-#[cfg(not(windows))]
-struct KillOnDropJob;
-
-#[cfg(not(windows))]
-impl KillOnDropJob {
-    fn assign(_child: &mut Child) -> Result<Self, RuntimeError> {
-        Ok(Self)
     }
 }
 
@@ -1020,6 +1213,52 @@ mod tests {
     }
 
     #[test]
+    fn runtime_entry_names_reject_case_variants_and_folded_duplicates() {
+        let exact = BTreeSet::from([ENGINE_EXE.to_owned()]);
+        let folded = BTreeSet::from([ENGINE_EXE.to_ascii_lowercase()]);
+        let mut seen = BTreeSet::new();
+        assert!(!accept_runtime_entry_name(
+            "SING-BOX.EXE",
+            "sing-box.exe",
+            &exact,
+            &folded,
+            &mut seen,
+        ));
+        assert!(accept_runtime_entry_name(
+            ENGINE_EXE,
+            "sing-box.exe",
+            &exact,
+            &folded,
+            &mut seen,
+        ));
+        assert!(!accept_runtime_entry_name(
+            ENGINE_EXE,
+            "sing-box.exe",
+            &exact,
+            &folded,
+            &mut seen,
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verified_engine_guards_block_directory_replacement_and_file_mutation() {
+        let fixture = FixtureLayout::create();
+        let (guards, _) = fixture.layout.verify_lock(&fixture.lock).unwrap();
+        assert!(fs::rename(
+            &fixture.layout.engine_dir,
+            fixture.root.join("engine-replaced")
+        )
+        .is_err());
+        assert!(OpenOptions::new()
+            .write(true)
+            .open(&fixture.layout.executable)
+            .is_err());
+        drop(guards);
+        fs::write(fixture.layout.engine_dir.join("late.dll"), b"foreign").unwrap();
+    }
+
+    #[test]
     fn reservations_are_distinct_and_occupy_loopback_ports() {
         let reservations = PortReservations::reserve().unwrap();
         let ports = reservations.ports();
@@ -1082,6 +1321,16 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    #[test]
+    fn native_check_boundary_errors_are_remapped_to_config_check() {
+        let error = as_config_check_error(RuntimeError::new(
+            "start_engine",
+            "fixture native launch failure",
+        ));
+        assert_eq!(error.stage(), "config_check");
+        assert_eq!(error.message(), "fixture native launch failure");
+    }
+
     #[cfg(windows)]
     #[test]
     fn session_config_is_private_atomic_and_locked_against_mutation() {
@@ -1102,6 +1351,25 @@ mod tests {
         let canonical_temp = fs::canonicalize(std::env::temp_dir()).unwrap();
         let canonical_root = fs::canonicalize(&root).unwrap();
         assert!(canonical_root.starts_with(&canonical_temp) && canonical_root != canonical_temp);
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn partial_session_construction_removes_generated_secret_data() {
+        let root = std::env::temp_dir().join(format!(
+            "routedeck-session-partial-{}",
+            random_hex(8).unwrap()
+        ));
+        let error = SessionConfig::create_with_identity(&root, "{\"secret\":\"fixture\"}", |_| {
+            Err(RuntimeError::new(
+                "session_storage",
+                "injected identity failure",
+            ))
+        })
+        .err()
+        .expect("injected identity failure was accepted");
+        assert_eq!(error.stage(), "session_storage");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
         fs::remove_dir(root).unwrap();
     }
 

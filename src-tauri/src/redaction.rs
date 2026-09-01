@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, fmt};
 use serde_json::Value;
 use url::Url;
 
-use crate::domain::{Node, NodeProtocol, Secret, TlsOptions};
+use crate::domain::{Node, NodeProtocol, Secret, TlsOptions, VlessTransport};
 
 const REDACTED: &str = "[REDACTED]";
 const OMITTED: &str = "[REDACTED: diagnostic omitted]";
@@ -46,10 +46,23 @@ impl Redactor {
     pub fn from_nodes(nodes: &[Node]) -> Self {
         let mut redactor = Self::default();
         for node in nodes {
+            redactor.add_text(node.server());
             match node.protocol() {
                 NodeProtocol::Vless(value) => {
                     redactor.add(&value.uuid);
                     redactor.add_tls(&value.tls);
+                    match &value.transport {
+                        VlessTransport::Tcp => {}
+                        VlessTransport::WebSocket { path, host } => {
+                            redactor.add_text(path);
+                            if let Some(host) = host {
+                                redactor.add_text(host);
+                            }
+                        }
+                        VlessTransport::Grpc { service_name } => {
+                            redactor.add_text(service_name);
+                        }
+                    }
                 }
                 NodeProtocol::Hysteria2(value) => {
                     redactor.add(&value.password);
@@ -80,9 +93,7 @@ impl Redactor {
     }
 
     pub fn with_secret(mut self, value: &str) -> Self {
-        if !value.is_empty() {
-            self.secrets.push(value.to_owned());
-        }
+        self.add_text(value);
         self.finish()
     }
 
@@ -99,7 +110,7 @@ impl Redactor {
             return OMITTED.into();
         }
         for secret in &self.secrets {
-            output = output.replace(secret, REDACTED);
+            output = replace_ascii_case_insensitive(&output, secret, REDACTED);
             if output.len() > MAX_DIAGNOSTIC_BYTES {
                 return OMITTED.into();
             }
@@ -123,6 +134,12 @@ impl Redactor {
     }
 
     fn add_tls(&mut self, tls: &TlsOptions) {
+        if let Some(server_name) = &tls.server_name {
+            self.add_text(server_name);
+        }
+        for alpn in &tls.alpn {
+            self.add_text(alpn);
+        }
         self.secrets.extend(
             tls.certificate_public_key_sha256
                 .iter()
@@ -132,6 +149,17 @@ impl Redactor {
         if let Some(reality) = &tls.reality {
             self.add(&reality.public_key);
             self.add(&reality.short_id);
+        }
+    }
+
+    fn add_text(&mut self, value: &str) {
+        if value.is_empty() {
+            return;
+        }
+        self.secrets.push(value.to_owned());
+        let lowercase = value.to_lowercase();
+        if lowercase != value {
+            self.secrets.push(lowercase);
         }
     }
 
@@ -310,7 +338,7 @@ mod tests {
 
     #[test]
     fn redacts_all_protocol_credentials_and_reality_material() {
-        let links = b"vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&flow=xtls-rprx-vision&type=tcp&sni=cover.test&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2\nhysteria2://fixture-password@example.test:443?obfs=salamander&obfs-password=fixture-obfs&sni=example.test\nnaive+https://fixture-user:fixture-pass@example.test:443";
+        let links = b"vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&flow=xtls-rprx-vision&type=tcp&sni=cover.test&alpn=h2&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2\nvless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@ws-endpoint.test:443?security=tls&type=ws&sni=ws-cover.test&host=cdn-host.test&path=%2Fprivate-ws\nvless://ffffffff-1111-2222-3333-444444444444@grpc-endpoint.test:443?security=tls&type=grpc&sni=grpc-cover.test&serviceName=private-grpc\nhysteria2://fixture-password@hy-endpoint.test:443?obfs=salamander&obfs-password=fixture-obfs&sni=hy-cover.test\nnaive+https://fixture-user:fixture-pass@naive-endpoint.test:443";
         let nodes = import_subscription(links).unwrap().nodes;
         let redactor = Redactor::from_nodes(&nodes);
         let output = redactor.redact(str::from_utf8(links).unwrap());
@@ -326,6 +354,19 @@ mod tests {
             assert!(!output.contains(secret), "secret fragment leaked: {secret}");
         }
         assert!(output.contains(REDACTED));
+        let config_diagnostic = redactor.redact(
+            "server=WS-ENDPOINT.TEST sni=ws-cover.test host=cdn-host.test path=/private-ws service=private-grpc alpn=h2",
+        );
+        for sensitive in [
+            "WS-ENDPOINT.TEST",
+            "ws-cover.test",
+            "cdn-host.test",
+            "/private-ws",
+            "private-grpc",
+            "h2",
+        ] {
+            assert!(!config_diagnostic.contains(sensitive));
+        }
     }
 
     #[test]
