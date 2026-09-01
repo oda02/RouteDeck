@@ -565,6 +565,11 @@ impl TlsOptions {
                 reality.public_key.expose(),
             );
             hash_tagged_component(hasher, b"tls.reality.short_id", reality.short_id.expose());
+            hash_tagged_optional(
+                hasher,
+                b"tls.reality.spider_x",
+                reality.spider_x.as_ref().map(Secret::expose),
+            );
         }
     }
 }
@@ -627,6 +632,7 @@ impl fmt::Debug for TlsOptions {
 pub struct RealityOptions {
     pub(crate) public_key: Secret,
     pub(crate) short_id: Secret,
+    pub(crate) spider_x: Option<Secret>,
 }
 
 impl RealityOptions {
@@ -645,6 +651,12 @@ impl RealityOptions {
             || !short_id.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(DomainError::new("invalid REALITY short ID"));
+        }
+        if let Some(spider_x) = &self.spider_x {
+            let spider_x = spider_x.expose();
+            if spider_x.len() > 2_048 || (!spider_x.is_empty() && !spider_x.starts_with('/')) {
+                return Err(DomainError::new("invalid REALITY SpiderX path"));
+            }
         }
         Ok(())
     }

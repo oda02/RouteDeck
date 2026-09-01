@@ -20,6 +20,9 @@ const SENSITIVE_KEYS: &[&str] = &[
     "short_id",
     "pbk",
     "sid",
+    "spx",
+    "spider_x",
+    "spiderX",
     "ech",
     "obfs-password",
     "obfs_password",
@@ -149,6 +152,9 @@ impl Redactor {
         if let Some(reality) = &tls.reality {
             self.add(&reality.public_key);
             self.add(&reality.short_id);
+            if let Some(spider_x) = &reality.spider_x {
+                self.add(spider_x);
+            }
         }
     }
 
@@ -338,7 +344,7 @@ mod tests {
 
     #[test]
     fn redacts_all_protocol_credentials_and_reality_material() {
-        let links = b"vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&flow=xtls-rprx-vision&type=tcp&sni=cover.test&alpn=h2&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2\nvless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@ws-endpoint.test:443?security=tls&type=ws&sni=ws-cover.test&host=cdn-host.test&path=%2Fprivate-ws\nvless://ffffffff-1111-2222-3333-444444444444@grpc-endpoint.test:443?security=tls&type=grpc&sni=grpc-cover.test&serviceName=private-grpc\nhysteria2://fixture-password@hy-endpoint.test:443?obfs=salamander&obfs-password=fixture-obfs&sni=hy-cover.test\nnaive+https://fixture-user:fixture-pass@naive-endpoint.test:443";
+        let links = b"vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&flow=xtls-rprx-vision&type=tcp&sni=cover.test&alpn=h2&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2&spx=%2Fprivate-spider%3Ftoken%3Dfixture\nvless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@ws-endpoint.test:443?security=tls&type=ws&sni=ws-cover.test&host=cdn-host.test&path=%2Fprivate-ws\nvless://ffffffff-1111-2222-3333-444444444444@grpc-endpoint.test:443?security=tls&type=grpc&sni=grpc-cover.test&serviceName=private-grpc\nhysteria2://fixture-password@hy-endpoint.test:443?obfs=salamander&obfs-password=fixture-obfs&sni=hy-cover.test\nnaive+https://fixture-user:fixture-pass@naive-endpoint.test:443";
         let nodes = import_subscription(links).unwrap().nodes;
         let redactor = Redactor::from_nodes(&nodes);
         let output = redactor.redact(str::from_utf8(links).unwrap());
@@ -350,6 +356,7 @@ mod tests {
             "fixture-pass",
             "abcdefghijklmnopqrstuvwxyz",
             "a1b2",
+            "private-spider",
         ] {
             assert!(!output.contains(secret), "secret fragment leaked: {secret}");
         }

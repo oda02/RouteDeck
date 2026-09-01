@@ -256,6 +256,12 @@ fn parse_vless_url(
             tls.reality = Some(RealityOptions {
                 public_key,
                 short_id,
+                spider_x: query
+                    .get("spx")
+                    .cloned()
+                    .map(Secret::new_allow_empty)
+                    .transpose()
+                    .map_err(|_| ImportError::new("REALITY SpiderX path is invalid"))?,
             });
         }
         _ => return Err(ImportError::new("unsupported VLESS security")),
@@ -691,6 +697,7 @@ fn parse_clash_vless(
                     optional_str(value, "short-id")?.unwrap_or("").to_owned(),
                 )
                 .map_err(|_| ImportError::new("REALITY short ID is invalid"))?,
+                spider_x: None,
             })
         }
         _ => return Err(ImportError::new("invalid Clash REALITY options")),
@@ -1149,6 +1156,7 @@ fn parse_json_tls(
                         required_string_allow_empty(value, "short_id")?.to_owned(),
                     )
                     .map_err(|_| ImportError::new("REALITY short ID is invalid"))?,
+                    spider_x: None,
                 })
             }
         }
@@ -1632,12 +1640,32 @@ mod tests {
         );
 
         let baseline = import_subscription(base.as_bytes()).unwrap();
-        for link in [with_spider_x, with_empty_spider_x] {
+        for (link, expected) in [
+            (with_spider_x, "/private?token=fixture"),
+            (with_empty_spider_x, ""),
+        ] {
             let report = import_subscription(link.as_bytes()).unwrap();
             assert_eq!(report.nodes.len(), 1);
             assert!(report.rejected.is_empty());
             assert_eq!(report.nodes[0].id(), baseline.nodes[0].id());
+            let NodeProtocol::Vless(vless) = report.nodes[0].protocol() else {
+                panic!("expected VLESS node");
+            };
+            assert_eq!(
+                vless
+                    .tls
+                    .reality
+                    .as_ref()
+                    .and_then(|reality| reality.spider_x.as_ref())
+                    .map(Secret::expose),
+                Some(expected)
+            );
         }
+
+        let invalid_path = format!(
+            "vless://{UUID}@example.test:443?encryption=none&security=reality&type=tcp&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2&spx=relative"
+        );
+        assert!(import_subscription(invalid_path.as_bytes()).is_err());
 
         for security in ["none", "tls"] {
             let misplaced = format!(

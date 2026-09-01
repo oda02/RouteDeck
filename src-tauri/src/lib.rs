@@ -11,6 +11,7 @@ pub mod subscription_fetch;
 mod system_proxy;
 #[cfg(windows)]
 mod windows_process;
+pub mod xray_config;
 
 use std::sync::Arc;
 

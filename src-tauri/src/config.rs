@@ -53,6 +53,23 @@ pub struct VpnDnsServer {
     pub path: String,
 }
 
+pub struct SocksBridge<'a> {
+    pub server_port: u16,
+    pub username: &'a str,
+    pub password: &'a str,
+}
+
+impl fmt::Debug for SocksBridge<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SocksBridge")
+            .field("server_port", &self.server_port)
+            .field("username", &"[REDACTED]")
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
 pub struct GeneratedConfig(String);
 
 impl GeneratedConfig {
@@ -89,6 +106,42 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 pub fn generate_config(request: ConfigRequest<'_>) -> Result<GeneratedConfig, ConfigError> {
+    generate_config_with_selected(request, None)
+}
+
+pub fn generate_socks_bridge_config(
+    request: ConfigRequest<'_>,
+    bridge: SocksBridge<'_>,
+) -> Result<GeneratedConfig, ConfigError> {
+    if !matches!(
+        request.node.protocol(),
+        NodeProtocol::Vless(vless) if vless.tls.reality.is_some()
+    ) {
+        return Err(ConfigError::new(
+            "SOCKS bridge is only supported for VLESS REALITY nodes",
+        ));
+    }
+    if bridge.server_port == 0 {
+        return Err(ConfigError::new("SOCKS bridge port must be non-zero"));
+    }
+    let username = Secret::new(bridge.username.to_owned())
+        .map_err(|_| ConfigError::new("invalid SOCKS bridge username"))?;
+    let password = Secret::new(bridge.password.to_owned())
+        .map_err(|_| ConfigError::new("invalid SOCKS bridge password"))?;
+    generate_config_with_selected(
+        request,
+        Some(selected_socks_bridge(
+            bridge.server_port,
+            &username,
+            &password,
+        )),
+    )
+}
+
+fn generate_config_with_selected(
+    request: ConfigRequest<'_>,
+    selected_override: Option<Value>,
+) -> Result<GeneratedConfig, ConfigError> {
     validate_request(&request)?;
     let health_password = Secret::new(request.health_password)
         .map_err(|_| ConfigError::new("invalid health-listener credential"))?;
@@ -135,7 +188,10 @@ pub fn generate_config(request: ConfigRequest<'_>) -> Result<GeneratedConfig, Co
         }));
     }
 
-    let mut selected = selected_outbound(request.node)?;
+    let mut selected = match selected_override {
+        Some(selected) => selected,
+        None => selected_outbound(request.node)?,
+    };
     let mut dns_servers = vec![json!({ "type": "local", "tag": "bootstrap" })];
     let dns_final = match request.policy.dns {
         DnsPolicy::CurrentNetwork => "bootstrap",
@@ -211,6 +267,18 @@ pub fn generate_config(request: ConfigRequest<'_>) -> Result<GeneratedConfig, Co
     let text = serde_json::to_string_pretty(&root)
         .map_err(|_| ConfigError::new("could not serialize generated configuration"))?;
     Ok(GeneratedConfig(text))
+}
+
+fn selected_socks_bridge(server_port: u16, username: &Secret, password: &Secret) -> Value {
+    json!({
+        "type": "socks",
+        "tag": "selected",
+        "server": "127.0.0.1",
+        "server_port": server_port,
+        "version": "5",
+        "username": username.expose(),
+        "password": password.expose()
+    })
 }
 
 pub fn validate_no_direct_health(config: &Value) -> Result<(), ConfigError> {
@@ -639,6 +707,103 @@ mod tests {
         assert!(value.pointer("/outbounds/0/transport").is_none());
         assert!(!value.to_string().contains("spx"));
         assert!(!value.to_string().contains("private"));
+    }
+
+    #[test]
+    fn vless_reality_bridge_replaces_only_the_selected_outbound() {
+        let node = node(
+            "vless://11111111-2222-3333-4444-555555555555@example.test:443?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2",
+        );
+        let policy = policy(DefaultRoute::Vpn);
+        let generated = generate_socks_bridge_config(
+            request(&node, &policy),
+            SocksBridge {
+                server_port: 19090,
+                username: "fixture-bridge-user",
+                password: "fixture-bridge-password",
+            },
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(generated.as_str()).unwrap();
+
+        assert_eq!(
+            value.pointer("/outbounds/0/type").and_then(Value::as_str),
+            Some("socks")
+        );
+        assert_eq!(
+            value.pointer("/outbounds/0/server").and_then(Value::as_str),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            value
+                .pointer("/outbounds/0/server_port")
+                .and_then(Value::as_u64),
+            Some(19090)
+        );
+        assert_eq!(
+            value
+                .pointer("/outbounds/0/version")
+                .and_then(Value::as_str),
+            Some("5")
+        );
+        assert_eq!(
+            value.pointer("/route/final").and_then(Value::as_str),
+            Some("selected")
+        );
+        assert_eq!(
+            value
+                .pointer("/route/rules/0/inbound/0")
+                .and_then(Value::as_str),
+            Some("health-in")
+        );
+        assert_eq!(
+            value
+                .pointer("/route/rules/0/outbound")
+                .and_then(Value::as_str),
+            Some("selected")
+        );
+        assert!(!generated.as_str().contains("example.test"));
+        assert!(!format!("{generated:?}").contains("fixture-bridge-password"));
+    }
+
+    #[test]
+    fn bridge_rejects_non_reality_nodes_and_invalid_credentials() {
+        let policy = policy(DefaultRoute::Vpn);
+        let tls = node(
+            "vless://11111111-2222-3333-4444-555555555555@example.test:443?security=tls&type=tcp&sni=cover.test",
+        );
+        assert!(generate_socks_bridge_config(
+            request(&tls, &policy),
+            SocksBridge {
+                server_port: 19090,
+                username: "fixture",
+                password: "fixture",
+            }
+        )
+        .is_err());
+
+        let reality = node(
+            "vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&type=tcp&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2",
+        );
+        for bridge in [
+            SocksBridge {
+                server_port: 0,
+                username: "fixture",
+                password: "fixture",
+            },
+            SocksBridge {
+                server_port: 19090,
+                username: "",
+                password: "fixture",
+            },
+            SocksBridge {
+                server_port: 19090,
+                username: "fixture",
+                password: "",
+            },
+        ] {
+            assert!(generate_socks_bridge_config(request(&reality, &policy), bridge).is_err());
+        }
     }
 
     #[test]
