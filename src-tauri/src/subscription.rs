@@ -225,7 +225,7 @@ fn parse_vless_url(
         _ => return Err(ImportError::new("unsupported VLESS flow")),
     };
     let security = query.get("security").map(String::as_str).unwrap_or("none");
-    let has_tls_parameters = ["sni", "alpn", "fp", "pbk", "sid"]
+    let has_tls_parameters = ["sni", "alpn", "fp", "pbk", "sid", "spx"]
         .iter()
         .any(|key| query.contains_key(*key));
     if security == "none" && has_tls_parameters {
@@ -233,7 +233,11 @@ fn parse_vless_url(
             "TLS parameters are present while VLESS security is disabled",
         ));
     }
-    if security == "tls" && (query.contains_key("pbk") || query.contains_key("sid")) {
+    if security == "tls"
+        && ["pbk", "sid", "spx"]
+            .iter()
+            .any(|key| query.contains_key(*key))
+    {
         return Err(ImportError::new(
             "REALITY parameters require VLESS security=reality",
         ));
@@ -1634,6 +1638,13 @@ mod tests {
             assert!(report.rejected.is_empty());
             assert_eq!(report.nodes[0].id(), baseline.nodes[0].id());
         }
+
+        for security in ["none", "tls"] {
+            let misplaced = format!(
+                "vless://{UUID}@example.test:443?encryption=none&security={security}&type=tcp&spx=%2F"
+            );
+            assert!(import_subscription(misplaced.as_bytes()).is_err());
+        }
     }
 
     #[test]
@@ -1671,9 +1682,8 @@ mod tests {
     #[test]
     fn rejects_non_tls_hysteria_security_extension() {
         for security in ["", "none", "reality"] {
-            let link = format!(
-                "hysteria2://fixture@example.test:443?security={security}&sni=cover.test"
-            );
+            let link =
+                format!("hysteria2://fixture@example.test:443?security={security}&sni=cover.test");
             let report = import_subscription(link.as_bytes()).unwrap_err();
             assert_eq!(
                 report.to_string(),
