@@ -12,16 +12,29 @@ $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $verifier = Join-Path $PSScriptRoot 'verify-engine.ps1'
 $sourceLock = Join-Path $repoRoot 'engine\sing-box.lock.json'
 $archive = (Get-Item -LiteralPath $ArchivePath -Force).FullName
-$pwsh = (Get-Process -Id $PID).Path
 $tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $testRoot = Join-Path $tempBase ('RouteDeck-engine-verifier-' + [guid]::NewGuid().ToString('N'))
 $safeCleanupPrefix = Join-Path $tempBase 'RouteDeck-engine-verifier-'
 
 function Invoke-Verifier([string] $Target, [string] $LockFile = $sourceLock) {
-  $output = & $pwsh -NoProfile -File $verifier -Path $Target -LockFile $LockFile 2>&1
+  # Invoke the verifier in a child script scope and catch its terminating
+  # failure directly. Spawning a nested PowerShell and redirecting native
+  # stderr is not portable: Windows PowerShell 5.1 can promote that stderr to
+  # a terminating ErrorRecord when this harness uses ErrorActionPreference=Stop.
+  $records = New-Object System.Collections.ArrayList
+  $exitCode = 0
+  try {
+    & $verifier -Path $Target -LockFile $LockFile *>&1 |
+      ForEach-Object { [void] $records.Add($_) }
+  }
+  catch {
+    $exitCode = 1
+    [void] $records.Add($_)
+  }
+
   return [pscustomobject]@{
-    ExitCode = $LASTEXITCODE
-    Output = ($output | Out-String)
+    ExitCode = $exitCode
+    Output = ($records | Out-String)
   }
 }
 
@@ -53,7 +66,9 @@ function New-HostileLock([string] $ArchiveEntryPath, [string] $Name) {
   $lock = Get-Content -Raw -LiteralPath $sourceLock | ConvertFrom-Json
   $lock.runtimeFiles[0].archivePath = $ArchiveEntryPath
   $path = Join-Path $testRoot "$Name.lock.json"
-  $lock | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $path -Encoding utf8NoBOM
+  # `utf8NoBOM` does not exist in Windows PowerShell 5.1; both UTF-8 forms are
+  # accepted by ConvertFrom-Json, so use the cross-version encoding name.
+  $lock | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $path -Encoding UTF8
   return $path
 }
 
@@ -97,11 +112,12 @@ try {
       }
     }
   }
-  foreach ($superscript in @('¹', '²', '³')) {
+  foreach ($codePoint in @(0x00B9, 0x00B2, 0x00B3)) {
+    $superscript = [char] $codePoint
     foreach ($prefix in @('COM', 'LPT')) {
       $device = "$prefix$superscript"
       $hostileCases += @{
-        Name = 'reserved-' + $prefix.ToLowerInvariant() + '-superscript-' + $superscript
+        Name = 'reserved-' + $prefix.ToLowerInvariant() + '-superscript-' + ('{0:x4}' -f $codePoint)
         Path = "engine/$device.config"
         Message = 'reserved Windows device name'
       }

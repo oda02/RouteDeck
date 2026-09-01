@@ -65,7 +65,17 @@ function Assert-SafeRelativePath([string] $Value, [string] $Label) {
     # extension (for example, CON.txt). Trim spaces from the stem as Win32
     # name normalization can otherwise alias a reserved name.
     $stem = $segment.Split('.')[0].TrimEnd(' ')
-    if ($stem -match '^(CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])$') {
+    $isReservedDevice = $stem -match '^(CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9]|LPT[1-9])$'
+    $superscriptDigits = "$([char] 0x00B9)$([char] 0x00B2)$([char] 0x00B3)"
+    $isSuperscriptPort = (
+      $stem.Length -eq 4 -and
+      (
+        $stem.StartsWith('COM', [StringComparison]::OrdinalIgnoreCase) -or
+        $stem.StartsWith('LPT', [StringComparison]::OrdinalIgnoreCase)
+      ) -and
+      $superscriptDigits.Contains([string] $stem[3])
+    )
+    if ($isReservedDevice -or $isSuperscriptPort) {
       Fail "$Label contains a reserved Windows device name: $Value"
     }
   }
@@ -130,6 +140,22 @@ function Assert-NoReparsePoint([System.IO.FileSystemInfo] $Item, [string] $Label
   }
 }
 
+function Get-DescendantRelativePath(
+  [System.IO.DirectoryInfo] $Root,
+  [System.IO.FileSystemInfo] $Child
+) {
+  $trimCharacters = [char[]] @(
+    [IO.Path]::DirectorySeparatorChar,
+    [IO.Path]::AltDirectorySeparatorChar
+  )
+  $rootPrefix = $Root.FullName.TrimEnd($trimCharacters) + [IO.Path]::DirectorySeparatorChar
+  $childPath = $Child.FullName
+  if (-not $childPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    Fail "engine directory entry escaped its verified root: $childPath"
+  }
+  return $childPath.Substring($rootPrefix.Length).Replace('\', '/')
+}
+
 function Verify-Directory([System.IO.DirectoryInfo] $Directory, $Files, [string] $Version) {
   Assert-NoReparsePoint $Directory 'engine directory'
   $expectedExecutables = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -160,7 +186,7 @@ function Verify-Directory([System.IO.DirectoryInfo] $Directory, $Files, [string]
     $current = $pending.Pop()
     foreach ($child in $current.GetFileSystemInfos()) {
       Assert-NoReparsePoint $child 'engine directory entry'
-      $relative = [IO.Path]::GetRelativePath($Directory.FullName, $child.FullName).Replace('\', '/')
+      $relative = Get-DescendantRelativePath $Directory $child
       $relative = Assert-SafeRelativePath $relative 'engine directory entry'
       if ($child -is [System.IO.DirectoryInfo]) {
         $pending.Push($child)
