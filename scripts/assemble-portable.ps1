@@ -78,25 +78,62 @@ function Assert-SafeTargetPath([string] $Value, [string] $RepositoryRoot) {
   if ($Value.StartsWith('\\') -or $Value.StartsWith('//')) {
     Fail 'UNC and device target paths are not supported'
   }
-  if (-not [IO.Path]::IsPathRooted($Value)) {
-    Fail 'target path must be absolute'
-  }
-  if ($Value.IndexOfAny([char[]] @('*', '?', '"', '<', '>', '|')) -ge 0) {
-    Fail 'target path contains an invalid Win32 character'
+  # Path.IsPathRooted is insufficient here: on Windows it also accepts
+  # drive-relative (C:foo) and root-relative (\foo) paths. Requiring a drive,
+  # colon, and separator is the .NET Framework/PowerShell 5-compatible
+  # equivalent needed by this local-Windows-only packaging gate.
+  if ($Value -cnotmatch '^[A-Za-z]:[\\/]') {
+    Fail 'target path must be a fully qualified local-drive path'
   }
 
-  $pathRoot = [IO.Path]::GetPathRoot($Value)
-  $remainder = $Value.Substring($pathRoot.Length)
+  $candidateValue = $Value.TrimEnd([char[]] @('\', '/'))
+  if ($candidateValue -match '^[A-Za-z]:$') {
+    Fail 'volume-root target paths are not allowed'
+  }
+  $remainder = $candidateValue.Substring(3)
+  if ([string]::IsNullOrEmpty($remainder)) {
+    Fail 'volume-root target paths are not allowed'
+  }
   if ($remainder.Contains(':')) {
     Fail 'target path contains an alternate-data-stream separator'
   }
-  foreach ($segment in $remainder.Replace('/', '\').Split('\')) {
-    if ($segment -in @('.', '..')) {
-      Fail 'target path contains a traversal segment'
+
+  $segments = $remainder.Replace('/', '\').Split('\')
+  foreach ($segment in $segments) {
+    if ([string]::IsNullOrEmpty($segment) -or $segment -in @('.', '..')) {
+      Fail 'target path contains an empty or traversal segment'
+    }
+    if ($segment.EndsWith('.') -or $segment.EndsWith(' ')) {
+      Fail 'target path contains a Windows-ambiguous segment'
+    }
+    foreach ($character in $segment.ToCharArray()) {
+      if ([int] $character -lt 32) {
+        Fail 'target path contains a control character'
+      }
+      if ('<>:"|?*'.Contains([string] $character)) {
+        Fail 'target path contains an invalid Win32 character'
+      }
+    }
+
+    # DOS device names remain reserved with extensions. Windows also reserves
+    # the superscript aliases COM¹/²/³ and LPT¹/²/³.
+    $stem = $segment.Split('.')[0].TrimEnd(' ')
+    $isReservedDevice = $stem -match '^(CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9]|LPT[1-9])$'
+    $superscriptDigits = "$([char] 0x00B9)$([char] 0x00B2)$([char] 0x00B3)"
+    $isSuperscriptPort = (
+      $stem.Length -eq 4 -and
+      (
+        $stem.StartsWith('COM', [StringComparison]::OrdinalIgnoreCase) -or
+        $stem.StartsWith('LPT', [StringComparison]::OrdinalIgnoreCase)
+      ) -and
+      $superscriptDigits.Contains([string] $stem[3])
+    )
+    if ($isReservedDevice -or $isSuperscriptPort) {
+      Fail 'target path contains a reserved Windows device name'
     }
   }
 
-  $fullPath = [IO.Path]::GetFullPath($Value)
+  $fullPath = [IO.Path]::GetFullPath($candidateValue)
   $trimCharacters = [char[]] @(
     [IO.Path]::DirectorySeparatorChar,
     [IO.Path]::AltDirectorySeparatorChar
@@ -127,11 +164,24 @@ function Assert-SafeTargetPath([string] $Value, [string] $RepositoryRoot) {
   if ([IO.File]::Exists($fullPath)) {
     Fail 'target path is an existing file'
   }
-  if ([IO.Directory]::Exists($fullPath)) {
-    $targetItem = Get-Item -LiteralPath $fullPath -Force
-    if (($targetItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-      Fail 'target directory is a reparse point'
+
+  # Checking only the final target misses a junction/symlink in an existing
+  # parent. Walk all the way to the volume root and fail closed on any reparse
+  # point before a future implementation is allowed to create or copy files.
+  $ancestorPath = $fullPath
+  while (-not [string]::IsNullOrWhiteSpace($ancestorPath)) {
+    if ([IO.Directory]::Exists($ancestorPath) -or [IO.File]::Exists($ancestorPath)) {
+      $ancestorItem = Get-Item -LiteralPath $ancestorPath -Force
+      if (($ancestorItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail "target path ancestor is a reparse point: $($ancestorItem.FullName)"
+      }
     }
+
+    $parent = [IO.Directory]::GetParent($ancestorPath)
+    if ($null -eq $parent -or $parent.FullName -ieq $ancestorPath) {
+      break
+    }
+    $ancestorPath = $parent.FullName
   }
 
   return $fullPath

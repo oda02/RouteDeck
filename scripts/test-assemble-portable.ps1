@@ -87,6 +87,7 @@ $resolvedArchive = (Resolve-Path -LiteralPath $ArchivePath).Path
 $tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/')
 $safePrefix = Join-Path $tempBase 'RouteDeck-portable-audit-'
 $testRoot = $safePrefix + [guid]::NewGuid().ToString('N')
+$junctionPath = $null
 
 Assert-True ($testRoot.StartsWith($safePrefix, [StringComparison]::OrdinalIgnoreCase)) `
   'unique test root escaped the guarded prefix'
@@ -190,12 +191,23 @@ try {
   Push-Location $testRoot
   try {
     Assert-Rejected 'relative target is rejected' $gatePath $resolvedArchive `
-      'relative-target' 'target path must be absolute'
+      'relative-target' 'fully qualified local-drive path'
     Assert-TargetAbsent (Join-Path $testRoot 'relative-target') 'relative target'
+
+    $drivePrefix = [IO.Path]::GetPathRoot($testRoot).Substring(0, 2)
+    $driveRelativeTarget = $drivePrefix + 'drive-relative-target'
+    Assert-Rejected 'drive-relative target is rejected' $gatePath $resolvedArchive `
+      $driveRelativeTarget 'fully qualified local-drive path'
+    Assert-TargetAbsent (Join-Path $testRoot 'drive-relative-target') 'drive-relative target'
   }
   finally {
     Pop-Location
   }
+
+  $rootRelativeTarget = $testRoot.Substring(2) + '\root-relative-target'
+  Assert-Rejected 'root-relative target is rejected' $gatePath $resolvedArchive `
+    $rootRelativeTarget 'fully qualified local-drive path'
+  Assert-TargetAbsent (Join-Path $testRoot 'root-relative-target') 'root-relative target'
 
   Assert-Rejected 'broad temp-root target is rejected' $gatePath $resolvedArchive `
     ([IO.Path]::GetTempPath()) 'broad target path is not allowed'
@@ -206,7 +218,7 @@ try {
 
   $traversalTarget = Join-Path $testRoot 'nested\..\escaped-target'
   Assert-Rejected 'traversal target is rejected' $gatePath $resolvedArchive `
-    $traversalTarget 'target path contains a traversal segment'
+    $traversalTarget 'empty or traversal segment'
   Assert-TargetAbsent (Join-Path $testRoot 'escaped-target') 'traversal target'
 
   $adsTarget = (Join-Path $testRoot 'safe-target') + ':stream'
@@ -216,6 +228,38 @@ try {
   Assert-Rejected 'device target is rejected' $gatePath $resolvedArchive `
     '\\?\C:\RouteDeck-portable-audit-device' 'UNC and device target paths are not supported'
 
+  $hostileTargets = @(
+    [pscustomobject] @{ Label = 'reserved DOS device with extension'; Path = (Join-Path $testRoot 'CON.txt\child'); Expected = 'reserved Windows device name' },
+    [pscustomobject] @{ Label = 'reserved superscript DOS device with extension'; Path = (Join-Path $testRoot ("COM$([char] 0x00B9).log\child")); Expected = 'reserved Windows device name' },
+    [pscustomobject] @{ Label = 'trailing-dot segment'; Path = (Join-Path $testRoot 'ambiguous.\child'); Expected = 'Windows-ambiguous segment' },
+    [pscustomobject] @{ Label = 'trailing-space segment'; Path = (Join-Path $testRoot 'ambiguous \child'); Expected = 'Windows-ambiguous segment' },
+    [pscustomobject] @{ Label = 'control-character segment'; Path = (Join-Path $testRoot ("control$([char] 1)segment\child")); Expected = 'control character' },
+    [pscustomobject] @{ Label = 'invalid-Win32-character segment'; Path = (Join-Path $testRoot 'invalid<segment\child'); Expected = 'invalid Win32 character' }
+  )
+  foreach ($hostileTarget in $hostileTargets) {
+    Assert-Rejected $hostileTarget.Label $gatePath $resolvedArchive `
+      $hostileTarget.Path $hostileTarget.Expected
+  }
+
+  $junctionBacking = Join-Path $testRoot 'junction-backing'
+  $junctionPath = Join-Path $testRoot 'junction-parent'
+  [IO.Directory]::CreateDirectory($junctionBacking) | Out-Null
+  try {
+    New-Item -ItemType Junction -Path $junctionPath -Target $junctionBacking | Out-Null
+    $junctionItem = Get-Item -LiteralPath $junctionPath -Force
+    Assert-True (($junctionItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) `
+      'junction fixture is not a reparse point'
+    $junctionTarget = Join-Path $junctionPath 'future-portable-target'
+    Assert-Rejected 'reparse-point ancestor is rejected' $gatePath $resolvedArchive `
+      $junctionTarget 'target path ancestor is a reparse point'
+    Assert-TargetAbsent $junctionTarget 'reparse-point ancestor target'
+  }
+  finally {
+    if ($null -ne $junctionPath -and [IO.Directory]::Exists($junctionPath)) {
+      [IO.Directory]::Delete($junctionPath, $false)
+    }
+  }
+
   Write-Output 'PASS: portable assembly audit suite completed'
 }
 finally {
@@ -223,6 +267,12 @@ finally {
   Assert-True ($resolvedTestRoot.StartsWith($safePrefix, [StringComparison]::OrdinalIgnoreCase)) `
     'cleanup target escaped the guarded temporary prefix'
   Assert-True ($resolvedTestRoot -cne $tempBase) 'cleanup target resolved to the broad temp root'
+  if ($null -ne $junctionPath -and [IO.Directory]::Exists($junctionPath)) {
+    $junctionItem = Get-Item -LiteralPath $junctionPath -Force
+    Assert-True (($junctionItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) `
+      'guarded cleanup encountered a non-reparse junction fixture'
+    [IO.Directory]::Delete($junctionPath, $false)
+  }
   if ([IO.Directory]::Exists($resolvedTestRoot)) {
     Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force
   }
