@@ -1,5 +1,5 @@
 import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const forbiddenMarkers = [
@@ -19,15 +19,35 @@ async function productionFiles(directory) {
   return nested.flat();
 }
 
-const files = await productionFiles(fileURLToPath(new URL("../dist", import.meta.url)));
-for (const file of files) {
-  const content = await readFile(file);
-  const text = content.toString("utf8");
-  for (const marker of forbiddenMarkers) {
-    if (text.includes(marker)) {
-      throw new Error(`production bundle contains forbidden development marker: ${marker}`);
+export async function assertProductionBundle(directory) {
+  const root = resolve(directory);
+  const files = await productionFiles(root);
+  const artifacts = files.map((file) => relative(root, file).replaceAll("\\", "/"));
+
+  if (artifacts.length === 0) {
+    throw new Error("production bundle contains no artifacts");
+  }
+  if (!artifacts.includes("index.html")) {
+    throw new Error("production bundle is missing root index.html");
+  }
+  if (!artifacts.some((artifact) => /^assets\/.+\.js$/.test(artifact))) {
+    throw new Error("production bundle is missing assets/*.js");
+  }
+
+  for (const file of files) {
+    const content = await readFile(file);
+    const text = content.toString("utf8");
+    for (const marker of forbiddenMarkers) {
+      if (text.includes(marker)) {
+        throw new Error(`production bundle contains forbidden development marker: ${marker}`);
+      }
     }
   }
+  return files.length;
 }
 
-console.log(`production bundle boundary verified (${files.length} files)`);
+const invokedAsScript = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (invokedAsScript) {
+  const count = await assertProductionBundle(fileURLToPath(new URL("../dist", import.meta.url)));
+  console.log(`production bundle boundary verified (${count} files)`);
+}
