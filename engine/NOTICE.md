@@ -34,7 +34,7 @@ The three texts under `engine/licenses/` are authentic and hash-pinned, but they
 
 ## Point-in-time malware scan
 
-On 2026-09-01, the exact locked ZIP was verified, extracted into a unique `%TEMP%` directory, verified again as a directory, and scanned with the installed Microsoft Defender command-line scanner `4.18.26060.3008-0`. Defender returned exit code `0` and reported that it found no threats. No exclusions were added and neither binary was executed. `Get-MpComputerStatus` denied access, so engine/signature-version metadata was not recorded.
+On 2026-09-01, the exact locked ZIP was verified, extracted into a unique `%TEMP%` directory, verified again as a directory, and scanned with the installed Microsoft Defender command-line scanner. The hash-bound, path-sanitized report is committed at `engine/security/defender-scan-20260901T103906Z.json`; it records scanner `4.18.26070.9-0`, UTC timestamps, command shape, exit code `0`, and the captured `found no threats` output. No exclusions were added and neither binary was executed. `Get-MpComputerStatus` denied access, so the report explicitly marks engine/signature metadata unavailable rather than inferring it.
 
 This scan is point-in-time supporting evidence only. It is not proof that the binary is harmless, does not replace provenance/hash/runtime controls, and says nothing about license completeness.
 

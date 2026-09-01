@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "reportKind": "point-in-time-microsoft-defender-scan",
+  "engineLock": {
+    "path": "engine/sing-box.lock.json",
+    "size": 2835,
+    "sha256": "d5d8a5447cedc9b099202c2a50232e8d583977ad47125377bdb89bddea21612a"
+  },
+  "artifact": {
+    "engine": "sing-box",
+    "version": "1.13.19",
+    "archiveSize": 21046252,
+    "archiveSha256": "e011a4def2f5e2b143ed54adb2b1a20a6be407806ab4442f3667f1dd817a2c8d",
+    "runtimeFiles": [
+      {
+        "path": "sing-box.exe",
+        "size": 45492224,
+        "sha256": "a4476dd768168a77e249050066bb32774addefcc37da123978623e7b2819de28"
+      },
+      {
+        "path": "libcronet.dll",
+        "size": 9528832,
+        "sha256": "257f966119ffca91d7a2ce110a4b668b865d88bf2ed5339fd06a5644b0d02823"
+      },
+      {
+        "path": "LICENSE",
+        "size": 808,
+        "sha256": "bb3805862b583aee73ad6f7805ec634747a37257a637a3069857843f05ea589c"
+      }
+    ]
+  },
+  "preconditions": [
+    "archive verified against engine/sing-box.lock.json",
+    "archive extracted to a unique temporary directory",
+    "extracted directory verified against engine/sing-box.lock.json",
+    "no engine binary executed"
+  ],
+  "scanner": {
+    "path": "C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\4.18.26070.9-0\\MpCmdRun.exe",
+    "platformDirectory": "4.18.26070.9-0",
+    "fileVersion": "4.18.26070.9 (797b3603749206dfffe67a1cc891531b0a2cf438)",
+    "productVersion": "4.18.26070.9",
+    "commandShape": "MpCmdRun.exe -Scan -ScanType 3 -File <unique-temp-engine-directory> -DisableRemediation"
+  },
+  "scan": {
+    "startedAtUtc": "2026-09-01T10:39:06.1997164+00:00",
+    "completedAtUtc": "2026-09-01T10:39:06.9216698+00:00",
+    "exitCode": 0,
+    "stdout": "Scan starting...\r\nScan finished.\r\nScanning <TEMP>\\RouteDeck-engine-evidence-<random>\\sing-box-1.13.19-windows-amd64 found no threats.",
+    "stderr": ""
+  },
+  "signatureMetadata": {
+    "status": "unavailable",
+    "engineVersion": null,
+    "signatureVersion": null,
+    "reason": "Get-MpComputerStatus access denied in the non-elevated review session"
+  },
+  "interpretation": [
+    "Exit code and output are point-in-time evidence only.",
+    "This report is not proof that the binaries are harmless.",
+    "This report does not establish license compliance.",
+    "No Defender exclusions were added."
+  ]
+}

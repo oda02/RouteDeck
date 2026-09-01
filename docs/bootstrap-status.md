@@ -19,11 +19,11 @@ Checked on 2026-09-01 in the local Windows workspace.
 ## Current limitations
 
 - The release artifact was inspected and hashed without executing it. The shell does not yet package or execute `sing-box`, WinTUN, a proxy controller, or privileged code.
-- Microsoft Defender scanned a uniquely staged, twice-verified copy of the exact engine directory on 2026-09-01 and returned exit code `0` with no threats found. No exclusions were added. This point-in-time result is evidence only, not a safety guarantee.
+- Microsoft Defender scanned a uniquely staged, twice-verified copy of the exact engine directory on 2026-09-01 and returned exit code `0` with no threats found. The sanitized report at `engine/security/defender-scan-20260901T103906Z.json` binds the result to the engine lock and runtime hashes; unavailable signature metadata is explicit. No exclusions were added. This point-in-time result is evidence only, not a safety guarantee.
 - `cargo check` must run through `VsDevCmd.bat` (or another shell where MSVC tools including `link.exe` are already on `PATH`).
 - The current verification covers compilation only; Windows integration and privileged tests remain intentionally out of scope.
 - The PowerShell verifier is not the runtime integrity-and-launch gate. A separate path-based hash followed by process launch has a time-of-check/time-of-use race; the native controller must prevent replacement between verification and `CreateProcess`, and that implementation still requires security review and hostile concurrency tests.
-- The upstream ZIP includes the sing-box GPL-3.0-or-later license but not a complete Cronet/Chromium or sing-box dependency notice inventory. Authentic top-level Cronet/NaiveProxy/Chromium license texts and the unresolved evidence are pinned under `engine/licenses/` and `engine/NOTICE.md`. `scripts/assemble-portable.ps1` enforces the current `blocked` manifest and exits before creating a target. This is not a legal-compliance claim; release packaging remains blocked pending the documented Windows Cronet notices, sing-box transitive notices, and source-compliance review.
+- The upstream ZIP includes the sing-box GPL-3.0-or-later license but not a complete Cronet/Chromium or sing-box dependency notice inventory. Authentic top-level Cronet/NaiveProxy/Chromium license texts and the unresolved evidence are pinned under `engine/licenses/` and `engine/NOTICE.md`. `scripts/assemble-portable.ps1` enforces the exact reviewed notice schema, provenance, hashes, set cardinality, and current `blocked` status before any target action. `scripts/test-assemble-portable.ps1` exercises tamper and no-write cases. This is not a legal-compliance claim; release packaging remains blocked pending the documented Windows Cronet notices, sing-box transitive notices, and source-compliance review.
 
 ## Reproduce the checks
 
@@ -35,4 +35,5 @@ npm run build
 cmd /d /s /c 'call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 && cargo check --locked --offline --manifest-path src-tauri\Cargo.toml'
 pwsh -NoProfile -File scripts\verify-engine.ps1 -Path <release-zip-or-extracted-engine-directory>
 pwsh -NoProfile -File scripts\test-verify-engine.ps1 -ArchivePath <reviewed-release-zip>
+pwsh -NoProfile -File scripts\test-assemble-portable.ps1 -ArchivePath <reviewed-release-zip>
 ```
