@@ -190,6 +190,10 @@ fn parse_vless_url(
             "fp",
             "pbk",
             "sid",
+            // `spx` is Xray's optional REALITY SpiderX hint. sing-box has no
+            // corresponding client field, so accepting and discarding it is
+            // the compatible translation for VLESS share links.
+            "spx",
             "packetEncoding",
             "host",
             "path",
@@ -336,10 +340,19 @@ fn parse_hysteria_url(
             "obfs-password",
             "sni",
             "insecure",
+            "alpn",
+            "fp",
+            "security",
             "ech",
             "pinSHA256",
         ],
     )?;
+    if query
+        .get("security")
+        .is_some_and(|security| security != "tls")
+    {
+        return Err(ImportError::new("unsupported Hysteria2 security"));
+    }
     if query.contains_key("pinSHA256") {
         return Err(ImportError::new(
             "Hysteria certificate fingerprint import is not supported",
@@ -381,7 +394,11 @@ fn parse_hysteria_url(
             "Hysteria2 URI ECH import is not supported safely",
         ));
     }
-    let tls = tls_from_query(&query)?;
+    let mut tls = tls_from_query(&query)?;
+    // Hysteria2 runs over QUIC. sing-box only supports ECH from its custom TLS
+    // options for QUIC, so an ecosystem `fp` hint is validated above but must
+    // not be emitted as a uTLS configuration that the engine cannot apply.
+    tls.utls_fingerprint = None;
     let name = display_name(url, "Hysteria2", &server, port)?;
     Node::create(
         name,
@@ -1599,6 +1616,27 @@ mod tests {
     }
 
     #[test]
+    fn imports_vless_reality_with_optional_xray_spider_x_hint() {
+        let base = format!(
+            "vless://{UUID}@example.test:443?encryption=none&security=reality&flow=xtls-rprx-vision&type=tcp&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2#Office"
+        );
+        let with_spider_x = format!(
+            "vless://{UUID}@example.test:443?encryption=none&security=reality&flow=xtls-rprx-vision&type=tcp&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2&spx=%2Fprivate%3Ftoken%3Dfixture#Office"
+        );
+        let with_empty_spider_x = format!(
+            "vless://{UUID}@example.test:443?encryption=none&security=reality&flow=xtls-rprx-vision&type=tcp&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2&spx=#Office"
+        );
+
+        let baseline = import_subscription(base.as_bytes()).unwrap();
+        for link in [with_spider_x, with_empty_spider_x] {
+            let report = import_subscription(link.as_bytes()).unwrap();
+            assert_eq!(report.nodes.len(), 1);
+            assert!(report.rejected.is_empty());
+            assert_eq!(report.nodes[0].id(), baseline.nodes[0].id());
+        }
+    }
+
+    #[test]
     fn imports_hysteria_and_naive_base64_once() {
         let links = "hysteria2://fixture-password@example.test:443?obfs=salamander&obfs-password=fixture-obfs&sni=example.test#HY2\nnaive+quic://fixture-user:fixture-pass@example.test:443#Naive";
         let encoded = general_purpose::STANDARD.encode(links);
@@ -1608,6 +1646,40 @@ mod tests {
             .nodes
             .iter()
             .all(|node| node.source_format() == SourceFormat::Base64List));
+    }
+
+    #[test]
+    fn imports_extended_hysteria_uri_without_emitting_quic_utls() {
+        let link = "hysteria2://fixture-user:fixture-pass@example.test:443/?alpn=h3&fp=chrome&obfs=salamander&obfs-password=fixture-obfs&security=tls&sni=cover.test#HY2";
+        let report = import_subscription(link.as_bytes()).unwrap();
+        assert_eq!(report.nodes.len(), 1);
+        assert!(report.rejected.is_empty());
+
+        let NodeProtocol::Hysteria2(node) = report.nodes[0].protocol() else {
+            panic!("expected Hysteria2 node");
+        };
+        assert_eq!(node.password.expose(), "fixture-user:fixture-pass");
+        assert_eq!(node.tls.alpn, vec!["h3"]);
+        assert_eq!(node.tls.server_name.as_deref(), Some("cover.test"));
+        assert!(node.tls.utls_fingerprint.is_none());
+        assert!(matches!(
+            node.obfs.as_ref().map(|obfs| obfs.kind),
+            Some(HysteriaObfsKind::Salamander)
+        ));
+    }
+
+    #[test]
+    fn rejects_non_tls_hysteria_security_extension() {
+        for security in ["", "none", "reality"] {
+            let link = format!(
+                "hysteria2://fixture@example.test:443?security={security}&sni=cover.test"
+            );
+            let report = import_subscription(link.as_bytes()).unwrap_err();
+            assert_eq!(
+                report.to_string(),
+                "subscription contains no valid supported nodes"
+            );
+        }
     }
 
     #[test]
