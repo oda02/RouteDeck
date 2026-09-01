@@ -504,7 +504,7 @@ export class TauriController implements RouteDeckController {
     });
     const projected: SubscriptionPreview = {
       token: dto.previewId,
-      sourceLabel: sourceType === "clipboard" ? "Буфер обмена · скрыто" : "HTTPS-подписка · адрес скрыт",
+      sourceLabel: sourceType === "clipboard" ? "Буфер обмена" : "HTTPS-подписка",
       supported: (["VLESS", "Hysteria2", "Naive"] as const)
         .map((protocol) => ({ protocol, count: counts.get(protocol) ?? 0 }))
         .filter((entry) => entry.count > 0),
@@ -576,15 +576,15 @@ export class TauriController implements RouteDeckController {
           name: node.displayName,
           country: "—",
           protocol: protocolName(node.protocol),
-          detail: node.insecureTls ? "Требует отдельного подтверждения небезопасного TLS" : "Проверено строгим импортом",
-          source: "Локальный импорт",
+          detail: node.insecureTls ? "Отключена проверка TLS" : "Импортировано из подписки",
+          source: "Подписка",
           latencyState: "unavailable",
         }));
       this.pendingImport = undefined;
       this.publish({
         servers,
         selectedServerId: servers[0]?.id ?? "",
-        subscriptionName: "Локальный импорт",
+        subscriptionName: "Подписка",
         subscriptionUpdatedAt: "только что",
       });
     } finally {

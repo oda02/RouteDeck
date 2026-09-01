@@ -298,7 +298,7 @@ class DevelopmentDemoController implements RouteDeckController {
 
   previewSubscription = async (source: SubscriptionImportSource): Promise<SubscriptionPreview> => {
     await wait(350);
-    let sourceLabel = "Буфер обмена · скрыто";
+    let sourceLabel = "Буфер обмена";
     if (source.type === "url") {
       let parsed: URL;
       try {

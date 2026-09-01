@@ -190,11 +190,11 @@ Validation rules include DNS-name/IP syntax, port `1..65535`, UUID syntax, bound
 ### 6.1 Fetch boundary
 
 - V1 accepts only bounded `https://` URLs without userinfo or fragments. HTTP and LAN-source opt-ins are not implemented.
-- The UI offers one ordinary load action. The backend automatically uses a supported current loopback Windows System Proxy when one is active; otherwise it connects directly. There is no transport selector and the import never changes Windows proxy, registry, VPN, or process state.
+- The UI offers one ordinary URL field and one import action. The backend automatically uses a supported current loopback Windows System Proxy when one is active; otherwise it connects directly. There is no source-method or transport selector, and the import never changes Windows proxy, registry, VPN, or process state.
 - Both paths use the standard `reqwest` HTTPS client and the Windows trust policy. Direct requests resolve the origin locally and bind the request to the validated public address set. When a system proxy is used, normal proxy behavior applies: the proxy resolves the origin and can observe the usual CONNECT destination metadata. RouteDeck does not claim that proxy-side DNS prevents rebinding or access to local destinations.
 - Disable automatic redirects and follow at most 3 manually. Every target must remain a valid HTTPS URL. Use bounded DNS/connect/overall timeouts and read at most 10 MiB plus one sentinel byte. V1 does not request compression and rejects non-identity `Content-Encoding`.
 - Reject invalid UTF-8 except an optional UTF-8 BOM. Never execute content sniffed as HTML.
-- Reserve the same bounded preview slot before URL validation, DNS, fetch, and parse. Parse in memory and retain only the typed pending preview; the raw URL is never stored, logged, placed in diagnostics/errors/command lines, or emitted to the renderer after the request returns. Commit the new node set atomically only after confirmation. A failed refresh retains the prior working snapshot.
+- Reserve the same bounded preview slot before URL validation, DNS, fetch, and parse. Parse in memory and retain only the typed pending preview; the raw URL is never stored, logged, placed in diagnostics/errors/command lines, or emitted to the renderer after the request returns. The frontend may chain preview and atomic commit behind the single user action; a failed refresh retains the prior working snapshot and keeps the URL editable for retry.
 
 ### 6.2 Format detection order
 

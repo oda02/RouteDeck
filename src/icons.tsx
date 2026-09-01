@@ -40,5 +40,4 @@ export const ImportIcon = (props: IconProps) => <IconBase {...props}><path d="M1
 export const TrashIcon = (props: IconProps) => <IconBase {...props}><path d="M3 6h18M8 6V4h8v2M19 6l-1 15H6L5 6M10 11v5M14 11v5"/></IconBase>;
 export const XIcon = (props: IconProps) => <IconBase {...props}><path d="m6 6 12 12M18 6 6 18"/></IconBase>;
 export const InfoIcon = (props: IconProps) => <IconBase {...props}><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></IconBase>;
-export const EyeIcon = (props: IconProps) => <IconBase {...props}><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></IconBase>;
 export const LoaderIcon = (props: IconProps) => <IconBase className="spin" {...props}><path d="M21 12a9 9 0 1 1-6.2-8.6"/></IconBase>;

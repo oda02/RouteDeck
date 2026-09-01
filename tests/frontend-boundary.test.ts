@@ -48,7 +48,7 @@ test("release selection can never choose the demo controller", () => {
   assert.equal(selectControllerRuntime({ explicitDemo: true, isDevelopment: true, tauriIpcAvailable: true }), "demo");
 });
 
-test("non-dismissible import keeps focus inside the mounted dialog", () => {
+test("busy import keeps focus inside the mounted dialog", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   assert.match(source, /previouslyFocusedRef\.current = document\.activeElement[\s\S]*return \(\) => previouslyFocusedRef\.current\?\.focus\([\s\S]*\}, \[\]\);/);
   assert.match(source, /data-dialog-busy-focus/);
@@ -64,25 +64,23 @@ test("every import failure focuses its enabled source or recovery control", () =
   const genericTarget = source.indexOf('querySelector<HTMLElement>("[data-autofocus]")', errorTarget);
   assert.ok(errorTarget >= 0 && genericTarget > errorTarget);
   assert.match(source, /id="subscription-url"[^\n]*data-error-autofocus=\{importError \? "true" : undefined\}/);
-  assert.match(source, /ref=\{clipboardButtonRef\}[^\n]*data-error-autofocus=\{importError \? "true" : undefined\}[^\n]*onClick=\{readClipboardSource\}/);
-  assert.match(source, /data-error-autofocus=\{importError \? "true" : undefined\}[^\n]*onClick=\{commitImport\}/);
-  assert.match(source, /focusKey=\{subscriptionPreview \? "preview" : `source-\$\{importMethod\}`\}/);
+  assert.match(source, /focusKey="subscription-url"/);
+  assert.match(source, /id="subscription-import-form"[^\n]*onSubmit=/);
   assert.doesNotMatch(source, /focusKey=\{[^\n]*importError/);
-  assert.equal(source.match(/\bfocusImportInput\(\);/g)?.length, 1, "only synchronous empty-source validation may schedule direct focus");
+  assert.match(source, /setImportError\("Вставьте ссылку на подписку\."\)[\s\S]*requestAnimationFrame\(\(\) => subscriptionInputRef\.current\?\.focus\(\)\)/);
 });
 
-test("URL input is masked and cleared before the async preview action", () => {
+test("URL import is a normal editable field and one validation-plus-commit action", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
-  assert.match(source, /id="subscription-url" type=\{subscriptionVisible \? "text" : "password"\}/);
+  assert.match(source, /id="subscription-url" type="url" inputMode="url" autoComplete="url"/);
   assert.match(source, /id="subscription-url"[\s\S]*defaultValue=""/);
   assert.doesNotMatch(source, /subscriptionSource|setSubscriptionSource|value=\{subscriptionSource\}/);
-  const secretRead = source.indexOf("let subscriptionUrl = subscriptionInputRef.current?.value");
-  const secretClear = source.indexOf("clearSubscriptionUrl();", secretRead);
-  const ipcCall = source.indexOf("controller.previewSubscription({ type: \"url\", value: subscriptionUrl })", secretClear);
-  const localClear = source.indexOf('subscriptionUrl = "";', ipcCall);
-  const asyncAction = source.indexOf("void runAsyncAction({", localClear);
-  assert.ok(secretRead >= 0 && secretRead < secretClear && secretClear < ipcCall && ipcCall < localClear && localClear < asyncAction);
-  assert.match(source, /retry: sourceType === "url" \? undefined : previewImport/);
+  assert.doesNotMatch(source, /type=\{subscriptionVisible|EyeIcon|Прочитать буфер обмена|Файл · скоро|Подтвердить импорт/);
+  const urlRead = source.indexOf("const subscriptionUrl = subscriptionInputRef.current?.value.trim()");
+  const previewCall = source.indexOf('controller.previewSubscription({ type: "url", value: subscriptionUrl })', urlRead);
+  const commitCall = source.indexOf("controller.commitSubscription(preview)", previewCall);
+  const clearAfterSuccess = source.indexOf("clearSubscriptionUrl();", commitCall);
+  assert.ok(urlRead >= 0 && urlRead < previewCall && previewCall < commitCall && commitCall < clearAfterSuccess);
 });
 
 test("URL import uses automatic backend transport without a renderer selector", () => {
@@ -92,8 +90,9 @@ test("URL import uses automatic backend transport without a renderer selector", 
   assert.doesNotMatch(source, /SubscriptionFetchTransport|subscriptionTransport|Транспорт HTTPS-загрузки|subscription-transport-help|current_loopback_system_proxy/);
   assert.doesNotMatch(model, /SubscriptionFetchTransport|current_loopback_system_proxy/);
   assert.doesNotMatch(styles, /subscription-transport/);
-  assert.match(source, /загрузится по HTTPS через текущий сетевой путь Windows/);
-  assert.match(source, /importMethod === "url" \? "Загрузить"/);
+  assert.match(source, /Поддерживаются подписки по HTTPS/);
+  assert.match(source, /importing \? "Импортируем…" : "Импортировать"/);
+  assert.doesNotMatch(source, /Источник подписки|importMethod|clipboardSource|file-adapter-note|import-preview/);
   assert.doesNotMatch(source, /Безопасно загрузить|опасные перенаправления|заблокирует .*локальные адреса/);
 });
 
@@ -321,7 +320,7 @@ test("HTTPS URL preview uses the exact typed command and retains no secret", asy
   await controller.ready();
   const preview = await controller.previewSubscription({ type: "url", value: secret });
   assert.deepEqual(calls[1], { command: "preview_import_url", arguments_: { url: secret } });
-  assert.equal(preview.sourceLabel, "HTTPS-подписка · адрес скрыт");
+  assert.equal(preview.sourceLabel, "HTTPS-подписка");
   assert.ok(!JSON.stringify(preview).includes(secret));
   assert.ok(!JSON.stringify(controller.getSnapshot()).includes(secret));
   assert.ok(!JSON.stringify(controller).includes(secret));

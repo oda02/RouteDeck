@@ -15,7 +15,6 @@ import {
   CheckIcon,
   ChevronRightIcon,
   CopyIcon,
-  EyeIcon,
   HomeIcon,
   IdleIcon,
   ImportIcon,
@@ -44,7 +43,6 @@ import {
   type Destination,
   type RoutingConfig,
   type SettingsConfig,
-  type SubscriptionPreview,
   type TunPathChoice,
 } from "./model";
 
@@ -782,23 +780,16 @@ export default function App() {
   const [toast, setToast] = useState<ToastState | null>(null);
   const [toastPaused, setToastPaused] = useState(false);
   const [actionFailure, setActionFailure] = useState<ActionFailure | null>(null);
-  const [importMethod, setImportMethod] = useState<"url" | "clipboard" | "file">("url");
-  const [clipboardSource, setClipboardSource] = useState("");
-  const [subscriptionVisible, setSubscriptionVisible] = useState(false);
   const [importError, setImportError] = useState("");
   const [importing, setImporting] = useState(false);
-  const [subscriptionPreview, setSubscriptionPreview] = useState<SubscriptionPreview | null>(null);
-  const confirmingImport = importing && subscriptionPreview !== null;
   const mainRef = useRef<HTMLElement>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const subscriptionInputRef = useRef<HTMLInputElement>(null);
-  const clipboardButtonRef = useRef<HTMLButtonElement>(null);
   const importGeneration = useRef(0);
   const scrollPositions = useRef<Record<Destination, number>>({ home: 0, servers: 0, routing: 0, settings: 0, diagnostics: 0 });
 
   const clearSubscriptionUrl = useCallback(() => {
     if (subscriptionInputRef.current) subscriptionInputRef.current.value = "";
-    setSubscriptionVisible(false);
   }, []);
 
   const invalidateImport = useCallback(() => {
@@ -812,8 +803,6 @@ export default function App() {
     setDialog(null);
     setPendingMode(null);
     setImportError("");
-    setSubscriptionPreview(null);
-    setClipboardSource("");
     clearSubscriptionUrl();
   }, [clearSubscriptionUrl, invalidateImport]);
 
@@ -949,92 +938,15 @@ export default function App() {
     setSettingsDraft(controller.getSnapshot().settings);
   };
 
-  const focusImportInput = () => window.requestAnimationFrame(() => {
-    if (importMethod === "url") subscriptionInputRef.current?.focus();
-    else clipboardButtonRef.current?.focus();
-  });
-
-  const readClipboardSource = () => {
-    controller.cancelImportPreview();
-    const generation = ++importGeneration.current;
-    void runAsyncAction({
-      page: "servers",
-      title: "Не удалось прочитать буфер обмена",
-      setBusy: (busy) => {
-        if (generation === importGeneration.current) setImporting(busy);
-      },
-      action: () => navigator.clipboard.readText(),
-      retry: readClipboardSource,
-      errorPresentation: "inline",
-      onError: (publicError) => {
-        if (generation !== importGeneration.current) return;
-        setImportError(publicError.message);
-      },
-      onSuccess: (value) => {
-        if (generation !== importGeneration.current) return;
-        setClipboardSource(value);
-        setImportError(value.trim() ? "" : "Буфер обмена пуст.");
-      },
-    });
-  };
-
-  const previewImport = () => {
-    if (importMethod === "file") {
-      setImportError("Выбор файла появится вместе с Tauri dialog adapter.");
-      return;
-    }
-    const sourceType = importMethod === "url" ? "url" : "clipboard";
-    const hasSource = sourceType === "url"
-      ? Boolean(subscriptionInputRef.current?.value.trim())
-      : Boolean(clipboardSource.trim());
-    if (!hasSource) {
-      setImportError(importMethod === "url" ? "Введите URL подписки. Значение будет скрыто после импорта." : "Сначала явно прочитайте подписку из буфера обмена.");
-      focusImportInput();
+  const importSubscription = () => {
+    const subscriptionUrl = subscriptionInputRef.current?.value.trim() ?? "";
+    if (!subscriptionUrl) {
+      setImportError("Вставьте ссылку на подписку.");
+      window.requestAnimationFrame(() => subscriptionInputRef.current?.focus());
       return;
     }
     setImportError("");
     controller.cancelImportPreview();
-    const generation = ++importGeneration.current;
-    let pending: Promise<SubscriptionPreview>;
-    if (sourceType === "url") {
-      // The URL is read directly from the DOM and erased synchronously. It is
-      // never copied into React state or a retry callback.
-      let subscriptionUrl = subscriptionInputRef.current?.value ?? "";
-      clearSubscriptionUrl();
-      pending = controller.previewSubscription({ type: "url", value: subscriptionUrl });
-      subscriptionUrl = "";
-    } else {
-      pending = controller.previewSubscription({ type: "clipboard", value: clipboardSource });
-    }
-    void runAsyncAction({
-      page: "servers",
-      title: "Не удалось проверить подписку",
-      setBusy: (busy) => {
-        if (generation === importGeneration.current) setImporting(busy);
-      },
-      action: () => pending,
-      retry: sourceType === "url" ? undefined : previewImport,
-      errorPresentation: "inline",
-      onError: (publicError) => {
-        if (generation !== importGeneration.current) return;
-        if (sourceType === "url") {
-          clearSubscriptionUrl();
-        }
-        setImportError(publicError.message);
-      },
-      onSuccess: (preview) => {
-        if (generation !== importGeneration.current) return;
-        // The raw URL/share-list is a secret and is no longer needed after the
-        // backend has converted it into a masked preview token.
-        setClipboardSource("");
-        clearSubscriptionUrl();
-        setSubscriptionPreview(preview);
-      },
-    });
-  };
-
-  const commitImport = () => {
-    if (!subscriptionPreview) return;
     const generation = ++importGeneration.current;
     void runAsyncAction({
       page: "servers",
@@ -1042,17 +954,22 @@ export default function App() {
       setBusy: (busy) => {
         if (generation === importGeneration.current) setImporting(busy);
       },
-      action: () => controller.commitSubscription(subscriptionPreview),
-      retry: commitImport,
+      action: async () => {
+        const preview = await controller.previewSubscription({ type: "url", value: subscriptionUrl });
+        if (generation !== importGeneration.current) return null;
+        await controller.commitSubscription(preview);
+        return preview;
+      },
       errorPresentation: "inline",
       onError: (publicError) => {
-        if (generation === importGeneration.current) setImportError(publicError.message);
-      },
-      onSuccess: () => {
         if (generation !== importGeneration.current) return;
+        setImportError(publicError.message);
+      },
+      onSuccess: (preview) => {
+        if (!preview || generation !== importGeneration.current) return;
+        clearSubscriptionUrl();
         closeDialog();
-        setClipboardSource("");
-        showToast("Подписка проверена и импортирована", "success");
+        showToast(`Подписка импортирована · ${preview.nodeNames.length} серверов`, "success");
       },
     });
   };
@@ -1080,7 +997,7 @@ export default function App() {
       case "home":
         return <HomePage snapshot={snapshot} headingRef={headingRef} onNavigate={navigate} onModeChange={handleModeChange} onConnect={handleConnect} onDisconnect={disconnect} onRetry={retryConnection} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "servers":
-        return <ServersPage snapshot={snapshot} headingRef={headingRef} search={search} onSearch={setSearch} onImport={() => { invalidateImport(); setClipboardSource(""); clearSubscriptionUrl(); setDialog("import"); }} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
+        return <ServersPage snapshot={snapshot} headingRef={headingRef} search={search} onSearch={setSearch} onImport={() => { invalidateImport(); clearSubscriptionUrl(); setDialog("import"); }} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "routing":
         return <RoutingPage snapshot={snapshot} headingRef={headingRef} draft={routingDraft} onDraftChange={setRoutingDraft} onApply={applyRouting} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "settings":
@@ -1113,51 +1030,24 @@ export default function App() {
       {dialog === "import" ? (
         <Dialog
           title="Импорт подписки"
-          description="RouteDeck импортирует только поддерживаемые узлы и не выполняет чужие команды или настройки."
-          focusKey={subscriptionPreview ? "preview" : `source-${importMethod}`}
+          description="Вставьте HTTPS-ссылку от провайдера. RouteDeck добавит поддерживаемые серверы."
+          focusKey="subscription-url"
           onClose={closeDialog}
           busy={importing}
-          closeDisabled={confirmingImport}
-          actions={subscriptionPreview ? <>
-            <button className="secondary-button" type="button" data-autofocus disabled={confirmingImport} onClick={() => { invalidateImport(); setSubscriptionPreview(null); setImportError(""); }}>Назад</button>
-            <button className="primary-button dialog-primary" type="button" disabled={importing} data-error-autofocus={importError ? "true" : undefined} aria-busy={importing} aria-describedby={importError ? "import-error" : undefined} onClick={commitImport}>{importing ? <LoaderIcon size={19} /> : <ImportIcon size={19} />}{importing ? "Импортируем…" : "Подтвердить импорт"}</button>
-          </> : <>
+          actions={<>
             <button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Отмена</button>
-            <button className="primary-button dialog-primary" type="button" disabled={importing || importMethod === "file"} aria-busy={importing} onClick={previewImport}>{importing ? <LoaderIcon size={19} /> : <ImportIcon size={19} />}{importing ? (importMethod === "url" ? "Загружаем…" : "Проверяем содержимое…") : (importMethod === "url" ? "Загрузить" : "Проверить содержимое")}</button>
+            <button className="primary-button dialog-primary" type="submit" form="subscription-import-form" disabled={importing} aria-busy={importing}>{importing ? <LoaderIcon size={19} /> : <ImportIcon size={19} />}{importing ? "Импортируем…" : "Импортировать"}</button>
           </>}
         >
-          {subscriptionPreview ? (
-            <section className="import-preview" aria-live="polite">
-              {importError ? <p id="import-error" className="field-error" role="alert">{importError}</p> : null}
-              {confirmingImport ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><InfoIcon size={17} />Импорт подтверждается локальным контроллером. Дождитесь результата — окно закроется только после согласования списка серверов.</p> : null}
-              <p className="overline">Предпросмотр · данные ещё не сохранены</p>
-              <h3>Найдено поддерживаемых узлов</h3>
-              <p className="preview-source">Источник: {subscriptionPreview.sourceLabel}</p>
-              <div className="preview-counts">{subscriptionPreview.supported.map((item) => <span key={item.protocol}><strong>{item.count}</strong>{item.protocol}</span>)}</div>
-              <p>{subscriptionPreview.unsupportedCount} неподдерживаемых записей будут пропущены.</p>
-              <ul>{subscriptionPreview.nodeNames.map((name) => <li key={name}>{name}</li>)}</ul>
-            </section>
-          ) : <>
-            <SegmentedControl
-              label="Источник подписки"
-              value={importMethod}
-              options={[{ value: "url", label: "URL" }, { value: "clipboard", label: "Буфер" }, { value: "file", label: "Файл · скоро", disabled: true }]}
-              onChange={(method) => { invalidateImport(); setImportMethod(method); setClipboardSource(""); clearSubscriptionUrl(); setImportError(""); setSubscriptionPreview(null); }}
-            />
-            {importing ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><LoaderIcon size={17} />{importMethod === "url" ? "Загружаем подписку…" : "Проверяем содержимое подписки…"}</p> : null}
-            {importMethod === "url" ? (
-              <div className="dialog-field"><label htmlFor="subscription-url">HTTPS URL подписки</label><span className="secret-input"><input ref={subscriptionInputRef} id="subscription-url" type={subscriptionVisible ? "text" : "password"} autoComplete="off" defaultValue="" disabled={importing} data-error-autofocus={importError ? "true" : undefined} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-help"} placeholder="https://provider.example/••••" onInput={() => setImportError("")} /><button className="icon-button" type="button" disabled={importing} aria-label={subscriptionVisible ? "Скрыть URL" : "Показать URL"} title={subscriptionVisible ? "Скрыть URL" : "Показать URL"} onClick={() => setSubscriptionVisible((visible) => !visible)}><EyeIcon size={18} /></button></span><small id="import-help">Подписка загрузится по HTTPS через текущий сетевой путь Windows с обычными ограничениями по времени и размеру. URL очистится из формы после запуска.</small>{importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}</div>
-            ) : (
-              <div className="method-placeholder compact-placeholder">
-                <ImportIcon size={24} />
-                <strong>{clipboardSource ? "Подписка прочитана и скрыта" : "Буфер не читается автоматически"}</strong>
-                <p>Нажмите кнопку сами — только это действие запрашивает clipboard API.</p>
-                <button ref={clipboardButtonRef} className="secondary-button full-width" type="button" disabled={importing} data-error-autofocus={importError ? "true" : undefined} aria-describedby={importError ? "import-error" : undefined} onClick={readClipboardSource}>Прочитать буфер обмена</button>
-                {importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}
-              </div>
-            )}
-            <p className="file-adapter-note"><InfoIcon size={17} />Локальный файл будет доступен после подключения безопасного Tauri dialog adapter; fake-импорт отключён.</p>
-          </>}
+          <form id="subscription-import-form" onSubmit={(event) => { event.preventDefault(); importSubscription(); }}>
+            {importing ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><LoaderIcon size={17} />Загружаем и добавляем серверы…</p> : null}
+            <div className="dialog-field">
+              <label htmlFor="subscription-url">Ссылка на подписку</label>
+              <input ref={subscriptionInputRef} id="subscription-url" type="url" inputMode="url" autoComplete="url" defaultValue="" disabled={importing} data-autofocus data-error-autofocus={importError ? "true" : undefined} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-help"} placeholder="https://provider.example/subscription" onInput={() => setImportError("")} />
+              <small id="import-help">Можно вставить ссылку обычным Ctrl+V. Поддерживаются подписки по HTTPS.</small>
+              {importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}
+            </div>
+          </form>
         </Dialog>
       ) : null}
 

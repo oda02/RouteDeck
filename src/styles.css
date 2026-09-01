@@ -839,8 +839,7 @@ h2 {
   gap: var(--space-2);
 }
 
-.search-field,
-.secret-input {
+.search-field {
   display: flex;
   min-width: 0;
   align-items: center;
@@ -856,14 +855,12 @@ h2 {
   gap: var(--space-2);
 }
 
-.search-field:focus-within,
-.secret-input:focus-within {
+.search-field:focus-within {
   outline: 3px solid var(--focus);
   outline-offset: 2px;
 }
 
-.search-field input,
-.secret-input input {
+.search-field input {
   width: 100%;
   min-width: 0;
   min-height: 42px;
@@ -875,8 +872,7 @@ h2 {
   font-size: 14px;
 }
 
-.search-field input::placeholder,
-.secret-input input::placeholder {
+.search-field input::placeholder {
   color: var(--text-disabled);
 }
 
@@ -983,8 +979,7 @@ h2 {
   line-height: 14px;
 }
 
-.empty-state,
-.method-placeholder {
+.empty-state {
   display: flex;
   min-height: 140px;
   padding: var(--space-5);
@@ -998,87 +993,14 @@ h2 {
   text-align: center;
 }
 
-.empty-state strong,
-.method-placeholder strong {
+.empty-state strong {
   color: var(--text-primary);
   font-size: 14px;
 }
 
-.empty-state span,
-.method-placeholder p {
+.empty-state span {
   font-size: 12px;
   line-height: 17px;
-}
-
-.compact-placeholder {
-  min-height: 164px;
-}
-
-.file-adapter-note {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 17px;
-}
-
-.file-adapter-note svg {
-  flex: 0 0 auto;
-  margin-top: 1px;
-}
-
-.import-preview {
-  display: flex;
-  padding: var(--space-4);
-  flex-direction: column;
-  gap: var(--space-3);
-  border: 1px solid var(--info-border);
-  border-radius: var(--radius-lg);
-  color: var(--info-text);
-  background: var(--info-bg);
-}
-
-.import-preview h3 {
-  margin: 0;
-  font-size: 18px;
-  line-height: 24px;
-}
-
-.import-preview p,
-.import-preview li,
-.preview-source {
-  font-size: 13px;
-  line-height: 19px;
-}
-
-.import-preview ul {
-  margin: 0;
-  padding-left: 20px;
-}
-
-.preview-counts {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: var(--space-2);
-}
-
-.preview-counts span {
-  display: flex;
-  min-width: 0;
-  padding: var(--space-2);
-  align-items: center;
-  flex-direction: column;
-  border: 1px solid var(--info-border);
-  border-radius: var(--radius-md);
-  font-size: 11px;
-  line-height: 16px;
-  text-align: center;
-}
-
-.preview-counts strong {
-  font-size: 18px;
-  line-height: 22px;
 }
 
 .effective-summary {
@@ -1463,12 +1385,6 @@ select,
 .dialog-field select,
 .dialog-field > input {
   width: 100%;
-}
-
-.secret-input .icon-button {
-  width: 44px;
-  min-width: 44px;
-  min-height: 44px;
 }
 
 .choice-list {

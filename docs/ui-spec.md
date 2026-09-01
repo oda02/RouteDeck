@@ -428,15 +428,16 @@ Variants: info, warning, error, success. All use fully opaque semantic backgroun
 
 ### 6.10 `ImportSubscriptionDialog`
 
-- Initial focus is the dialog title or first method control. Methods: URL, clipboard,
-  local file. Each has a visible label.
-- URL import has one ordinary `Загрузить` action and no network-transport selector. It
-  follows the current Windows network path automatically, with normal timeout and size
-  limits. The URL is cleared from the form after loading and is not echoed in errors.
-  Clipboard is read only after explicit button activation.
-- Validate, then show counts by supported/unsupported protocol before the user confirms.
-- Error belongs next to the failing field and the first invalid field receives focus on
-  submit. Escape/Cancel always remains available before commit.
+- The dialog has one visible URL field and one ordinary `Импортировать` action. A user
+  can paste with standard Windows shortcuts; there is no source-method or network-
+  transport selector.
+- Import follows the current Windows network path automatically, with normal HTTPS,
+  timeout, and response-size limits. Internally the backend still validates before an
+  atomic commit, but the UI does not turn that implementation detail into a second step.
+- The URL remains editable after a failed request, is cleared after success, and is never
+  echoed in errors, logs, or diagnostics.
+- Error belongs next to the URL field and the field receives focus on submit. Escape and
+  Cancel remain available while the request is pending.
 
 ### 6.11 `ConfirmDialog`
 

@@ -21,7 +21,7 @@ export function toPublicActionError(error: unknown): PublicActionError {
       case "invalid-subscription-url":
         return { message: "Проверьте формат HTTPS URL подписки." };
       case "insecure-subscription-url":
-        return { message: "Для подписки требуется защищённый HTTPS URL." };
+        return { message: "Поддерживаются ссылки на подписку по HTTPS." };
       case "subscription-policy-blocked":
         return { message: "Ссылка подписки или её перенаправление не поддерживается. Используйте обычный публичный HTTPS URL." };
       case "subscription-fetch-failed":
@@ -33,9 +33,9 @@ export function toPublicActionError(error: unknown): PublicActionError {
       case "subscription-invalid-encoding":
         return { message: "Сервер вернул подписку в неподдерживаемой кодировке. Нужен корректный текст UTF-8." };
       case "empty-subscription-source":
-        return { message: "Источник подписки пуст." };
+        return { message: "Ссылка на подписку пустая." };
       case "stale-subscription-preview":
-        return { message: "Предпросмотр устарел. Проверьте источник ещё раз." };
+        return { message: "Импорт был отменён или уже завершён. Повторите попытку." };
     }
   }
   if (typeof DOMException !== "undefined" && error instanceof DOMException && error.name === "NotAllowedError") {
