@@ -364,19 +364,38 @@ Addresses are examples, not constants: preflight must choose non-overlapping RFC
 
 ## 9. Windows System Proxy ownership
 
+The normative Windows ownership, guardian, IPC, recovery, risk, and test-gate design is
+in [Safe Windows mode ownership](windows-mode-ownership.md). This section summarizes the
+product contract; implementations must satisfy the more detailed document as well.
+
 Use WinINet's `INTERNET_OPTION_PER_CONNECTION_OPTION` APIs to query/set the current user's flags, proxy server, and bypass values. Microsoft recommends the per-connection option API over `INTERNET_OPTION_PROXY`, and requires a refresh after global changes. Do not directly edit registry values: Microsoft warns clients not to depend on the implementation storage. See [setting/retrieving Internet options](https://learn.microsoft.com/en-us/windows/win32/wininet/setting-and-retrieving-internet-options) and [WinINet option flags](https://learn.microsoft.com/en-us/windows/win32/wininet/option-flags).
 
-Treat the relevant state as one normalized snapshot:
+The first release changes only the default/LAN connection (`pszConnection = NULL`). An
+active RAS connection with distinct per-connection proxy state is a hard unsupported
+conflict, not permission to change only part of the effective state. Query
+`INTERNET_PER_CONN_FLAGS_UI` with the documented fallback, retain raw flags for restore,
+and include the manual proxy, bypass, PAC URL, auto-discovery flags, and supported
+settable PAC secondary/reload values. Treat the relevant state as one exact API snapshot:
 
 ```text
 ProxySnapshot {
-  flags (direct/proxy/auto-config),
+  connection_target,
+  flags_ui,
+  flags_restore,
   proxy_server,
   proxy_bypass,
   auto_config_url,
-  autodetect,
+  auto_discovery_flags,
+  supported_secondary_auto_config_state,
 }
 ```
+
+Do not reorder or otherwise semantically rewrite a foreign proxy, bypass, or PAC value.
+An unreadable field, partial query, or inconsistent flag result is a hard conflict.
+RouteDeck constructs its published proxy mapping and fixed bypass policy natively. If a
+manual proxy, PAC, or auto-detection is already active, takeover requires explicit,
+short-lived consent bound to a hash of the complete snapshot; the snapshot is compared
+again immediately before writing.
 
 ### 9.1 Durable journal
 
@@ -388,13 +407,19 @@ ProxyJournal {
   session_uuid,
   owner_pid + owner_process_start_time,
   created_at,
-  phase: Prepared | Applied | Restoring,
-  original: exact normalized snapshot,
+  phase: Prepared | Applied | Restoring | Conflict,
+  original: exact API snapshot,
   published: exact intended RouteDeck snapshot,
+  published listener PID + process start time,
 }
 ```
 
-Write temporary file, flush, atomically rename, then make the Windows change. After writing, broadcast/refresh via the documented WinINet APIs, re-read, and require an exact match before proceeding. Protect the journal against cross-user access: an original proxy/PAC URL may itself be sensitive, and the journal is security-sensitive state evidence.
+Write a create-new temporary file, flush it, atomically replace/rename with write-through
+semantics, then make the Windows change. The file lives under the current user's local
+application-data directory, has a restrictive ACL and reparse/owner checks, and protects
+its payload with DPAPI CurrentUser. After writing, broadcast/refresh via the documented
+WinINet APIs, re-read, and require an exact match before proceeding. An original proxy
+or PAC URL may itself be sensitive, and the journal is security-sensitive state evidence.
 
 ### 9.2 Compare-before-write/restore
 
@@ -408,21 +433,66 @@ A watcher periodically and on network/settings notifications re-reads the snapsh
 
 Two local proxy listeners on different ports can coexist. Two effective Windows System Proxy owners cannot: the system-wide setting can publish only one endpoint set. RouteDeck must state this explicitly.
 
+### 9.3 Ephemeral guardian and ownership proof
+
+System Proxy uses a fixed, verified, **unprivileged** per-session guardian. The guardian
+installs no service, task, startup entry, or persistent process. It captures, journals,
+publishes, watches, and restores WinINet state and monitors the GUI PID plus process
+creation time. This closes the dead-proxy window after a GUI crash; if the guardian and
+GUI both fail, the durable journal drives next-start reconciliation. The guardian builds
+the proxy mapping itself and accepts no arbitrary proxy string, PAC URL, path, or command.
+
+`Connected(SystemProxy)` requires the same valid `Applied` journal, authenticated live
+guardian, exact current WinINet snapshot, expected listener process ownership, and a
+selected-outbound HTTPS proof. Process, listeners, journal, guardian, and WinINet state
+are checked again after the proof. A guardian death or exact-state mismatch removes the
+green state immediately.
+
 ## 10. TUN elevation and other-VPN coexistence
 
 ### 10.1 UAC-on-demand helper
 
 The GUI manifest remains `asInvoker`. Launch the fixed helper with the Windows `runas` verb only when the user enables TUN; Windows then displays UAC. Microsoft documents both [`runas`](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecutea) and execution-level manifests in [application manifests](https://learn.microsoft.com/en-us/windows/win32/sbscs/application-manifests).
 
-The helper accepts only typed operations such as `StartTun(session_id, config_handle, parent_identity)` and `StopTun(session_id)`. It must not accept an executable path, shell command, arbitrary arguments/environment, registry path, interface command, or output path from the renderer.
+The helper is a separate minimal binary without Tauri/WebView code. Release builds require
+an Authenticode-trusted helper with the expected signer and exact component-manifest hash;
+unsigned elevation is restricted to explicitly development-only builds in a disposable
+VM. The helper accepts only typed operations such as
+`StartTun(session_id, registered_config_handle_id, upstream_choice_id, preflight_hash)`
+and `StopTun(session_id)`. It must not accept an executable path, shell command,
+arbitrary arguments/environment, registry path, config path, interface command, service
+name, or output path from the renderer.
 
-IPC uses a per-session named pipe with an explicit ACL restricted to the launching user SID, Administrators, and SYSTEM; do not rely on the permissive default descriptor. Microsoft notes that a default named-pipe ACL grants read access to Everyone and anonymous users; see [named-pipe security](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights).
+IPC uses a one-instance per-session named pipe with remote clients rejected and an
+explicit ACL restricted to the launching user SID, Administrators, and SYSTEM; do not
+rely on the permissive default descriptor. Both peers verify PID, process creation time,
+image identity, and signature. A challenge sent inside the pipe, a monotonic request
+sequence, expiry, and a one-start state machine reject replay. The command line contains
+no secret or renderer-controlled path. Microsoft notes that a default named-pipe ACL
+grants read access to Everyone and anonymous users; see
+[named-pipe security](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights).
 
-The helper owns sing-box in a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and monitors the GUI PID **and process creation time** to avoid PID-reuse mistakes. Windows documents that closing the last such job handle terminates all associated processes; see [Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects).
+The native controller retains a private generated-config handle; after mutual peer
+authentication, the helper duplicates and independently validates that handle. It also
+re-verifies the engine and DLL using held no-write/no-delete handles. The helper creates
+sing-box suspended, assigns it to a Job Object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and only then resumes it. It monitors the GUI PID
+**and process creation time** to avoid PID-reuse mistakes. Windows documents that closing
+the last such job handle terminates all associated processes; see
+[Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects).
 
 ### 10.2 Preflight and upstream interface choice
 
-Before elevation, enumerate IPv4/IPv6 adapters and routes, occupied RouteDeck prefixes, default routes, and likely tunnel adapters. Windows provides `GetAdaptersAddresses` and `GetIpForwardTable2`; adapter/route metrics influence the preferred route. See [GetAdaptersAddresses](https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-getadaptersaddresses), [GetIpForwardTable2](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/getipforwardtable2), and [interface metrics](https://learn.microsoft.com/en-us/windows-server/networking/technologies/network-subsystem/net-sub-interface-metric).
+Before elevation, enumerate IPv4/IPv6 adapters and routes, occupied prefixes, default
+routes, DNS state, likely tunnel adapters, and the best route to every resolved selected
+server address. Use interface LUID plus GUID for identity; an index or name alone is not
+ownership. Allocate random non-overlapping RFC1918 `/30` and ULA `/126` prefixes and a
+session-unique interface name; fixed example addresses are forbidden in production.
+Windows provides `GetAdaptersAddresses`, `GetIpForwardTable2`, and `GetBestRoute2`;
+adapter/route metrics influence the preferred route. See
+[GetAdaptersAddresses](https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-getadaptersaddresses),
+[GetIpForwardTable2](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/getipforwardtable2),
+and [interface metrics](https://learn.microsoft.com/en-us/windows-server/networking/technologies/network-subsystem/net-sub-interface-metric).
 
 Offer these explicit policies when another VPN/default tunnel is detected:
 
@@ -432,7 +502,18 @@ Offer these explicit policies when another VPN/default tunnel is detected:
 
 Do not assume a different local port makes two TUNs compatible. Refuse startup on prefix collision, missing usable upstream, multiple ambiguous equal-metric defaults without a user choice, an existing `RouteDeck` adapter/session not owned by the journal, or a post-start route table that does not match the intended policy.
 
-v2rayN in System Proxy-only mode does not inherently prevent RouteDeck's local listeners or TUN core from starting, but its global proxy ownership may conflict with RouteDeck System Proxy and its subscription-fetch path must not be inherited accidentally.
+The complete preflight is hashed into the user's choice and is revalidated immediately
+before UAC and by the helper. Route/interface/address notifications degrade the mode and
+require a fresh proof before green can return. Stop removes only adapter/routes whose
+complete LUID/GUID and route identity match the TUN journal; any mismatch is preserved as
+foreign state.
+
+v2rayN in System Proxy-only mode does not inherently prevent RouteDeck's local listeners
+or TUN core from starting, but its global proxy ownership may conflict with RouteDeck
+System Proxy and its subscription-fetch path must not be inherited accidentally. A
+foreign System Proxy also makes TUN per-app results unreliable for proxy-aware apps: the
+TUN may observe the foreign proxy core instead of the browser process. The UI labels this
+nested/best-effort and never silently disables the foreign proxy.
 
 ## 11. Proof-of-traffic and latency
 
@@ -488,10 +569,17 @@ No host-changing test or release build proceeds until all are true:
 3. generated configs for every supported protocol pass the pinned `sing-box check` in CI;
 4. Windows proxy ownership and crash recovery pass deterministic mock tests;
 5. elevated helper command schema/ACL/path/hash handling receive independent security review;
-6. privileged TUN and concurrent-VPN tests first pass in an isolated Windows VM;
-7. the package has no unexpected listeners, services, startup tasks, or writes outside documented per-user locations.
+6. the unprivileged guardian passes publish/crash/restore and journal-gap tests in an
+   isolated Windows VM;
+7. privileged TUN and concurrent-VPN tests first pass in both clean and second-VPN
+   isolated Windows VM snapshots;
+8. the package has no unexpected listeners, services, startup tasks, or writes outside documented per-user locations.
 
-The detailed acceptance cases are in [test-matrix.md](test-matrix.md).
+**Windows System Proxy and RouteDeck TUN must not be activated on the user's main PC
+before every applicable VM gate passes.** Local-only explicit proxy testing remains
+allowed because it does not mutate Windows global state. The detailed design and
+acceptance cases are in [windows-mode-ownership.md](windows-mode-ownership.md) and
+[test-matrix.md](test-matrix.md).
 
 ## 15. Primary references
 

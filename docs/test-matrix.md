@@ -15,6 +15,10 @@
 
 Every state-changing W/H test records a before snapshot and has a verified cleanup assertion. A test fails if cleanup is unknown, even when connectivity succeeded.
 
+The normative mode boundary and safe sequencing are defined in
+[Safe Windows mode ownership](windows-mode-ownership.md). Tests must not bypass its
+consent, journal, guardian, helper, or ownership requirements.
+
 ## 2. Release-blocking acceptance summary
 
 - All U and C cases pass on every change.
@@ -24,6 +28,20 @@ Every state-changing W/H test records a before snapshot and has a verified clean
 - TUN helper accepts no arbitrary command/path/config (`PR-05` through `PR-12`).
 - VLESS/REALITY, Hysteria2, and Naive each pass config validation and real authorized proof.
 - Default Direct + selected-app VPN and default VPN + selected-app Direct pass in TUN for IPv4 and IPv6.
+
+### 2.1 Hard Windows VM gate
+
+**Do not publish RouteDeck Windows System Proxy or start RouteDeck TUN on the user's main
+PC until all U/C tests, the independent ownership/helper security review, and all
+applicable W tests pass in both a clean disposable Windows VM snapshot and a snapshot
+with a second VPN/proxy installed.** Local-only proof through explicit loopback ports is
+not a Windows mode mutation and may proceed separately.
+
+Before this gate passes, the main PC must not be used for a WinINet write, existing
+proxy/PAC takeover, UAC helper activation, route/DNS/adapter mutation, stale-state
+cleanup, forced crash/power/sleep/network-change case, physical-interface bypass, or
+another-VPN race. Direct registry edits, service/task/startup installation, blind force
+restore, and termination or reconfiguration of another VPN are forbidden in every tier.
 
 ## 3. Artifact and supply-chain tests
 
@@ -164,6 +182,13 @@ All W/H proxy tests snapshot the exact WinINet per-connection state before execu
 | PX-18 | W/H | App ignores Windows proxy/uses direct UDP | UI does not claim capture; diagnostics explain System Proxy limitation. |
 | PX-19 | U/W | Global Direct, one app VPN in System Proxy | Best-effort behavior labeled accurately; never promoted to reliable full split tunneling. |
 | PX-20 | W | Stop with restoration conflict | Preserve journal/evidence; stop/retain listener according to currently published endpoint without dead-proxy window. |
+| PX-21 | U/W | Active RAS connection has distinct per-connection proxy state | Hard unsupported conflict; RouteDeck does not partially write LAN or RAS state. |
+| PX-22 | U/W | Existing proxy/PAC/autodetect changes after takeover preview | Snapshot-bound consent becomes stale; no Windows write. |
+| PX-23 | W | GUI is killed while the exact RouteDeck proxy is published | Ephemeral unprivileged guardian restores exact original promptly; next startup verifies clean journal state. |
+| PX-24 | W | Guardian dies while GUI/core remain alive | Immediate Degraded; controlled exact recovery; never leave a green or dead published endpoint. |
+| PX-25 | W | Policy rewrites WinINet immediately after RouteDeck set | Exact reread fails or watcher detects displacement; no write loop and no blind reclaim. |
+| PX-26 | U/W | Journal has foreign ACL/owner, reparse, invalid DPAPI, over-size, truncation, or unknown schema | Quarantine/RecoveryRequired; no Windows write or secret disclosure. |
+| PX-27 | W | WinINet or listener ownership changes after HTTPS proof but before final publish | Post-proof recheck blocks Connected and begins exact recovery. |
 
 ## 8. TUN privilege, routes, DNS, and routing tests
 
@@ -181,6 +206,10 @@ All W/H proxy tests snapshot the exact WinINet per-connection state before execu
 | PR-10 | W | Same-user stale session/nonce replay | Session challenge rejected after first use/expiry. |
 | PR-11 | W | PID reused after parent exits | Parent creation-time mismatch causes cleanup; no stale authorization. |
 | PR-12 | W | GUI crashes/forced termination | Helper detects it; Job Object kills core; route/adapter cleanup verified. |
+| PR-13 | U/W | Helper is unsigned, wrong signer/version, wrong exact hash, or has an invalid component manifest | Release build refuses before UAC/state mutation; test-signed development helper is limited to disposable VM. |
+| PR-14 | U/W | Pipe squatting, remote client, second instance, wrong peer image, stale sequence, duplicate/unknown fields, or over-size frame | Fixed ACL/peer authentication/closed schema rejects the session; no mutation. |
+| PR-15 | W | Renderer or stale controller substitutes a config handle | Only a native registered handle from the authenticated GUI is duplicated; type/file ID/DACL/reparse/hash/schema mismatch is rejected. |
+| PR-16 | W | Core attempts work before Job assignment or spawns an early child | Suspended create, Job assignment, then resume prevents escape; closing the job kills the full tree. |
 | TN-01 | U | Preflight route/adapter fixtures: no other tunnel | Unique prefixes/interface selected. |
 | TN-02 | U/W | RouteDeck example prefix already present | Choose non-overlapping prefix or refuse; never overwrite route. |
 | TN-03 | W | TUN start with IPv4+IPv6 | Both captured according to policy; no family leak. |
@@ -200,6 +229,12 @@ All W/H proxy tests snapshot the exact WinINet per-connection state before execu
 | TN-17 | W | Simulated reboot/power loss with journal | Next startup finds no live owner, reconciles safely, never deletes foreign routes. |
 | TN-18 | W | DNS policy=VPN with default Direct + one VPN app | All captured DNS traverses selected while payload split remains correct; UI explains that Direct apps' DNS also uses VPN. |
 | TN-19 | W | DNS policy=CurrentNetwork with VPN app | Payload split remains correct; observable current-network DNS and warning are accepted behavior, never described as leak-free. |
+| TN-20 | U/W | Dynamic IPv4/IPv6 prefix and interface-name allocation across occupied adapter/route fixtures | Random `/30` and `/126` do not overlap; interface name is session-unique; fixed sample values never reach production. |
+| TN-21 | W | Adapter/route/DNS/best-path state changes between consent and helper launch | Preflight hash/revalidation fails before TUN mutation and requires a new user choice. |
+| TN-22 | W | Route/interface/address notification while Connected | Immediate Degraded; exact state and outbound are re-proved before green returns. |
+| TN-23 | U/W | Residual or foreign route shares RouteDeck name, prefix, metric, or index but not complete LUID/GUID/row identity | Rollback leaves it untouched and preserves journal/evidence. |
+| TN-24 | W | Foreign System Proxy remains enabled during RouteDeck TUN | UI labels nested/best-effort; per-app acceptance is not claimed because traffic may be attributed to the foreign proxy core. |
+| TN-25 | W | Helper or OS dies during each TUN journal phase | Job cleanup and startup reconciliation remove only exact owned state; ambiguity becomes RecoveryRequired. |
 
 ## 9. Coexistence with v2rayN/another VPN
 
@@ -215,7 +250,8 @@ All W/H proxy tests snapshot the exact WinINet per-connection state before execu
 | CO-08 | W | Ambiguous equal-metric defaults/tunnel adapter identity | Explicit choice required; no automatic mutation. |
 | CO-09 | W | Other VPN starts or stops while RouteDeck TUN runs | Route/ownership watcher detects change; re-proof or degrade; no false green. |
 | CO-10 | W | Prefix, DNS, or default-route conflict discovered post-start | Rollback RouteDeck-owned state only; preserve other VPN. |
-| CO-11 | H | User's real v2rayN remains running throughout non-mutating local listener/protocol test | No process termination or setting change; selected node can still be validated through explicit local health proxy. |
+| CO-11 | H | User's real v2rayN remains running throughout non-mutating local listener/protocol test | No process termination or setting change; selected node can still be validated through explicit local health proxy. This is permitted before the Windows-mode VM gate because it publishes neither System Proxy nor TUN. |
+| CO-12 | W | Foreign System Proxy feeds a foreign core while RouteDeck TUN is active | RouteDeck observes and explains the attribution boundary; browser-specific rules are not certified reliable. |
 
 ## 10. Protocol end-to-end acceptance
 
@@ -281,12 +317,12 @@ Real server credentials are never committed or printed. W uses dedicated test cr
 
 ## 14. Final host smoke sequence
 
-Run only after independent security review and all preceding automated/VM gates pass:
+Run only after independent security review and the hard VM gate in section 2.1 passes:
 
 1. Record (do not alter) current processes, WinINet proxy snapshot, adapters, IPv4/IPv6 routes, DNS, and RouteDeck ports; redact addresses in saved diagnostics.
 2. With the user's other VPN still running, start RouteDeck core in local-only mode. Verify distinct HTTP/SOCKS/health ports and prove VLESS, Hysteria2, and Naive through the explicit health proxy without publishing System Proxy or TUN.
 3. Test System Proxy only after the UI presents existing ownership and the user explicitly chooses takeover. Verify browser egress, ownership watcher, exact restore, and v2rayN displacement behavior.
-4. Test TUN only after route preflight presents nested/physical/cancel and the user selects one. Verify both routing defaults, a selected browser app, IPv4/IPv6, DNS, sleep/resume, and exact cleanup.
+4. Test TUN only after route preflight presents nested/physical/cancel and the user selects one. The first reliable per-app host case runs without a foreign TUN or foreign System Proxy. Verify both routing defaults, a selected browser app, IPv4/IPv6, DNS, and exact cleanup; destructive sleep/crash/network-flap cases remain VM-only.
 5. Stop RouteDeck. Assert no RouteDeck process/listener/adapter/route/journal remains unless a deliberate proxy conflict retained evidence. Assert the other VPN process and state were not stopped or modified outside the user's explicit choice.
 6. Repeat one clean connect/disconnect to prove recovery is not dependent on the first run.
 
