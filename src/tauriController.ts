@@ -288,14 +288,6 @@ function routeDeckErrorFromBackend(error: PublicErrorDto): RouteDeckError {
   }
 }
 
-function safeInvokeError(error: unknown): RouteDeckError {
-  try {
-    return routeDeckErrorFromBackend(parsePublicError(error));
-  } catch {
-    return new RouteDeckError("runtime-failure");
-  }
-}
-
 export class TauriController implements RouteDeckController {
   private snapshot = initialTauriSnapshot();
   private readonly listeners = new Set<() => void>();
@@ -391,13 +383,25 @@ export class TauriController implements RouteDeckController {
     return this.transport;
   }
 
+  private invokeError(error: unknown): RouteDeckError {
+    try {
+      return routeDeckErrorFromBackend(parsePublicError(error));
+    } catch (contractError) {
+      if (contractError instanceof ContractViolation) {
+        this.failBoundary("backend-response-invalid");
+        return new RouteDeckError("backend-response-invalid");
+      }
+      return new RouteDeckError("runtime-failure");
+    }
+  }
+
   private async invokeStatus(command: string, arguments_?: Record<string, unknown>): Promise<void> {
     const transport = await this.requireTransport();
     let raw: unknown;
     try {
       raw = await transport.invoke(command, arguments_);
     } catch (error) {
-      throw safeInvokeError(error);
+      throw this.invokeError(error);
     }
     try {
       this.acceptRuntime(parseRuntimeStatus(raw));
@@ -461,6 +465,12 @@ export class TauriController implements RouteDeckController {
     if (!source.value.trim()) throw new RouteDeckError("empty-subscription-source");
     const sourceType = source.type;
     const transport = await this.requireTransport();
+    // Initialization can take long enough for the dialog to be closed or the
+    // import method to change. Never send a secret-bearing IPC after that.
+    if (generation !== this.importGeneration) {
+      source = { type: "clipboard", value: "" };
+      throw new RouteDeckError("stale-subscription-preview");
+    }
     let raw: unknown;
     try {
       const pending = sourceType === "url"
@@ -472,7 +482,7 @@ export class TauriController implements RouteDeckController {
       raw = await pending;
     } catch (error) {
       source = { type: "clipboard", value: "" };
-      throw safeInvokeError(error);
+      throw this.invokeError(error);
     }
     let dto: ImportPreviewDto;
     try {
@@ -541,7 +551,7 @@ export class TauriController implements RouteDeckController {
       try {
         raw = await transport.invoke("confirm_import", { previewId: preview.token });
       } catch (error) {
-        throw safeInvokeError(error);
+        throw this.invokeError(error);
       }
       let confirmed;
       try {
@@ -596,7 +606,7 @@ export class TauriController implements RouteDeckController {
       try {
         raw = await transport.invoke("runtime_diagnostics");
       } catch (error) {
-        throw safeInvokeError(error);
+        throw this.invokeError(error);
       }
       const diagnostics = parseDiagnostics(raw);
       this.acceptRuntime(diagnostics.status);

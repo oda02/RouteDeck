@@ -44,7 +44,6 @@ import {
   type Destination,
   type RoutingConfig,
   type SettingsConfig,
-  type SubscriptionImportSource,
   type SubscriptionPreview,
   type TunPathChoice,
 } from "./model";
@@ -671,7 +670,7 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
   );
 }
 
-function Dialog({ title, description, focusKey, onClose, closeDisabled = false, children, actions }: { title: string; description?: string; focusKey?: string; onClose: () => void; closeDisabled?: boolean; children: ReactNode; actions: ReactNode }) {
+function Dialog({ title, description, focusKey, onClose, busy = false, closeDisabled = false, children, actions }: { title: string; description?: string; focusKey?: string; onClose: () => void; busy?: boolean; closeDisabled?: boolean; children: ReactNode; actions: ReactNode }) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const previouslyFocusedRef = useRef<HTMLElement | null>(null);
 
@@ -682,13 +681,13 @@ function Dialog({ title, description, focusKey, onClose, closeDisabled = false, 
 
   useEffect(() => {
     const dialog = dialogRef.current;
-    const focusable = closeDisabled
+    const focusable = busy || closeDisabled
       ? dialog?.querySelector<HTMLElement>("[data-dialog-busy-focus]")
       : dialog?.querySelector<HTMLElement>("[data-autofocus]")
       ?? dialog?.querySelector<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)");
     const frame = window.requestAnimationFrame(() => focusable?.focus());
     return () => window.cancelAnimationFrame(frame);
-  }, [closeDisabled, focusKey]);
+  }, [busy, closeDisabled, focusKey]);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -702,13 +701,37 @@ function Dialog({ title, description, focusKey, onClose, closeDisabled = false, 
       const items = Array.from(dialog.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex='-1'])"));
       const first = items[0];
       const last = items[items.length - 1];
-      if (!first || !last) return;
+      const busyTarget = dialog.querySelector<HTMLElement>("[data-dialog-busy-focus]");
+      if (!first || !last) {
+        if (busyTarget) {
+          event.preventDefault();
+          busyTarget.focus();
+        }
+        return;
+      }
+      if (document.activeElement === busyTarget) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+        return;
+      }
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
       if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     };
+    const onFocusIn = (event: FocusEvent) => {
+      if (!dialog || dialog.contains(event.target as Node | null)) return;
+      const target = busy || closeDisabled
+        ? dialog.querySelector<HTMLElement>("[data-dialog-busy-focus]")
+        : dialog.querySelector<HTMLElement>("[data-autofocus]")
+        ?? dialog.querySelector<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)");
+      target?.focus({ preventScroll: true });
+    };
     document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [closeDisabled, onClose]);
+    document.addEventListener("focusin", onFocusIn);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("focusin", onFocusIn);
+    };
+  }, [busy, closeDisabled, onClose]);
 
   return (
     <div className="dialog-scrim" role="presentation">
@@ -758,7 +781,7 @@ export default function App() {
   const [toastPaused, setToastPaused] = useState(false);
   const [actionFailure, setActionFailure] = useState<ActionFailure | null>(null);
   const [importMethod, setImportMethod] = useState<"url" | "clipboard" | "file">("url");
-  const [subscriptionSource, setSubscriptionSource] = useState("");
+  const [clipboardSource, setClipboardSource] = useState("");
   const [subscriptionVisible, setSubscriptionVisible] = useState(false);
   const [importError, setImportError] = useState("");
   const [importing, setImporting] = useState(false);
@@ -770,6 +793,11 @@ export default function App() {
   const clipboardButtonRef = useRef<HTMLButtonElement>(null);
   const importGeneration = useRef(0);
   const scrollPositions = useRef<Record<Destination, number>>({ home: 0, servers: 0, routing: 0, settings: 0, diagnostics: 0 });
+
+  const clearSubscriptionUrl = useCallback(() => {
+    if (subscriptionInputRef.current) subscriptionInputRef.current.value = "";
+    setSubscriptionVisible(false);
+  }, []);
 
   const invalidateImport = useCallback(() => {
     importGeneration.current += 1;
@@ -783,9 +811,9 @@ export default function App() {
     setPendingMode(null);
     setImportError("");
     setSubscriptionPreview(null);
-    setSubscriptionSource("");
-    setSubscriptionVisible(false);
-  }, [invalidateImport]);
+    setClipboardSource("");
+    clearSubscriptionUrl();
+  }, [clearSubscriptionUrl, invalidateImport]);
 
   const showToast = useCallback((message: string, kind: ToastKind = "success") => {
     setToast({ message, kind });
@@ -943,7 +971,7 @@ export default function App() {
       },
       onSuccess: (value) => {
         if (generation !== importGeneration.current) return;
-        setSubscriptionSource(value);
+        setClipboardSource(value);
         setImportError(value.trim() ? "" : "Буфер обмена пуст.");
         if (!value.trim()) focusImportInput();
       },
@@ -955,7 +983,11 @@ export default function App() {
       setImportError("Выбор файла появится вместе с Tauri dialog adapter.");
       return;
     }
-    if (!subscriptionSource.trim()) {
+    const sourceType = importMethod === "url" ? "url" : "clipboard";
+    const hasSource = sourceType === "url"
+      ? Boolean(subscriptionInputRef.current?.value.trim())
+      : Boolean(clipboardSource.trim());
+    if (!hasSource) {
       setImportError(importMethod === "url" ? "Введите URL подписки. Значение будет скрыто после импорта." : "Сначала явно прочитайте подписку из буфера обмена.");
       focusImportInput();
       return;
@@ -963,14 +995,16 @@ export default function App() {
     setImportError("");
     controller.cancelImportPreview();
     const generation = ++importGeneration.current;
-    const sourceValue = subscriptionSource;
-    const sourceType = importMethod === "url" ? "url" : "clipboard";
-    let source: SubscriptionImportSource = { type: sourceType, value: sourceValue };
+    let pending: Promise<SubscriptionPreview>;
     if (sourceType === "url") {
-      // The URL may contain credentials. Remove it from React state before IPC
-      // starts; errors require explicit re-entry instead of retaining a secret.
-      setSubscriptionSource("");
-      setSubscriptionVisible(false);
+      // The URL is read directly from the DOM and erased synchronously. It is
+      // never copied into React state or a retry callback.
+      let subscriptionUrl = subscriptionInputRef.current?.value ?? "";
+      clearSubscriptionUrl();
+      pending = controller.previewSubscription({ type: "url", value: subscriptionUrl });
+      subscriptionUrl = "";
+    } else {
+      pending = controller.previewSubscription({ type: "clipboard", value: clipboardSource });
     }
     void runAsyncAction({
       page: "servers",
@@ -978,18 +1012,13 @@ export default function App() {
       setBusy: (busy) => {
         if (generation === importGeneration.current) setImporting(busy);
       },
-      action: () => {
-        const pending = controller.previewSubscription(source);
-        source = { type: "clipboard", value: "" };
-        return pending;
-      },
-      retry: previewImport,
+      action: () => pending,
+      retry: sourceType === "url" ? undefined : previewImport,
       errorPresentation: "inline",
       onError: (publicError) => {
         if (generation !== importGeneration.current) return;
         if (sourceType === "url") {
-          setSubscriptionSource("");
-          setSubscriptionVisible(false);
+          clearSubscriptionUrl();
         }
         setImportError(publicError.message);
         focusImportInput();
@@ -998,8 +1027,8 @@ export default function App() {
         if (generation !== importGeneration.current) return;
         // The raw URL/share-list is a secret and is no longer needed after the
         // backend has converted it into a masked preview token.
-        setSubscriptionSource("");
-        setSubscriptionVisible(false);
+        setClipboardSource("");
+        clearSubscriptionUrl();
         setSubscriptionPreview(preview);
       },
     });
@@ -1023,7 +1052,7 @@ export default function App() {
       onSuccess: () => {
         if (generation !== importGeneration.current) return;
         closeDialog();
-        setSubscriptionSource("");
+        setClipboardSource("");
         showToast("Подписка проверена и импортирована", "success");
       },
     });
@@ -1052,7 +1081,7 @@ export default function App() {
       case "home":
         return <HomePage snapshot={snapshot} headingRef={headingRef} onNavigate={navigate} onModeChange={handleModeChange} onConnect={handleConnect} onDisconnect={disconnect} onRetry={retryConnection} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "servers":
-        return <ServersPage snapshot={snapshot} headingRef={headingRef} search={search} onSearch={setSearch} onImport={() => { invalidateImport(); setDialog("import"); }} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
+        return <ServersPage snapshot={snapshot} headingRef={headingRef} search={search} onSearch={setSearch} onImport={() => { invalidateImport(); setClipboardSource(""); clearSubscriptionUrl(); setDialog("import"); }} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "routing":
         return <RoutingPage snapshot={snapshot} headingRef={headingRef} draft={routingDraft} onDraftChange={setRoutingDraft} onApply={applyRouting} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "settings":
@@ -1088,6 +1117,7 @@ export default function App() {
           description="RouteDeck импортирует только поддерживаемые узлы и не выполняет чужие команды или настройки."
           focusKey={subscriptionPreview ? "preview" : "source"}
           onClose={closeDialog}
+          busy={importing}
           closeDisabled={confirmingImport}
           actions={subscriptionPreview ? <>
             <button className="secondary-button" type="button" data-autofocus disabled={confirmingImport} onClick={() => { invalidateImport(); setSubscriptionPreview(null); setImportError(""); }}>Назад</button>
@@ -1100,7 +1130,7 @@ export default function App() {
           {subscriptionPreview ? (
             <section className="import-preview" aria-live="polite">
               {importError ? <p id="import-error" className="field-error" role="alert">{importError}</p> : null}
-              {confirmingImport ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={0} data-dialog-busy-focus><InfoIcon size={17} />Импорт подтверждается локальным контроллером. Дождитесь результата — окно закроется только после согласования списка серверов.</p> : null}
+              {confirmingImport ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><InfoIcon size={17} />Импорт подтверждается локальным контроллером. Дождитесь результата — окно закроется только после согласования списка серверов.</p> : null}
               <p className="overline">Предпросмотр · данные ещё не сохранены</p>
               <h3>Найдено поддерживаемых узлов</h3>
               <p className="preview-source">Источник: {subscriptionPreview.sourceLabel}</p>
@@ -1113,14 +1143,15 @@ export default function App() {
               label="Источник подписки"
               value={importMethod}
               options={[{ value: "url", label: "URL" }, { value: "clipboard", label: "Буфер" }, { value: "file", label: "Файл · скоро", disabled: true }]}
-              onChange={(method) => { invalidateImport(); setImportMethod(method); setSubscriptionSource(""); setSubscriptionVisible(false); setImportError(""); setSubscriptionPreview(null); }}
+              onChange={(method) => { invalidateImport(); setImportMethod(method); setClipboardSource(""); clearSubscriptionUrl(); setImportError(""); setSubscriptionPreview(null); }}
             />
+            {importing ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><LoaderIcon size={17} />{importMethod === "url" ? "Безопасно загружаем подписку по HTTPS…" : "Проверяем содержимое подписки…"}</p> : null}
             {importMethod === "url" ? (
-              <div className="dialog-field"><label htmlFor="subscription-url">HTTPS URL подписки</label><span className="secret-input"><input ref={subscriptionInputRef} id="subscription-url" type={subscriptionVisible ? "text" : "password"} autoComplete="off" value={subscriptionSource} disabled={importing} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-help"} placeholder="https://provider.example/••••" onChange={(event) => { setSubscriptionSource(event.target.value); setImportError(""); }} /><button className="icon-button" type="button" disabled={importing} aria-label={subscriptionVisible ? "Скрыть URL" : "Показать URL"} title={subscriptionVisible ? "Скрыть URL" : "Показать URL"} onClick={() => setSubscriptionVisible((visible) => !visible)}><EyeIcon size={18} /></button></span><small id="import-help">Контроллер загрузит подписку по HTTPS, заблокирует опасные перенаправления и локальные адреса. URL очищается сразу после запуска и не попадает в диагностику.</small>{importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}</div>
+              <div className="dialog-field"><label htmlFor="subscription-url">HTTPS URL подписки</label><span className="secret-input"><input ref={subscriptionInputRef} id="subscription-url" type={subscriptionVisible ? "text" : "password"} autoComplete="off" defaultValue="" disabled={importing} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-help"} placeholder="https://provider.example/••••" onInput={() => setImportError("")} /><button className="icon-button" type="button" disabled={importing} aria-label={subscriptionVisible ? "Скрыть URL" : "Показать URL"} title={subscriptionVisible ? "Скрыть URL" : "Показать URL"} onClick={() => setSubscriptionVisible((visible) => !visible)}><EyeIcon size={18} /></button></span><small id="import-help">Контроллер загрузит подписку по HTTPS, заблокирует опасные перенаправления и локальные адреса. URL очищается сразу после запуска и не попадает в диагностику.</small>{importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}</div>
             ) : (
               <div className="method-placeholder compact-placeholder">
                 <ImportIcon size={24} />
-                <strong>{subscriptionSource ? "Подписка прочитана и скрыта" : "Буфер не читается автоматически"}</strong>
+                <strong>{clipboardSource ? "Подписка прочитана и скрыта" : "Буфер не читается автоматически"}</strong>
                 <p>Нажмите кнопку сами — только это действие запрашивает clipboard API.</p>
                 <button ref={clipboardButtonRef} className="secondary-button full-width" type="button" disabled={importing} onClick={readClipboardSource}>Прочитать буфер обмена</button>
                 {importError ? <small className="field-error" role="alert">{importError}</small> : null}

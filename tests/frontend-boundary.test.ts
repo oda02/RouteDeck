@@ -52,17 +52,24 @@ test("non-dismissible import keeps focus inside the mounted dialog", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   assert.match(source, /previouslyFocusedRef\.current = document\.activeElement[\s\S]*return \(\) => previouslyFocusedRef\.current\?\.focus\([\s\S]*\}, \[\]\);/);
   assert.match(source, /data-dialog-busy-focus/);
-  assert.match(source, /role="status" aria-live="polite" tabIndex=\{0\} data-dialog-busy-focus/);
+  assert.match(source, /role="status" aria-live="polite" tabIndex=\{-1\} data-dialog-busy-focus/);
+  assert.match(source, /document\.addEventListener\("focusin", onFocusIn\)/);
+  assert.match(source, /dialog\.contains\(event\.target as Node \| null\)/);
   assert.doesNotMatch(source, /previouslyFocused\?\.focus/);
 });
 
 test("URL input is masked and cleared before the async preview action", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   assert.match(source, /id="subscription-url" type=\{subscriptionVisible \? "text" : "password"\}/);
-  const secretClear = source.indexOf("if (sourceType === \"url\") {");
-  const asyncAction = source.indexOf("void runAsyncAction({", secretClear);
-  assert.ok(secretClear >= 0 && asyncAction > secretClear);
-  assert.match(source.slice(secretClear, asyncAction), /setSubscriptionSource\(""\)/);
+  assert.match(source, /id="subscription-url"[\s\S]*defaultValue=""/);
+  assert.doesNotMatch(source, /subscriptionSource|setSubscriptionSource|value=\{subscriptionSource\}/);
+  const secretRead = source.indexOf("let subscriptionUrl = subscriptionInputRef.current?.value");
+  const secretClear = source.indexOf("clearSubscriptionUrl();", secretRead);
+  const ipcCall = source.indexOf("controller.previewSubscription({ type: \"url\", value: subscriptionUrl })", secretClear);
+  const localClear = source.indexOf('subscriptionUrl = "";', ipcCall);
+  const asyncAction = source.indexOf("void runAsyncAction({", localClear);
+  assert.ok(secretRead >= 0 && secretRead < secretClear && secretClear < ipcCall && ipcCall < localClear && localClear < asyncAction);
+  assert.match(source, /retry: sourceType === "url" \? undefined : previewImport/);
 });
 
 test("local-only readiness never maps to global Connected", () => {
@@ -195,13 +202,18 @@ test("ready status requires complete proof, identity, latency, and distinct port
 
 test("cancelled import cannot retain or publish a late preview", async () => {
   let resolvePreview!: (value: unknown) => void;
+  let markPreviewInvoked!: () => void;
   const discarded: Array<{ command: string; arguments_?: Record<string, unknown> }> = [];
   const previewResult = new Promise<unknown>((resolve) => { resolvePreview = resolve; });
+  const previewInvoked = new Promise<void>((resolve) => { markPreviewInvoked = resolve; });
   const transport: TauriTransport = {
     listen: async () => () => undefined,
     invoke: async (command, arguments_) => {
       if (command === "runtime_status") return runtimeStatus(1, "disconnected");
-      if (command === "preview_import_content") return previewResult;
+      if (command === "preview_import_content") {
+        markPreviewInvoked();
+        return previewResult;
+      }
       if (command === "discard_import_preview") {
         discarded.push({ command, arguments_ });
         return null;
@@ -212,6 +224,7 @@ test("cancelled import cannot retain or publish a late preview", async () => {
   const controller = new TauriController(async () => transport);
   await controller.ready();
   const pending = controller.previewSubscription({ type: "clipboard", value: "vless://hidden-fixture" });
+  await previewInvoked;
   controller.cancelImportPreview();
   resolvePreview({
     previewId: "preview-fixture",
@@ -222,6 +235,30 @@ test("cancelled import cannot retain or publish a late preview", async () => {
   await assert.rejects(pending, { code: "stale-subscription-preview" });
   assert.deepEqual(discarded, [{ command: "discard_import_preview", arguments_: { previewId: "preview-fixture" } }]);
   assert.equal(controller.getSnapshot().servers.length, 0);
+  controller.dispose();
+});
+
+test("cancelled import waiting for transport never sends secret-bearing IPC", async () => {
+  const secret = "https://provider.example/subscription?token=cancel-before-ready";
+  let resolveLoader!: (transport: TauriTransport) => void;
+  const loader = new Promise<TauriTransport>((resolve) => { resolveLoader = resolve; });
+  const calls: Array<{ command: string; arguments_?: Record<string, unknown> }> = [];
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command, arguments_) => {
+      calls.push({ command, arguments_ });
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => loader);
+  const pending = controller.previewSubscription({ type: "url", value: secret });
+  controller.cancelImportPreview();
+  resolveLoader(transport);
+
+  await assert.rejects(pending, { code: "stale-subscription-preview" });
+  assert.deepEqual(calls, [{ command: "runtime_status", arguments_: undefined }]);
+  assert.doesNotMatch(JSON.stringify(calls), /cancel-before-ready/);
   controller.dispose();
 });
 
@@ -258,13 +295,18 @@ test("HTTPS URL preview uses the exact typed command and retains no secret", asy
 test("stale HTTPS URL preview is discarded without publishing its secret", async () => {
   const secret = "https://provider.example/subscription?token=late-secret";
   let resolvePreview!: (value: unknown) => void;
+  let markPreviewInvoked!: () => void;
   const previewResult = new Promise<unknown>((resolve) => { resolvePreview = resolve; });
+  const previewInvoked = new Promise<void>((resolve) => { markPreviewInvoked = resolve; });
   const discarded: unknown[] = [];
   const transport: TauriTransport = {
     listen: async () => () => undefined,
     invoke: async (command, arguments_) => {
       if (command === "runtime_status") return runtimeStatus(1, "disconnected");
-      if (command === "preview_import_url") return previewResult;
+      if (command === "preview_import_url") {
+        markPreviewInvoked();
+        return previewResult;
+      }
       if (command === "discard_import_preview") {
         discarded.push(arguments_);
         return null;
@@ -275,6 +317,7 @@ test("stale HTTPS URL preview is discarded without publishing its secret", async
   const controller = new TauriController(async () => transport);
   await controller.ready();
   const pending = controller.previewSubscription({ type: "url", value: secret });
+  await previewInvoked;
   controller.cancelImportPreview();
   resolvePreview({
     previewId: "preview-url-late",
@@ -324,6 +367,38 @@ test("HTTPS fetch failures map to finite localized errors without backend detail
       },
     );
   }
+  controller.dispose();
+});
+
+test("malformed backend error closes the renderer boundary", async () => {
+  const secret = "https://provider.example/subscription?token=malformed-error";
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command) => {
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "preview_import_url") {
+        throw {
+          code: "subscription_fetch_timeout",
+          stage: "subscription_response",
+          message: "subscription.timeout",
+          detail: secret,
+        };
+      }
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+
+  await assert.rejects(
+    controller.previewSubscription({ type: "url", value: secret }),
+    { code: "backend-response-invalid" },
+  );
+  const snapshot = controller.getSnapshot();
+  assert.equal(snapshot.backendAvailable, false);
+  assert.equal(snapshot.notice?.id, "backend-response-invalid");
+  assert.doesNotMatch(JSON.stringify(snapshot), /malformed-error|subscription\.timeout/);
+  await assert.rejects(controller.connect(), { code: "backend-unavailable" });
   controller.dispose();
 });
 
