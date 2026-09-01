@@ -9,6 +9,8 @@ import type {
   RouteDeckController,
   RoutingConfig,
   SettingsConfig,
+  SubscriptionImportSource,
+  SubscriptionPreview,
   TunPathChoice,
 } from "./model";
 
@@ -28,10 +30,18 @@ const baseProofs = (): ConnectionProof[] => [
   { id: "local-ingress", label: "Локальный прокси", state: "idle", summary: "Не проверялся" },
   { id: "windows-mode", label: "Режим Windows", state: "idle", summary: "Не применён" },
   { id: "outbound-proof", label: "VPN-маршрут", state: "idle", summary: "Не проверялся" },
-  { id: "egress-ip", label: "VPN egress IP", state: "skipped", summary: "Последний: 203.0.113.42 (демо)" },
+  { id: "egress-ip", label: "VPN egress IP", state: "skipped", summary: "Не проверялся" },
 ];
 
+const demoProofs = (): ConnectionProof[] => baseProofs().map((proof) =>
+  proof.id === "egress-ip"
+    ? { ...proof, summary: "Последний: 203.0.113.42 (демо)" }
+    : proof,
+);
+
 const initialSnapshot: ControllerSnapshot = {
+  isDemo: true,
+  backendAvailable: false,
   phase: "disconnected",
   mode: "proxy",
   selectedServerId: "nl-vless",
@@ -42,7 +52,7 @@ const initialSnapshot: ControllerSnapshot = {
       country: "NL",
       protocol: "VLESS",
       detail: "Reality · Vision",
-      source: "My provider",
+      source: "DEMO profile",
       latencyState: "ready",
       latencyMs: 84,
       checkedAt: "14:32",
@@ -53,7 +63,7 @@ const initialSnapshot: ControllerSnapshot = {
       country: "DE",
       protocol: "Hysteria2",
       detail: "QUIC · TLS",
-      source: "My provider",
+      source: "DEMO profile",
       latencyState: "ready",
       latencyMs: 121,
       checkedAt: "14:31",
@@ -64,7 +74,7 @@ const initialSnapshot: ControllerSnapshot = {
       country: "FI",
       protocol: "Naive",
       detail: "HTTPS · Cronet",
-      source: "My provider",
+      source: "DEMO profile",
       latencyState: "unavailable",
     },
     {
@@ -73,7 +83,7 @@ const initialSnapshot: ControllerSnapshot = {
       country: "SE",
       protocol: "Hysteria2",
       detail: "QUIC · TLS",
-      source: "My provider",
+      source: "DEMO profile",
       latencyState: "ready",
       latencyMs: 96,
       checkedAt: "14:30",
@@ -84,12 +94,12 @@ const initialSnapshot: ControllerSnapshot = {
       country: "US",
       protocol: "VLESS",
       detail: "Reality · Vision",
-      source: "My provider",
+      source: "DEMO profile",
       latencyState: "timeout",
       checkedAt: "14:29",
     },
   ],
-  proofs: baseProofs(),
+  proofs: /* @__PURE__ */ demoProofs(),
   routing: {
     defaultRoute: "direct",
     apps: [
@@ -140,11 +150,11 @@ const initialSnapshot: ControllerSnapshot = {
       "Секреты и адрес подписки удалены из отчёта.",
     ],
   },
-  subscriptionName: "My provider",
+  subscriptionName: "DEMO provider",
   subscriptionUpdatedAt: "12 мин назад",
 };
 
-class MockRouteDeckController implements RouteDeckController {
+class DevelopmentDemoController implements RouteDeckController {
   private snapshot = initialSnapshot;
   private readonly listeners = new Set<() => void>();
   private operation = 0;
@@ -192,7 +202,7 @@ class MockRouteDeckController implements RouteDeckController {
     if (!["disconnected", "failed", "blocked-by-conflict", "degraded"].includes(this.snapshot.phase)) return;
     const token = ++this.operation;
     const isCurrent = () => token === this.operation;
-    this.publish({ proofs: baseProofs(), notice: undefined });
+    this.publish({ proofs: demoProofs(), notice: undefined });
 
     const step = async (
       phase: ConnectionPhase,
@@ -261,7 +271,7 @@ class MockRouteDeckController implements RouteDeckController {
     ++this.operation;
     this.setPhase("disconnecting");
     await wait(320);
-    this.publish({ phase: "disconnected", proofs: baseProofs(), notice: undefined });
+    this.publish({ phase: "disconnected", proofs: demoProofs(), notice: undefined });
   };
 
   retry = async () => this.connect();
@@ -284,9 +294,38 @@ class MockRouteDeckController implements RouteDeckController {
     });
   };
 
-  importSubscription = async (_source: string) => {
+  previewSubscription = async (source: SubscriptionImportSource): Promise<SubscriptionPreview> => {
     await wait(350);
-    this.publish({ subscriptionName: "Imported provider", subscriptionUpdatedAt: "только что" });
+    let sourceLabel = "Буфер обмена · скрыто";
+    if (source.type === "url") {
+      let parsed: URL;
+      try {
+        parsed = new URL(source.value);
+      } catch {
+        throw new Error("URL подписки имеет неверный формат.");
+      }
+      if (parsed.protocol !== "https:") throw new Error("Для подписки требуется HTTPS URL.");
+      sourceLabel = `${parsed.hostname}/••••`;
+    } else if (!source.value.trim()) {
+      throw new Error("Буфер обмена не содержит подписку.");
+    }
+    return {
+      token: `dev-preview-${Date.now()}`,
+      sourceLabel,
+      supported: [
+        { protocol: "VLESS", count: 4 },
+        { protocol: "Hysteria2", count: 3 },
+        { protocol: "Naive", count: 1 },
+      ],
+      unsupportedCount: 2,
+      nodeNames: ["Amsterdam Edge", "Frankfurt Fast", "Helsinki Quiet"],
+    };
+  };
+
+  commitSubscription = async (preview: SubscriptionPreview) => {
+    if (!preview.token.startsWith("dev-preview-")) throw new Error("Предпросмотр импорта устарел. Проверьте источник ещё раз.");
+    await wait(280);
+    this.publish({ subscriptionName: "DEMO imported provider", subscriptionUpdatedAt: "только что" });
   };
 
   applyRouting = async (routing: RoutingConfig) => {
@@ -301,7 +340,7 @@ class MockRouteDeckController implements RouteDeckController {
 
   runDiagnostics = async () => {
     this.publish({
-      diagnostics: { ...this.snapshot.diagnostics, running: true, steps: baseProofs() },
+      diagnostics: { ...this.snapshot.diagnostics, running: true, steps: demoProofs() },
     });
     await wait(480);
     const steps: ConnectionProof[] = [
@@ -329,7 +368,7 @@ class MockRouteDeckController implements RouteDeckController {
     this.publish({
       phase: "disconnected",
       mode: "proxy",
-      proofs: baseProofs(),
+      proofs: demoProofs(),
       notice: undefined,
       routing: initialSnapshot.routing,
       settings: initialSnapshot.settings,
@@ -349,4 +388,70 @@ class MockRouteDeckController implements RouteDeckController {
   };
 }
 
-export const controller: RouteDeckController = new MockRouteDeckController();
+class BackendUnavailableController implements RouteDeckController {
+  private readonly snapshot: ControllerSnapshot = {
+    isDemo: false,
+    backendAvailable: false,
+    phase: "failed",
+    mode: "proxy",
+    selectedServerId: "",
+    servers: [],
+    proofs: baseProofs(),
+    notice: {
+      id: "backend-unavailable",
+      kind: "error",
+      title: "Backend RouteDeck пока недоступен",
+      body: "Интерфейс запущен без Tauri-адаптера. Соединение, импорт и изменения Windows заблокированы.",
+      detail: "Production работает fail-closed: ни одно синтетическое состояние не может стать подключённым.",
+    },
+    routing: { defaultRoute: "direct", apps: [] },
+    settings: {
+      startMinimized: false,
+      closeBehavior: "tray",
+      httpPort: 2080,
+      socksPort: 2081,
+      proxyConflictPolicy: "never-overwrite",
+      theme: "dark",
+    },
+    environment: {
+      otherVpnDetected: false,
+      systemProxyOwner: "none",
+      physicalAdapters: [],
+    },
+    subscriptionName: "Backend не подключён",
+    subscriptionUpdatedAt: "—",
+    diagnostics: {
+      running: false,
+      steps: baseProofs().map((proof) => ({ ...proof, state: "skipped", summary: "Backend недоступен" })),
+      sanitizedLog: ["Tauri adapter is not bound; production actions are disabled."],
+    },
+  };
+  private readonly listeners = new Set<() => void>();
+
+  getSnapshot = () => this.snapshot;
+  subscribe = (listener: () => void) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
+  private unavailable(): never {
+    throw new Error("Backend RouteDeck недоступен. Действие безопасно заблокировано.");
+  }
+  setMode = () => this.unavailable();
+  selectServer = () => this.unavailable();
+  connect = async () => this.unavailable();
+  disconnect = async () => this.unavailable();
+  retry = async () => this.unavailable();
+  dismissNotice = () => undefined;
+  refreshServers = async () => this.unavailable();
+  previewSubscription = async () => this.unavailable();
+  commitSubscription = async () => this.unavailable();
+  applyRouting = async () => this.unavailable();
+  saveSettings = async () => this.unavailable();
+  runDiagnostics = async () => this.unavailable();
+  resetLocalState = async () => this.unavailable();
+  getSanitizedReport = () => "RouteDeck production report\nbackend=unavailable\nstatus=fail-closed";
+}
+
+export const controller: RouteDeckController = import.meta.env.DEV
+  ? new DevelopmentDemoController()
+  : new BackendUnavailableController();

@@ -108,6 +108,8 @@ export interface DiagnosticsState {
 }
 
 export interface ControllerSnapshot {
+  isDemo: boolean;
+  backendAvailable: boolean;
   phase: ConnectionPhase;
   mode: ConnectionMode;
   selectedServerId: string;
@@ -122,6 +124,18 @@ export interface ControllerSnapshot {
   subscriptionUpdatedAt: string;
 }
 
+export type SubscriptionImportSource =
+  | { type: "url"; value: string }
+  | { type: "clipboard"; value: string };
+
+export interface SubscriptionPreview {
+  token: string;
+  sourceLabel: string;
+  supported: Array<{ protocol: Protocol; count: number }>;
+  unsupportedCount: number;
+  nodeNames: string[];
+}
+
 export interface RouteDeckController {
   getSnapshot: () => ControllerSnapshot;
   subscribe: (listener: () => void) => () => void;
@@ -132,7 +146,8 @@ export interface RouteDeckController {
   retry: () => Promise<void>;
   dismissNotice: () => void;
   refreshServers: () => Promise<void>;
-  importSubscription: (source: string) => Promise<void>;
+  previewSubscription: (source: SubscriptionImportSource) => Promise<SubscriptionPreview>;
+  commitSubscription: (preview: SubscriptionPreview) => Promise<void>;
   applyRouting: (routing: RoutingConfig) => Promise<void>;
   saveSettings: (settings: SettingsConfig) => Promise<void>;
   runDiagnostics: () => Promise<void>;

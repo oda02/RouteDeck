@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -42,10 +43,25 @@ import {
   type Destination,
   type RoutingConfig,
   type SettingsConfig,
+  type SubscriptionImportSource,
+  type SubscriptionPreview,
   type TunPathChoice,
 } from "./model";
 
 type DialogKind = "import" | "tun-preflight" | "mode-change" | "reset" | null;
+type ToastKind = "success" | "info" | "warning";
+type ToastState = { message: string; kind: ToastKind };
+type ActionFailure = { page: Destination; notice: AppNotice; retry?: () => void };
+type AsyncActionOptions<T> = {
+  page: Destination;
+  title: string;
+  action: () => Promise<T>;
+  setBusy?: (busy: boolean) => void;
+  onSuccess?: (value: T) => void;
+  onError?: (message: string) => void;
+  retry?: () => void;
+};
+type RunAsyncAction = <T>(options: AsyncActionOptions<T>) => Promise<T | undefined>;
 
 const navigation = [
   { id: "home", label: "Главная", icon: HomeIcon },
@@ -175,6 +191,17 @@ function OpaqueNotice({ notice, onClose, primaryAction, secondaryAction }: {
   );
 }
 
+function ActionFailureNotice({ failure, page, onClear }: { failure: ActionFailure | null; page: Destination; onClear: () => void }) {
+  if (!failure || failure.page !== page) return null;
+  return (
+    <OpaqueNotice
+      notice={failure.notice}
+      onClose={onClear}
+      primaryAction={failure.retry ? { label: "Повторить", onClick: failure.retry } : undefined}
+    />
+  );
+}
+
 function ProofCard({ proofs, title = "Проверка подключения", historical = false }: { proofs: ConnectionProof[]; title?: string; historical?: boolean }) {
   return (
     <section className="card proof-card" aria-labelledby="proof-card-title">
@@ -207,35 +234,42 @@ function ProofCard({ proofs, title = "Проверка подключения", 
 function SegmentedControl<T extends string>({ label, value, options, onChange, disabled = false }: {
   label: string;
   value: T;
-  options: Array<{ value: T; label: string }>;
+  options: Array<{ value: T; label: string; disabled?: boolean }>;
   onChange: (value: T) => void;
   disabled?: boolean;
 }) {
+  const groupName = useId();
   return (
-    <div className="segmented-control" role="radiogroup" aria-label={label} data-count={options.length}>
+    <fieldset className="segmented-control" aria-label={label} data-count={options.length}>
+      <legend className="sr-only">{label}</legend>
       {options.map((option) => (
-        <button
-          key={option.value}
-          type="button"
-          role="radio"
-          aria-checked={value === option.value}
-          disabled={disabled}
-          onClick={() => onChange(option.value)}
-        >
-          {option.label}
-        </button>
+        <label key={option.value} data-selected={value === option.value} data-disabled={disabled || option.disabled || undefined}>
+          <input
+            className="control-input"
+            type="radio"
+            name={groupName}
+            value={option.value}
+            checked={value === option.value}
+            disabled={disabled || option.disabled}
+            onChange={() => onChange(option.value)}
+          />
+          <span>{option.label}</span>
+        </label>
       ))}
-    </div>
+    </fieldset>
   );
 }
 
-function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, onDisconnect }: {
+function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, onDisconnect, onRetry, actionFailure, onClearFailure }: {
   snapshot: ControllerSnapshot;
   headingRef: React.RefObject<HTMLHeadingElement | null>;
   onNavigate: (destination: Destination) => void;
   onModeChange: (mode: ConnectionMode) => void;
   onConnect: () => void;
   onDisconnect: () => void;
+  onRetry: () => void;
+  actionFailure: ActionFailure | null;
+  onClearFailure: () => void;
 }) {
   const server = snapshot.servers.find((item) => item.id === snapshot.selectedServerId);
   const pending = pendingPhases.includes(snapshot.phase);
@@ -261,6 +295,8 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
         </div>
         <span className="mode-readout">{snapshot.mode === "proxy" ? "System Proxy" : "TUN"}</span>
       </div>
+
+      <ActionFailureNotice failure={actionFailure} page="home" onClear={onClearFailure} />
 
       <button className="selection-card" type="button" onClick={() => onNavigate("servers")}>
         <span className="selection-leading"><ServersIcon size={20} /></span>
@@ -310,8 +346,8 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
       {snapshot.notice ? (
         <OpaqueNotice
           notice={snapshot.notice}
-          onClose={controller.dismissNotice}
-          primaryAction={{ label: "Повторить проверку", onClick: () => void controller.retry() }}
+          onClose={snapshot.notice.id === "backend-unavailable" ? undefined : controller.dismissNotice}
+          primaryAction={snapshot.notice.id === "backend-unavailable" ? undefined : { label: "Повторить проверку", onClick: onRetry }}
           secondaryAction={{ label: "Открыть диагностику", onClick: () => onNavigate("diagnostics") }}
         />
       ) : null}
@@ -331,13 +367,16 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
   );
 }
 
-function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onToast }: {
+function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onToast, runAsyncAction, actionFailure, onClearFailure }: {
   snapshot: ControllerSnapshot;
   headingRef: React.RefObject<HTMLHeadingElement | null>;
   search: string;
   onSearch: (value: string) => void;
   onImport: () => void;
-  onToast: (message: string) => void;
+  onToast: (message: string, kind?: ToastKind) => void;
+  runAsyncAction: RunAsyncAction;
+  actionFailure: ActionFailure | null;
+  onClearFailure: () => void;
 }) {
   const [refreshing, setRefreshing] = useState(false);
   const filtered = useMemo(() => {
@@ -345,12 +384,16 @@ function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onToast
     return snapshot.servers.filter((server) => !query || `${server.country} ${server.name} ${server.protocol}`.toLocaleLowerCase("ru-RU").includes(query));
   }, [search, snapshot.servers]);
 
-  const refresh = async () => {
+  const refresh = () => {
     if (refreshing) return;
-    setRefreshing(true);
-    await controller.refreshServers();
-    setRefreshing(false);
-    onToast("Задержки серверов обновлены");
+    void runAsyncAction({
+      page: "servers",
+      title: "Не удалось проверить задержки серверов",
+      setBusy: setRefreshing,
+      action: controller.refreshServers,
+      retry: refresh,
+      onSuccess: () => onToast("Задержки серверов обновлены", "success"),
+    });
   };
 
   return (
@@ -359,6 +402,7 @@ function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onToast
         <div><p className="overline">Узлы подписки</p><h1 ref={headingRef} tabIndex={-1}>Серверы</h1></div>
         <span className="count-badge">{snapshot.servers.length}</span>
       </div>
+      <ActionFailureNotice failure={actionFailure} page="servers" onClear={onClearFailure} />
       <button className="primary-button" type="button" onClick={onImport}><ImportIcon size={20} />Импортировать подписку</button>
       <div className="toolbar">
         <label className="search-field">
@@ -366,7 +410,7 @@ function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onToast
           <SearchIcon size={18} />
           <input value={search} type="search" placeholder="Поиск по имени или протоколу" onChange={(event) => onSearch(event.target.value)} />
         </label>
-        <button className="icon-button bordered" type="button" aria-label="Проверить задержки" title="Проверить задержки" disabled={refreshing} onClick={() => void refresh()}>
+        <button className="icon-button bordered" type="button" aria-label="Проверить задержки" title="Проверить задержки" disabled={refreshing} onClick={refresh}>
           {refreshing ? <LoaderIcon size={19} /> : <RefreshIcon size={19} />}
         </button>
       </div>
@@ -379,15 +423,12 @@ function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onToast
           const selected = server.id === snapshot.selectedServerId;
           const latency = server.latencyState === "pending" ? "Проверка…" : server.latencyState === "timeout" ? "Тайм-аут" : server.latencyState === "unavailable" ? "—" : `${server.latencyMs} мс`;
           return (
-            <button
+            <label
               className="server-row"
               data-selected={selected}
               key={server.id}
-              role="radio"
-              aria-checked={selected}
-              type="button"
-              onClick={() => controller.selectServer(server.id)}
             >
+              <input className="control-input" type="radio" name="selected-server" value={server.id} checked={selected} onChange={() => controller.selectServer(server.id)} />
               <span className="radio-indicator" aria-hidden="true"><span /></span>
               <span className="country-code">{server.country}</span>
               <span className="server-copy">
@@ -398,7 +439,7 @@ function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onToast
                 <strong>{latency}</strong>
                 <span>{server.checkedAt ? `проверено ${server.checkedAt}` : "ещё не проверено"}</span>
               </span>
-            </button>
+            </label>
           );
         }) : <div className="empty-state"><SearchIcon size={24} /><strong>Ничего не найдено</strong><span>Измените запрос или обновите подписку.</span></div>}
       </div>
@@ -406,13 +447,16 @@ function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onToast
   );
 }
 
-function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onToast }: {
+function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onToast, runAsyncAction, actionFailure, onClearFailure }: {
   snapshot: ControllerSnapshot;
   headingRef: React.RefObject<HTMLHeadingElement | null>;
   draft: RoutingConfig;
   onDraftChange: (routing: RoutingConfig) => void;
   onApply: () => Promise<void>;
-  onToast: (message: string) => void;
+  onToast: (message: string, kind?: ToastKind) => void;
+  runAsyncAction: RunAsyncAction;
+  actionFailure: ActionFailure | null;
+  onClearFailure: () => void;
 }) {
   const [applying, setApplying] = useState(false);
   const dirty = JSON.stringify(draft) !== JSON.stringify(snapshot.routing);
@@ -425,20 +469,16 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
     apps: draft.apps.map((app) => app.id === id ? { ...app, route } : app),
   });
 
-  const addApp = () => {
-    if (draft.apps.some((app) => app.id === "browser-demo")) return;
-    onDraftChange({
-      ...draft,
-      apps: [...draft.apps, { id: "browser-demo", name: "Browser", path: "C:\\Program Files\\Browser\\browser.exe", route: "inherit" }],
-    });
-  };
-
-  const apply = async () => {
+  const apply = () => {
     if (!dirty || applying) return;
-    setApplying(true);
-    await onApply();
-    setApplying(false);
-    onToast("Правила маршрутизации применены");
+    void runAsyncAction({
+      page: "routing",
+      title: "Не удалось применить маршрутизацию",
+      setBusy: setApplying,
+      action: onApply,
+      retry: apply,
+      onSuccess: () => onToast("Правила маршрутизации применены", "success"),
+    });
   };
 
   return (
@@ -447,6 +487,7 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
         <div><p className="overline">Политика трафика</p><h1 ref={headingRef} tabIndex={-1}>Маршрутизация</h1></div>
         {dirty ? <span className="quiet-badge warning-badge">Не сохранено</span> : <span className="quiet-badge">Применено</span>}
       </div>
+      <ActionFailureNotice failure={actionFailure} page="routing" onClear={onClearFailure} />
       <section className="card">
         <div className="section-heading compact-heading"><div><p className="overline">Базовое правило</p><h2>Маршрут по умолчанию</h2></div></div>
         <SegmentedControl
@@ -465,7 +506,7 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
       <section className="card app-rules-card">
         <div className="section-heading">
           <div><p className="overline">Исключения</p><h2>Приложения</h2></div>
-          <button className="secondary-button compact-button" type="button" onClick={addApp}><PlusIcon size={18} />Добавить</button>
+          <button className="secondary-button compact-button" type="button" disabled title="Выбор приложения появится с Tauri dialog adapter"><PlusIcon size={18} />Добавить · скоро</button>
         </div>
         <div className="app-rule-list">
           {draft.apps.map((app) => (
@@ -490,31 +531,38 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
           ))}
         </div>
       </section>
-      <button className="primary-button" type="button" disabled={!dirty || applying} aria-busy={applying} onClick={() => void apply()}>
+      <button className="primary-button" type="button" disabled={!dirty || applying} aria-busy={applying} onClick={apply}>
         {applying ? <LoaderIcon size={20} /> : <CheckIcon size={20} />}{applying ? "Применяем…" : "Применить изменения"}
       </button>
     </div>
   );
 }
 
-function SettingsPage({ headingRef, snapshot, draft, onDraftChange, onSave, onReset, onToast }: {
+function SettingsPage({ headingRef, snapshot, draft, onDraftChange, onSave, onReset, onToast, runAsyncAction, actionFailure, onClearFailure }: {
   headingRef: React.RefObject<HTMLHeadingElement | null>;
   snapshot: ControllerSnapshot;
   draft: SettingsConfig;
   onDraftChange: (settings: SettingsConfig) => void;
   onSave: () => Promise<void>;
   onReset: () => void;
-  onToast: (message: string) => void;
+  onToast: (message: string, kind?: ToastKind) => void;
+  runAsyncAction: RunAsyncAction;
+  actionFailure: ActionFailure | null;
+  onClearFailure: () => void;
 }) {
   const [saving, setSaving] = useState(false);
   const dirty = JSON.stringify(draft) !== JSON.stringify(snapshot.settings);
   const portsValid = draft.httpPort >= 1024 && draft.httpPort <= 65535 && draft.socksPort >= 1024 && draft.socksPort <= 65535 && draft.httpPort !== draft.socksPort;
-  const save = async () => {
+  const save = () => {
     if (!dirty || !portsValid || saving) return;
-    setSaving(true);
-    await onSave();
-    setSaving(false);
-    onToast("Настройки сохранены");
+    void runAsyncAction({
+      page: "settings",
+      title: "Не удалось сохранить настройки",
+      setBusy: setSaving,
+      action: onSave,
+      retry: save,
+      onSuccess: () => onToast("Настройки сохранены", "success"),
+    });
   };
   return (
     <div className="page">
@@ -522,6 +570,7 @@ function SettingsPage({ headingRef, snapshot, draft, onDraftChange, onSave, onRe
         <div><p className="overline">Поведение приложения</p><h1 ref={headingRef} tabIndex={-1}>Настройки</h1></div>
         {dirty ? <span className="quiet-badge warning-badge">Изменено</span> : null}
       </div>
+      <ActionFailureNotice failure={actionFailure} page="settings" onClear={onClearFailure} />
 
       <section className="card settings-group">
         <div className="section-heading compact-heading"><div><p className="overline">Интерфейс</p><h2>Общие</h2></div></div>
@@ -546,22 +595,41 @@ function SettingsPage({ headingRef, snapshot, draft, onDraftChange, onSave, onRe
 
       <details className="card advanced-settings"><summary>Расширенные настройки</summary><div className="details-body"><p>Строгая маршрутизация TUN уменьшает утечки DNS, но может конфликтовать с виртуальными адаптерами. Диагностика покажет конкретную причину до UAC.</p><p>Сервис, драйвер и задача автозапуска в первой версии не устанавливаются.</p></div></details>
 
-      <button className="primary-button" type="button" disabled={!dirty || !portsValid || saving} aria-busy={saving} onClick={() => void save()}>{saving ? <LoaderIcon size={20} /> : <CheckIcon size={20} />}{saving ? "Сохраняем…" : "Сохранить изменения"}</button>
+      <button className="primary-button" type="button" disabled={!dirty || !portsValid || saving} aria-busy={saving} onClick={save}>{saving ? <LoaderIcon size={20} /> : <CheckIcon size={20} />}{saving ? "Сохраняем…" : "Сохранить изменения"}</button>
 
       <section className="danger-zone" aria-labelledby="danger-title"><div><h2 id="danger-title">Опасная зона</h2><p>Сбрасывает только локальные настройки и черновики RouteDeck. Чужой VPN и настройки Windows не изменяются.</p></div><button className="danger-button" type="button" onClick={onReset}>Сбросить локальное состояние…</button></section>
     </div>
   );
 }
 
-function DiagnosticsPage({ snapshot, headingRef, onToast }: { snapshot: ControllerSnapshot; headingRef: React.RefObject<HTMLHeadingElement | null>; onToast: (message: string) => void }) {
-  const run = () => void controller.runDiagnostics();
-  const copyReport = async () => {
-    try {
-      await navigator.clipboard.writeText(controller.getSanitizedReport());
-      onToast("Безопасный отчёт скопирован");
-    } catch {
-      onToast("Не удалось открыть буфер обмена");
-    }
+function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, actionFailure, onClearFailure }: {
+  snapshot: ControllerSnapshot;
+  headingRef: React.RefObject<HTMLHeadingElement | null>;
+  onToast: (message: string, kind?: ToastKind) => void;
+  runAsyncAction: RunAsyncAction;
+  actionFailure: ActionFailure | null;
+  onClearFailure: () => void;
+}) {
+  const [checking, setChecking] = useState(false);
+  const [copying, setCopying] = useState(false);
+  const run = () => {
+    void runAsyncAction({
+      page: "diagnostics",
+      title: "Не удалось запустить диагностику",
+      setBusy: setChecking,
+      action: controller.runDiagnostics,
+      retry: run,
+    });
+  };
+  const copyReport = () => {
+    void runAsyncAction({
+      page: "diagnostics",
+      title: "Не удалось скопировать безопасный отчёт",
+      setBusy: setCopying,
+      action: () => navigator.clipboard.writeText(controller.getSanitizedReport()),
+      retry: copyReport,
+      onSuccess: () => onToast("Безопасный отчёт скопирован", "success"),
+    });
   };
   const externalNotice: AppNotice = {
     id: "external-vpn",
@@ -573,11 +641,12 @@ function DiagnosticsPage({ snapshot, headingRef, onToast }: { snapshot: Controll
   return (
     <div className="page">
       <div className="page-title-row"><div><p className="overline">Проверка без догадок</p><h1 ref={headingRef} tabIndex={-1}>Диагностика</h1></div>{snapshot.diagnostics.lastRunAt ? <span className="quiet-badge">{snapshot.diagnostics.lastRunAt}</span> : null}</div>
-      <button className="primary-button" type="button" disabled={snapshot.diagnostics.running} aria-busy={snapshot.diagnostics.running} onClick={run}>{snapshot.diagnostics.running ? <LoaderIcon size={20} /> : <ActivityIcon size={20} />}{snapshot.diagnostics.running ? "Проверяем все этапы…" : "Запустить полную проверку"}</button>
+      <ActionFailureNotice failure={actionFailure} page="diagnostics" onClear={onClearFailure} />
+      <button className="primary-button" type="button" disabled={checking || snapshot.diagnostics.running} aria-busy={checking || snapshot.diagnostics.running} onClick={run}>{checking || snapshot.diagnostics.running ? <LoaderIcon size={20} /> : <ActivityIcon size={20} />}{checking || snapshot.diagnostics.running ? "Проверяем все этапы…" : "Запустить полную проверку"}</button>
       {snapshot.environment.otherVpnDetected ? <OpaqueNotice notice={externalNotice} primaryAction={{ label: "Повторить после изменения", onClick: run }} /> : null}
       <ProofCard proofs={snapshot.diagnostics.steps} title="Цепочка доказательств" historical={!snapshot.diagnostics.lastRunAt} />
       {snapshot.diagnostics.lastRunAt ? <p className="diagnostic-duration">Полная проверка: {snapshot.diagnostics.durationMs} мс · {snapshot.diagnostics.lastRunAt}</p> : null}
-      <button className="secondary-button full-width" type="button" onClick={() => void copyReport()}><CopyIcon size={19} />Копировать безопасный отчёт</button>
+      <button className="secondary-button full-width" type="button" disabled={copying} aria-busy={copying} onClick={copyReport}>{copying ? <LoaderIcon size={19} /> : <CopyIcon size={19} />}{copying ? "Копируем…" : "Копировать безопасный отчёт"}</button>
       <details className="card log-viewer"><summary>Технический журнал</summary><div className="details-body"><p className="field-help">Секреты и адрес подписки удаляются до отображения и копирования.</p><pre>{snapshot.diagnostics.sanitizedLog.join("\n")}</pre></div></details>
     </div>
   );
@@ -588,7 +657,8 @@ function Dialog({ title, description, onClose, children, actions }: { title: str
   useEffect(() => {
     const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const dialog = dialogRef.current;
-    const focusable = dialog?.querySelector<HTMLElement>("[data-autofocus], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)");
+    const focusable = dialog?.querySelector<HTMLElement>("[data-autofocus]")
+      ?? dialog?.querySelector<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)");
     window.requestAnimationFrame(() => focusable?.focus());
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -622,8 +692,9 @@ function Dialog({ title, description, onClose, children, actions }: { title: str
   );
 }
 
-function Toast({ message, onClose }: { message: string; onClose: () => void }) {
-  return <div className="toast" role="status" aria-live="polite" aria-atomic="true"><CheckIcon size={19} /><span>{message}</span><button className="icon-button" type="button" aria-label="Закрыть уведомление" title="Закрыть" onClick={onClose}><XIcon size={17} /></button></div>;
+function Toast({ toast, onClose }: { toast: ToastState; onClose: () => void }) {
+  const Icon = toast.kind === "warning" ? WarningIcon : toast.kind === "info" ? InfoIcon : CheckIcon;
+  return <div className="toast" data-kind={toast.kind} role="status" aria-live="polite" aria-atomic="true"><Icon size={19} /><span>{toast.message}</span><button className="icon-button" type="button" aria-label="Закрыть уведомление" title="Закрыть" onClick={onClose}><XIcon size={17} /></button></div>;
 }
 
 export default function App() {
@@ -636,20 +707,57 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [routingDraft, setRoutingDraft] = useState<RoutingConfig>(snapshot.routing);
   const [settingsDraft, setSettingsDraft] = useState<SettingsConfig>(snapshot.settings);
-  const [toast, setToast] = useState<string | null>(null);
+  const [toast, setToast] = useState<ToastState | null>(null);
+  const [actionFailure, setActionFailure] = useState<ActionFailure | null>(null);
   const [importMethod, setImportMethod] = useState<"url" | "clipboard" | "file">("url");
   const [subscriptionSource, setSubscriptionSource] = useState("");
   const [subscriptionVisible, setSubscriptionVisible] = useState(false);
   const [importError, setImportError] = useState("");
   const [importing, setImporting] = useState(false);
+  const [subscriptionPreview, setSubscriptionPreview] = useState<SubscriptionPreview | null>(null);
   const mainRef = useRef<HTMLElement>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
+  const subscriptionInputRef = useRef<HTMLInputElement>(null);
+  const clipboardButtonRef = useRef<HTMLButtonElement>(null);
   const scrollPositions = useRef<Record<Destination, number>>({ home: 0, servers: 0, routing: 0, settings: 0, diagnostics: 0 });
 
   const closeDialog = useCallback(() => {
     setDialog(null);
     setPendingMode(null);
     setImportError("");
+    setSubscriptionPreview(null);
+  }, []);
+
+  const showToast = useCallback((message: string, kind: ToastKind = "success") => {
+    setToast({ message, kind });
+  }, []);
+
+  const runAsyncAction: RunAsyncAction = useCallback(async <T,>({ page, title, action, setBusy, onSuccess, onError, retry }: AsyncActionOptions<T>) => {
+    setBusy?.(true);
+    setActionFailure((current) => current?.page === page ? null : current);
+    try {
+      const value = await action();
+      setActionFailure((current) => current?.page === page ? null : current);
+      onSuccess?.(value);
+      return value;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Неизвестная ошибка контроллера.";
+      onError?.(detail);
+      setActionFailure({
+        page,
+        retry,
+        notice: {
+          id: `action-${page}`,
+          kind: "error",
+          title,
+          body: detail,
+          detail: "Действие остановлено безопасно. Повторите попытку или откройте диагностику; зелёный статус не выставлен.",
+        },
+      });
+      return undefined;
+    } finally {
+      setBusy?.(false);
+    }
   }, []);
 
   const navigate = useCallback((destination: Destination) => {
@@ -702,7 +810,12 @@ export default function App() {
       setDialog("mode-change");
       return;
     }
-    controller.setMode(mode);
+    void runAsyncAction({
+      page: "home",
+      title: "Не удалось сменить режим",
+      action: async () => controller.setMode(mode),
+      retry: () => handleModeChange(mode),
+    });
   };
 
   const handleConnect = () => {
@@ -711,14 +824,27 @@ export default function App() {
       setDialog("tun-preflight");
       return;
     }
-    void controller.connect();
+    void runAsyncAction({
+      page: "home",
+      title: "Не удалось подключиться",
+      action: () => controller.connect(),
+      retry: handleConnect,
+    });
   };
 
   const connectTun = () => {
     if (!tunChoice) return;
     const choice: TunPathChoice = tunChoice === "nested" ? { type: "nested" } : { type: "physical", adapterId };
     closeDialog();
-    void controller.connect(choice);
+    void runAsyncAction({
+      page: "home",
+      title: "Не удалось запустить TUN",
+      action: () => controller.connect(choice),
+      retry: () => {
+        setTunChoice("");
+        setDialog("tun-preflight");
+      },
+    });
   };
 
   const applyRouting = async () => {
@@ -731,59 +857,171 @@ export default function App() {
     setSettingsDraft(controller.getSnapshot().settings);
   };
 
-  const importSubscription = async () => {
-    if (importMethod === "url" && !subscriptionSource.trim()) {
-      setImportError("Введите URL подписки. Значение будет скрыто после импорта.");
+  const focusImportInput = () => window.requestAnimationFrame(() => {
+    if (importMethod === "url") subscriptionInputRef.current?.focus();
+    else clipboardButtonRef.current?.focus();
+  });
+
+  const readClipboardSource = () => {
+    void runAsyncAction({
+      page: "servers",
+      title: "Не удалось прочитать буфер обмена",
+      setBusy: setImporting,
+      action: () => navigator.clipboard.readText(),
+      retry: readClipboardSource,
+      onError: (message) => {
+        setImportError(message);
+        focusImportInput();
+      },
+      onSuccess: (value) => {
+        setSubscriptionSource(value);
+        setImportError(value.trim() ? "" : "Буфер обмена пуст.");
+        if (!value.trim()) focusImportInput();
+      },
+    });
+  };
+
+  const previewImport = () => {
+    if (importMethod === "file") {
+      setImportError("Выбор файла появится вместе с Tauri dialog adapter.");
+      return;
+    }
+    if (!subscriptionSource.trim()) {
+      setImportError(importMethod === "url" ? "Введите URL подписки. Значение будет скрыто после импорта." : "Сначала явно прочитайте подписку из буфера обмена.");
+      focusImportInput();
       return;
     }
     setImportError("");
-    setImporting(true);
-    await controller.importSubscription(importMethod);
-    setImporting(false);
-    closeDialog();
-    setSubscriptionSource("");
-    setToast("Подписка проверена и импортирована");
+    const source: SubscriptionImportSource = importMethod === "url"
+      ? { type: "url", value: subscriptionSource }
+      : { type: "clipboard", value: subscriptionSource };
+    void runAsyncAction({
+      page: "servers",
+      title: "Не удалось проверить подписку",
+      setBusy: setImporting,
+      action: () => controller.previewSubscription(source),
+      retry: previewImport,
+      onError: (message) => {
+        setImportError(message);
+        focusImportInput();
+      },
+      onSuccess: (preview) => setSubscriptionPreview(preview),
+    });
+  };
+
+  const commitImport = () => {
+    if (!subscriptionPreview) return;
+    void runAsyncAction({
+      page: "servers",
+      title: "Не удалось импортировать подписку",
+      setBusy: setImporting,
+      action: () => controller.commitSubscription(subscriptionPreview),
+      retry: commitImport,
+      onError: setImportError,
+      onSuccess: () => {
+        closeDialog();
+        setSubscriptionSource("");
+        showToast("Подписка проверена и импортирована", "success");
+      },
+    });
+  };
+
+  const disconnect = () => {
+    void runAsyncAction({
+      page: "home",
+      title: "Не удалось безопасно отключиться",
+      action: controller.disconnect,
+      retry: disconnect,
+    });
+  };
+
+  const retryConnection = () => {
+    void runAsyncAction({
+      page: "home",
+      title: "Повторная проверка не удалась",
+      action: controller.retry,
+      retry: retryConnection,
+    });
   };
 
   const renderPage = () => {
     switch (activePage) {
       case "home":
-        return <HomePage snapshot={snapshot} headingRef={headingRef} onNavigate={navigate} onModeChange={handleModeChange} onConnect={handleConnect} onDisconnect={() => void controller.disconnect()} />;
+        return <HomePage snapshot={snapshot} headingRef={headingRef} onNavigate={navigate} onModeChange={handleModeChange} onConnect={handleConnect} onDisconnect={disconnect} onRetry={retryConnection} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "servers":
-        return <ServersPage snapshot={snapshot} headingRef={headingRef} search={search} onSearch={setSearch} onImport={() => setDialog("import")} onToast={setToast} />;
+        return <ServersPage snapshot={snapshot} headingRef={headingRef} search={search} onSearch={setSearch} onImport={() => setDialog("import")} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "routing":
-        return <RoutingPage snapshot={snapshot} headingRef={headingRef} draft={routingDraft} onDraftChange={setRoutingDraft} onApply={applyRouting} onToast={setToast} />;
+        return <RoutingPage snapshot={snapshot} headingRef={headingRef} draft={routingDraft} onDraftChange={setRoutingDraft} onApply={applyRouting} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "settings":
-        return <SettingsPage snapshot={snapshot} headingRef={headingRef} draft={settingsDraft} onDraftChange={setSettingsDraft} onSave={saveSettings} onReset={() => setDialog("reset")} onToast={setToast} />;
+        return <SettingsPage snapshot={snapshot} headingRef={headingRef} draft={settingsDraft} onDraftChange={setSettingsDraft} onSave={saveSettings} onReset={() => setDialog("reset")} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "diagnostics":
-        return <DiagnosticsPage snapshot={snapshot} headingRef={headingRef} onToast={setToast} />;
+        return <DiagnosticsPage snapshot={snapshot} headingRef={headingRef} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
     }
   };
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" data-demo={snapshot.isDemo || undefined}>
       <header className="app-header">
         <div className="brand"><span className="brand-mark"><RoutingIcon size={20} /></span><span><strong>RouteDeck</strong><small>sing-box controller</small></span></div>
         <StatusBadge phase={snapshot.phase} />
       </header>
+      {snapshot.isDemo ? (
+        <div className="demo-banner" role="status">
+          <InfoIcon size={17} />
+          <strong>DEMO</strong>
+          <span>Нет сети и системных изменений. Все статусы примерные.</span>
+        </div>
+      ) : null}
       <div className="workspace">
         <Navigation active={activePage} onNavigate={navigate} variant="rail" />
         <main className="app-main" ref={mainRef}>{renderPage()}</main>
       </div>
       <Navigation active={activePage} onNavigate={navigate} variant="bottom" />
-      {toast ? <Toast message={toast} onClose={() => setToast(null)} /> : null}
+      {toast ? <Toast toast={toast} onClose={() => setToast(null)} /> : null}
 
       {dialog === "import" ? (
         <Dialog
           title="Импорт подписки"
           description="RouteDeck импортирует только поддерживаемые узлы и не выполняет чужие команды или настройки."
           onClose={closeDialog}
-          actions={<><button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Отмена</button><button className="primary-button dialog-primary" type="button" disabled={importing} onClick={() => void importSubscription()}>{importing ? <LoaderIcon size={19} /> : <ImportIcon size={19} />}{importing ? "Проверяем…" : "Проверить и импортировать"}</button></>}
+          actions={subscriptionPreview ? <>
+            <button className="secondary-button" type="button" data-autofocus onClick={() => setSubscriptionPreview(null)}>Назад</button>
+            <button className="primary-button dialog-primary" type="button" disabled={importing} aria-busy={importing} onClick={commitImport}>{importing ? <LoaderIcon size={19} /> : <ImportIcon size={19} />}{importing ? "Импортируем…" : "Подтвердить импорт"}</button>
+          </> : <>
+            <button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Отмена</button>
+            <button className="primary-button dialog-primary" type="button" disabled={importing || importMethod === "file"} aria-busy={importing} onClick={previewImport}>{importing ? <LoaderIcon size={19} /> : <ImportIcon size={19} />}{importing ? "Проверяем…" : "Проверить источник"}</button>
+          </>}
         >
-          <SegmentedControl label="Источник подписки" value={importMethod} options={[{ value: "url", label: "URL" }, { value: "clipboard", label: "Буфер" }, { value: "file", label: "Файл" }]} onChange={setImportMethod} />
-          {importMethod === "url" ? (
-            <label className="dialog-field"><span>URL подписки</span><span className="secret-input"><input type={subscriptionVisible ? "text" : "password"} autoComplete="off" value={subscriptionSource} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-help"} placeholder="https://provider.example/••••" onChange={(event) => setSubscriptionSource(event.target.value)} /><button className="icon-button" type="button" aria-label={subscriptionVisible ? "Скрыть URL" : "Показать URL"} title={subscriptionVisible ? "Скрыть URL" : "Показать URL"} onClick={() => setSubscriptionVisible((visible) => !visible)}><EyeIcon size={18} /></button></span><small id="import-help">URL хранится как секрет и не попадает в диагностику.</small>{importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}</label>
-          ) : <div className="method-placeholder"><ImportIcon size={24} /><strong>{importMethod === "clipboard" ? "Вставить после явного разрешения" : "Выбрать локальный файл"}</strong><p>Backend-адаптер подключит системный диалог. Frontend не читает источник автоматически.</p></div>}
+          <ActionFailureNotice failure={actionFailure} page="servers" onClear={() => setActionFailure(null)} />
+          {subscriptionPreview ? (
+            <section className="import-preview" aria-live="polite">
+              <p className="overline">Предпросмотр · данные ещё не сохранены</p>
+              <h3>Найдено поддерживаемых узлов</h3>
+              <p className="preview-source">Источник: {subscriptionPreview.sourceLabel}</p>
+              <div className="preview-counts">{subscriptionPreview.supported.map((item) => <span key={item.protocol}><strong>{item.count}</strong>{item.protocol}</span>)}</div>
+              <p>{subscriptionPreview.unsupportedCount} неподдерживаемых записей будут пропущены.</p>
+              <ul>{subscriptionPreview.nodeNames.map((name) => <li key={name}>{name}</li>)}</ul>
+            </section>
+          ) : <>
+            <SegmentedControl
+              label="Источник подписки"
+              value={importMethod}
+              options={[{ value: "url", label: "URL" }, { value: "clipboard", label: "Буфер" }, { value: "file", label: "Файл · скоро", disabled: true }]}
+              onChange={(method) => { setImportMethod(method); setSubscriptionSource(""); setImportError(""); setSubscriptionPreview(null); }}
+            />
+            {importMethod === "url" ? (
+              <div className="dialog-field"><label htmlFor="subscription-url">URL подписки</label><span className="secret-input"><input ref={subscriptionInputRef} id="subscription-url" type={subscriptionVisible ? "text" : "password"} autoComplete="off" value={subscriptionSource} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-help"} placeholder="https://provider.example/••••" onChange={(event) => { setSubscriptionSource(event.target.value); setImportError(""); }} /><button className="icon-button" type="button" aria-label={subscriptionVisible ? "Скрыть URL" : "Показать URL"} title={subscriptionVisible ? "Скрыть URL" : "Показать URL"} onClick={() => setSubscriptionVisible((visible) => !visible)}><EyeIcon size={18} /></button></span><small id="import-help">URL передаётся typed adapter как секрет и не попадает в диагностику.</small>{importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}</div>
+            ) : (
+              <div className="method-placeholder compact-placeholder">
+                <ImportIcon size={24} />
+                <strong>{subscriptionSource ? "Подписка прочитана и скрыта" : "Буфер не читается автоматически"}</strong>
+                <p>Нажмите кнопку сами — только это действие запрашивает clipboard API.</p>
+                <button ref={clipboardButtonRef} className="secondary-button full-width" type="button" disabled={importing} onClick={readClipboardSource}>Прочитать буфер обмена</button>
+                {importError ? <small className="field-error" role="alert">{importError}</small> : null}
+              </div>
+            )}
+            <p className="file-adapter-note"><InfoIcon size={17} />Локальный файл будет доступен после подключения безопасного Tauri dialog adapter; fake-импорт отключён.</p>
+          </>}
         </Dialog>
       ) : null}
 
@@ -808,7 +1046,7 @@ export default function App() {
           title="Сменить режим подключения?"
           description="RouteDeck сначала безопасно остановит текущую сессию. Новый режим не запустится автоматически."
           onClose={closeDialog}
-          actions={<><button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Оставить текущий</button><button className="primary-button dialog-primary" type="button" onClick={() => { void controller.disconnect().then(() => controller.setMode(pendingMode)); closeDialog(); }}><CheckIcon size={19} />Отключить и выбрать</button></>}
+          actions={<><button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Оставить текущий</button><button className="primary-button dialog-primary" type="button" onClick={() => { const mode = pendingMode; closeDialog(); void runAsyncAction({ page: "home", title: "Не удалось безопасно сменить режим", action: async () => { await controller.disconnect(); controller.setMode(mode); }, retry: () => handleModeChange(mode) }); }}><CheckIcon size={19} />Отключить и выбрать</button></>}
         ><p className="dialog-copy">Будет выбран режим <strong>{pendingMode === "tun" ? "TUN" : "Системный прокси"}</strong>. После восстановления Windows-состояния нажмите «Подключить».</p></Dialog>
       ) : null}
 
@@ -817,8 +1055,8 @@ export default function App() {
           title="Сбросить локальное состояние?"
           description="Будут удалены только локальные настройки и черновики RouteDeck. Чужой VPN и Windows не изменяются."
           onClose={closeDialog}
-          actions={<><button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Отмена</button><button className="danger-button" type="button" onClick={() => { void controller.resetLocalState().then(() => { setRoutingDraft(controller.getSnapshot().routing); setSettingsDraft(controller.getSnapshot().settings); setToast("Локальное состояние сброшено"); }); closeDialog(); }}><TrashIcon size={19} />Сбросить RouteDeck</button></>}
-        ><p className="dialog-copy">Активное соединение будет остановлено mock-контроллером. В production backend перед сбросом обязан подтвердить восстановление принадлежащего RouteDeck состояния.</p></Dialog>
+          actions={<><button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Отмена</button><button className="danger-button" type="button" onClick={() => { closeDialog(); void runAsyncAction({ page: "settings", title: "Не удалось сбросить локальное состояние", action: controller.resetLocalState, retry: () => setDialog("reset"), onSuccess: () => { setRoutingDraft(controller.getSnapshot().routing); setSettingsDraft(controller.getSnapshot().settings); showToast("Локальное состояние сброшено", "info"); } }); }}><TrashIcon size={19} />Сбросить RouteDeck</button></>}
+        ><p className="dialog-copy">Активное соединение будет безопасно остановлено контроллером. Перед сбросом backend обязан подтвердить восстановление принадлежащего RouteDeck состояния.</p></Dialog>
       ) : null}
     </div>
   );
