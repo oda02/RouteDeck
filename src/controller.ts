@@ -1,3 +1,4 @@
+import { RouteDeckError } from "./model";
 import type {
   AppNotice,
   ConnectionMode,
@@ -237,7 +238,7 @@ class DevelopmentDemoController implements RouteDeckController {
         kind: "error",
         title: "Не удалось применить системный прокси",
         body: `Другой клиент использует ${this.snapshot.environment.externalProxyEndpoint}. Локальный прокси RouteDeck работает на 127.0.0.1:2080, но приложения Windows пока его не используют.`,
-        detail: "RouteDeck не перезаписывает чужое состояние автоматически. Отключите системный прокси в другом клиенте и повторите проверку.",
+        redactedDetail: "RouteDeck не перезаписывает чужое состояние автоматически. Отключите системный прокси в другом клиенте и повторите проверку.",
       });
       return;
     }
@@ -302,12 +303,12 @@ class DevelopmentDemoController implements RouteDeckController {
       try {
         parsed = new URL(source.value);
       } catch {
-        throw new Error("URL подписки имеет неверный формат.");
+        throw new RouteDeckError("invalid-subscription-url");
       }
-      if (parsed.protocol !== "https:") throw new Error("Для подписки требуется HTTPS URL.");
+      if (parsed.protocol !== "https:") throw new RouteDeckError("insecure-subscription-url");
       sourceLabel = `${parsed.hostname}/••••`;
     } else if (!source.value.trim()) {
-      throw new Error("Буфер обмена не содержит подписку.");
+      throw new RouteDeckError("empty-subscription-source");
     }
     return {
       token: `dev-preview-${Date.now()}`,
@@ -323,7 +324,7 @@ class DevelopmentDemoController implements RouteDeckController {
   };
 
   commitSubscription = async (preview: SubscriptionPreview) => {
-    if (!preview.token.startsWith("dev-preview-")) throw new Error("Предпросмотр импорта устарел. Проверьте источник ещё раз.");
+    if (!preview.token.startsWith("dev-preview-")) throw new RouteDeckError("stale-subscription-preview");
     await wait(280);
     this.publish({ subscriptionName: "DEMO imported provider", subscriptionUpdatedAt: "только что" });
   };
@@ -402,7 +403,7 @@ class BackendUnavailableController implements RouteDeckController {
       kind: "error",
       title: "Backend RouteDeck пока недоступен",
       body: "Интерфейс запущен без Tauri-адаптера. Соединение, импорт и изменения Windows заблокированы.",
-      detail: "Production работает fail-closed: ни одно синтетическое состояние не может стать подключённым.",
+      redactedDetail: "Production работает fail-closed: ни одно синтетическое состояние не может стать подключённым.",
     },
     routing: { defaultRoute: "direct", apps: [] },
     settings: {
@@ -434,7 +435,7 @@ class BackendUnavailableController implements RouteDeckController {
     return () => this.listeners.delete(listener);
   };
   private unavailable(): never {
-    throw new Error("Backend RouteDeck недоступен. Действие безопасно заблокировано.");
+    throw new RouteDeckError("backend-unavailable");
   }
   setMode = () => this.unavailable();
   selectServer = () => this.unavailable();

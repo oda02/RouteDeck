@@ -33,6 +33,7 @@ import {
   XIcon,
 } from "./icons";
 import {
+  RouteDeckError,
   destinations,
   type AppNotice,
   type AppRouteChoice,
@@ -51,6 +52,7 @@ import {
 type DialogKind = "import" | "tun-preflight" | "mode-change" | "reset" | null;
 type ToastKind = "success" | "info" | "warning";
 type ToastState = { message: string; kind: ToastKind };
+type PublicActionError = { message: string; redactedDetail?: string };
 type ActionFailure = { page: Destination; notice: AppNotice; retry?: () => void };
 type AsyncActionOptions<T> = {
   page: Destination;
@@ -58,7 +60,8 @@ type AsyncActionOptions<T> = {
   action: () => Promise<T>;
   setBusy?: (busy: boolean) => void;
   onSuccess?: (value: T) => void;
-  onError?: (message: string) => void;
+  onError?: (error: PublicActionError) => void;
+  errorPresentation?: "persistent" | "inline";
   retry?: () => void;
 };
 type RunAsyncAction = <T>(options: AsyncActionOptions<T>) => Promise<T | undefined>;
@@ -102,6 +105,30 @@ const proofStateLabels = {
   fail: "Ошибка",
   skipped: "Недоступно",
 } as const;
+
+function toPublicActionError(error: unknown): PublicActionError {
+  if (error instanceof RouteDeckError) {
+    switch (error.code) {
+      case "backend-unavailable":
+        return { message: "Backend RouteDeck недоступен. Действие безопасно заблокировано." };
+      case "invalid-subscription-url":
+        return { message: "Проверьте формат URL подписки." };
+      case "insecure-subscription-url":
+        return { message: "Для подписки требуется защищённый HTTPS URL." };
+      case "empty-subscription-source":
+        return { message: "Источник подписки пуст." };
+      case "stale-subscription-preview":
+        return { message: "Предпросмотр устарел. Проверьте источник ещё раз." };
+    }
+  }
+  if (error instanceof DOMException && error.name === "NotAllowedError") {
+    return { message: "Windows не разрешила доступ к буферу обмена. Проверьте разрешение и повторите действие." };
+  }
+  return {
+    message: "Действие не выполнено. Технические сведения скрыты, чтобы не показать секреты.",
+    redactedDetail: "Откройте безопасный диагностический отчёт или повторите действие.",
+  };
+}
 
 function useController() {
   return useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
@@ -172,12 +199,12 @@ function OpaqueNotice({ notice, onClose, primaryAction, secondaryAction }: {
           ) : null}
         </div>
         <p>{notice.body}</p>
-        {notice.detail ? (
+        {notice.redactedDetail ? (
           <>
             <button className="text-action" type="button" aria-expanded={detailsOpen} onClick={() => setDetailsOpen((open) => !open)}>
               {detailsOpen ? "Скрыть подробности" : "Показать подробности"}
             </button>
-            {detailsOpen ? <p className="notice-detail">{notice.detail}</p> : null}
+            {detailsOpen ? <p className="notice-detail">{notice.redactedDetail}</p> : null}
           </>
         ) : null}
         {primaryAction || secondaryAction ? (
@@ -636,7 +663,7 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
     kind: "warning",
     title: "Обнаружен другой VPN",
     body: `${snapshot.environment.otherVpnName ?? "Другой клиент"} использует системный прокси ${snapshot.environment.externalProxyEndpoint ?? "Windows"}. RouteDeck не изменяет его без явного выбора.`,
-    detail: "Локальные proxy listeners могут работать на разных портах, но эффективный системный прокси Windows только один.",
+    redactedDetail: "Локальные proxy listeners могут работать на разных портах, но эффективный системный прокси Windows только один.",
   };
   return (
     <div className="page">
@@ -652,7 +679,7 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
   );
 }
 
-function Dialog({ title, description, onClose, children, actions }: { title: string; description?: string; onClose: () => void; children: ReactNode; actions: ReactNode }) {
+function Dialog({ title, description, focusKey, onClose, children, actions }: { title: string; description?: string; focusKey?: string; onClose: () => void; children: ReactNode; actions: ReactNode }) {
   const dialogRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -679,7 +706,7 @@ function Dialog({ title, description, onClose, children, actions }: { title: str
       document.removeEventListener("keydown", onKeyDown);
       previouslyFocused?.focus({ preventScroll: true });
     };
-  }, [onClose]);
+  }, [focusKey, onClose]);
 
   return (
     <div className="dialog-scrim" role="presentation">
@@ -692,9 +719,27 @@ function Dialog({ title, description, onClose, children, actions }: { title: str
   );
 }
 
-function Toast({ toast, onClose }: { toast: ToastState; onClose: () => void }) {
+function Toast({ toast, onClose, onPausedChange }: { toast: ToastState; onClose: () => void; onPausedChange: (paused: boolean) => void }) {
+  const [hovered, setHovered] = useState(false);
+  const [focusWithin, setFocusWithin] = useState(false);
   const Icon = toast.kind === "warning" ? WarningIcon : toast.kind === "info" ? InfoIcon : CheckIcon;
-  return <div className="toast" data-kind={toast.kind} role="status" aria-live="polite" aria-atomic="true"><Icon size={19} /><span>{toast.message}</span><button className="icon-button" type="button" aria-label="Закрыть уведомление" title="Закрыть" onClick={onClose}><XIcon size={17} /></button></div>;
+  useEffect(() => onPausedChange(hovered || focusWithin), [focusWithin, hovered, onPausedChange]);
+  useEffect(() => () => onPausedChange(false), [onPausedChange]);
+  return (
+    <div
+      className="toast"
+      data-kind={toast.kind}
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      onFocus={() => setFocusWithin(true)}
+      onBlur={(event) => setFocusWithin(event.currentTarget.contains(event.relatedTarget as Node | null))}
+    >
+      <Icon size={19} /><span>{toast.message}</span><button className="icon-button" type="button" aria-label="Закрыть уведомление" title="Закрыть" onClick={onClose}><XIcon size={17} /></button>
+    </div>
+  );
 }
 
 export default function App() {
@@ -708,6 +753,7 @@ export default function App() {
   const [routingDraft, setRoutingDraft] = useState<RoutingConfig>(snapshot.routing);
   const [settingsDraft, setSettingsDraft] = useState<SettingsConfig>(snapshot.settings);
   const [toast, setToast] = useState<ToastState | null>(null);
+  const [toastPaused, setToastPaused] = useState(false);
   const [actionFailure, setActionFailure] = useState<ActionFailure | null>(null);
   const [importMethod, setImportMethod] = useState<"url" | "clipboard" | "file">("url");
   const [subscriptionSource, setSubscriptionSource] = useState("");
@@ -726,13 +772,16 @@ export default function App() {
     setPendingMode(null);
     setImportError("");
     setSubscriptionPreview(null);
+    setSubscriptionSource("");
+    setSubscriptionVisible(false);
   }, []);
 
   const showToast = useCallback((message: string, kind: ToastKind = "success") => {
+    setToastPaused(false);
     setToast({ message, kind });
   }, []);
 
-  const runAsyncAction: RunAsyncAction = useCallback(async <T,>({ page, title, action, setBusy, onSuccess, onError, retry }: AsyncActionOptions<T>) => {
+  const runAsyncAction: RunAsyncAction = useCallback(async <T,>({ page, title, action, setBusy, onSuccess, onError, errorPresentation = "persistent", retry }: AsyncActionOptions<T>) => {
     setBusy?.(true);
     setActionFailure((current) => current?.page === page ? null : current);
     try {
@@ -741,19 +790,21 @@ export default function App() {
       onSuccess?.(value);
       return value;
     } catch (error) {
-      const detail = error instanceof Error ? error.message : "Неизвестная ошибка контроллера.";
-      onError?.(detail);
-      setActionFailure({
-        page,
-        retry,
-        notice: {
-          id: `action-${page}`,
-          kind: "error",
-          title,
-          body: detail,
-          detail: "Действие остановлено безопасно. Повторите попытку или откройте диагностику; зелёный статус не выставлен.",
-        },
-      });
+      const publicError = toPublicActionError(error);
+      onError?.(publicError);
+      if (errorPresentation === "persistent") {
+        setActionFailure({
+          page,
+          retry,
+          notice: {
+            id: `action-${page}`,
+            kind: "error",
+            title,
+            body: publicError.message,
+            redactedDetail: publicError.redactedDetail ?? "Действие остановлено безопасно. Повторите попытку или откройте диагностику; зелёный статус не выставлен.",
+          },
+        });
+      }
       return undefined;
     } finally {
       setBusy?.(false);
@@ -787,10 +838,11 @@ export default function App() {
   }, [dialog, navigate]);
 
   useEffect(() => {
-    if (!toast) return;
+    if (!toast || toastPaused) return;
+    // Resuming starts a fresh five-second reading window; no notification expires while hovered or focused.
     const timer = window.setTimeout(() => setToast(null), 5000);
     return () => window.clearTimeout(timer);
-  }, [toast]);
+  }, [toast, toastPaused]);
 
   useEffect(() => {
     const query = window.matchMedia("(prefers-color-scheme: light)");
@@ -869,8 +921,9 @@ export default function App() {
       setBusy: setImporting,
       action: () => navigator.clipboard.readText(),
       retry: readClipboardSource,
-      onError: (message) => {
-        setImportError(message);
+      errorPresentation: "inline",
+      onError: (publicError) => {
+        setImportError(publicError.message);
         focusImportInput();
       },
       onSuccess: (value) => {
@@ -901,8 +954,9 @@ export default function App() {
       setBusy: setImporting,
       action: () => controller.previewSubscription(source),
       retry: previewImport,
-      onError: (message) => {
-        setImportError(message);
+      errorPresentation: "inline",
+      onError: (publicError) => {
+        setImportError(publicError.message);
         focusImportInput();
       },
       onSuccess: (preview) => setSubscriptionPreview(preview),
@@ -917,7 +971,8 @@ export default function App() {
       setBusy: setImporting,
       action: () => controller.commitSubscription(subscriptionPreview),
       retry: commitImport,
-      onError: setImportError,
+      errorPresentation: "inline",
+      onError: (publicError) => setImportError(publicError.message),
       onSuccess: () => {
         closeDialog();
         setSubscriptionSource("");
@@ -977,24 +1032,25 @@ export default function App() {
         <main className="app-main" ref={mainRef}>{renderPage()}</main>
       </div>
       <Navigation active={activePage} onNavigate={navigate} variant="bottom" />
-      {toast ? <Toast toast={toast} onClose={() => setToast(null)} /> : null}
+      {toast ? <Toast toast={toast} onPausedChange={setToastPaused} onClose={() => { setToast(null); setToastPaused(false); }} /> : null}
 
       {dialog === "import" ? (
         <Dialog
           title="Импорт подписки"
           description="RouteDeck импортирует только поддерживаемые узлы и не выполняет чужие команды или настройки."
+          focusKey={subscriptionPreview ? "preview" : "source"}
           onClose={closeDialog}
           actions={subscriptionPreview ? <>
-            <button className="secondary-button" type="button" data-autofocus onClick={() => setSubscriptionPreview(null)}>Назад</button>
+            <button className="secondary-button" type="button" data-autofocus onClick={() => { setSubscriptionPreview(null); setImportError(""); }}>Назад</button>
             <button className="primary-button dialog-primary" type="button" disabled={importing} aria-busy={importing} onClick={commitImport}>{importing ? <LoaderIcon size={19} /> : <ImportIcon size={19} />}{importing ? "Импортируем…" : "Подтвердить импорт"}</button>
           </> : <>
             <button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Отмена</button>
             <button className="primary-button dialog-primary" type="button" disabled={importing || importMethod === "file"} aria-busy={importing} onClick={previewImport}>{importing ? <LoaderIcon size={19} /> : <ImportIcon size={19} />}{importing ? "Проверяем…" : "Проверить источник"}</button>
           </>}
         >
-          <ActionFailureNotice failure={actionFailure} page="servers" onClear={() => setActionFailure(null)} />
           {subscriptionPreview ? (
             <section className="import-preview" aria-live="polite">
+              {importError ? <p id="import-error" className="field-error" role="alert">{importError}</p> : null}
               <p className="overline">Предпросмотр · данные ещё не сохранены</p>
               <h3>Найдено поддерживаемых узлов</h3>
               <p className="preview-source">Источник: {subscriptionPreview.sourceLabel}</p>
@@ -1007,7 +1063,7 @@ export default function App() {
               label="Источник подписки"
               value={importMethod}
               options={[{ value: "url", label: "URL" }, { value: "clipboard", label: "Буфер" }, { value: "file", label: "Файл · скоро", disabled: true }]}
-              onChange={(method) => { setImportMethod(method); setSubscriptionSource(""); setImportError(""); setSubscriptionPreview(null); }}
+              onChange={(method) => { setImportMethod(method); setSubscriptionSource(""); setSubscriptionVisible(false); setImportError(""); setSubscriptionPreview(null); }}
             />
             {importMethod === "url" ? (
               <div className="dialog-field"><label htmlFor="subscription-url">URL подписки</label><span className="secret-input"><input ref={subscriptionInputRef} id="subscription-url" type={subscriptionVisible ? "text" : "password"} autoComplete="off" value={subscriptionSource} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-help"} placeholder="https://provider.example/••••" onChange={(event) => { setSubscriptionSource(event.target.value); setImportError(""); }} /><button className="icon-button" type="button" aria-label={subscriptionVisible ? "Скрыть URL" : "Показать URL"} title={subscriptionVisible ? "Скрыть URL" : "Показать URL"} onClick={() => setSubscriptionVisible((visible) => !visible)}><EyeIcon size={18} /></button></span><small id="import-help">URL передаётся typed adapter как секрет и не попадает в диагностику.</small>{importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}</div>

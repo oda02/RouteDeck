@@ -84,7 +84,7 @@ export interface AppNotice {
   kind: NoticeKind;
   title: string;
   body: string;
-  detail?: string;
+  redactedDetail?: string;
 }
 
 export interface EnvironmentInfo {
@@ -134,6 +134,23 @@ export interface SubscriptionPreview {
   supported: Array<{ protocol: Protocol; count: number }>;
   unsupportedCount: number;
   nodeNames: string[];
+}
+
+export type RouteDeckErrorCode =
+  | "backend-unavailable"
+  | "invalid-subscription-url"
+  | "insecure-subscription-url"
+  | "empty-subscription-source"
+  | "stale-subscription-preview";
+
+export class RouteDeckError extends Error {
+  readonly code: RouteDeckErrorCode;
+
+  constructor(code: RouteDeckErrorCode) {
+    super(code);
+    this.name = "RouteDeckError";
+    this.code = code;
+  }
 }
 
 export interface RouteDeckController {
