@@ -339,12 +339,13 @@ impl Drop for PlatformProcess {
     }
 }
 
-pub(crate) fn create_suspended_engine(
+pub(crate) fn create_suspended_engine<T>(
     executable: &Path,
     engine_dir: &Path,
     action: EngineAction,
     config_path: &Path,
-) -> Result<SuspendedProcess, RuntimeError> {
+    preflight: impl FnOnce() -> Result<T, RuntimeError>,
+) -> Result<(SuspendedProcess, T), RuntimeError> {
     let application = nul_terminated(executable.as_os_str(), "engine executable path")?;
     let current_directory = nul_terminated(engine_dir.as_os_str(), "engine directory path")?;
     let mut command_line = command_line(executable.as_os_str(), action, config_path.as_os_str())?;
@@ -389,6 +390,9 @@ pub(crate) fn create_suspended_engine(
         | CREATE_NO_WINDOW
         | CREATE_UNICODE_ENVIRONMENT
         | EXTENDED_STARTUPINFO_PRESENT;
+    // Keep the exact namespace/ACL/file-ID revalidation adjacent to CreateProcessW. All
+    // fallible pipe, environment, attribute-list and Job setup is complete before this point.
+    let preflight = preflight()?;
     let created = unsafe {
         CreateProcessW(
             application.as_ptr(),
@@ -444,14 +448,17 @@ pub(crate) fn create_suspended_engine(
         WaitForSingleObject(process.raw(), 1_000);
     })?;
     let stderr = unsafe { File::from_raw_handle(pipe_read.into_raw()) };
-    Ok(SuspendedProcess {
-        process: Some(process),
-        thread: Some(thread),
-        job: Some(job),
-        stderr: Some(stderr),
-        pid: information.dwProcessId,
-        armed: true,
-    })
+    Ok((
+        SuspendedProcess {
+            process: Some(process),
+            thread: Some(thread),
+            job: Some(job),
+            stderr: Some(stderr),
+            pid: information.dwProcessId,
+            armed: true,
+        },
+        preflight,
+    ))
 }
 
 fn open_null(access: u32, security: &SECURITY_ATTRIBUTES) -> Result<OwnedHandle, RuntimeError> {

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
@@ -59,7 +59,7 @@ impl std::fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EngineLock {
     schema_version: u32,
@@ -68,7 +68,7 @@ struct EngineLock {
     runtime_files: Vec<LockedFile>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LockedFile {
     path: String,
@@ -80,7 +80,6 @@ struct LockedFile {
 #[derive(Debug)]
 pub(crate) struct FixedEngineLayout {
     engine_dir: PathBuf,
-    executable: PathBuf,
 }
 
 impl FixedEngineLayout {
@@ -108,7 +107,6 @@ impl FixedEngineLayout {
             ));
         }
         Ok(Self {
-            executable: canonical_engine.join(ENGINE_EXE),
             engine_dir: canonical_engine,
         })
     }
@@ -116,14 +114,12 @@ impl FixedEngineLayout {
 
 struct VerifiedFiles {
     _directory: File,
-    _executable: File,
-    _cronet: File,
+    files: BTreeMap<String, File>,
 }
 
 impl FixedEngineLayout {
     fn verify(&self) -> Result<(VerifiedFiles, String), RuntimeError> {
-        let lock: EngineLock = serde_json::from_str(EMBEDDED_ENGINE_LOCK)
-            .map_err(|_| RuntimeError::new("engine_integrity", "embedded lock is invalid"))?;
+        let lock = embedded_engine_lock()?;
         self.verify_lock(&lock)
     }
 
@@ -134,53 +130,74 @@ impl FixedEngineLayout {
                 "embedded engine identity is unsupported",
             ));
         }
-        let held_directory = open_engine_directory_guard(&self.engine_dir)?;
-        reject_unlocked_binaries(&self.engine_dir, &lock.runtime_files)?;
-        let mut held_executable = None;
-        let mut held_cronet = None;
-        for locked in &lock.runtime_files {
-            if Path::new(&locked.path).file_name() != Some(OsStr::new(&locked.path)) {
-                return Err(RuntimeError::new(
-                    "engine_integrity",
-                    "engine lock contains a nested runtime path",
-                ));
-            }
-            let path = self.engine_dir.join(&locked.path);
-            reject_reparse(&path)?;
-            let mut file = open_verified_file(&path)?;
-            let metadata = file
-                .metadata()
-                .map_err(|error| RuntimeError::new("engine_integrity", error.to_string()))?;
-            if !metadata.is_file() || metadata.len() != locked.size {
-                return Err(RuntimeError::new(
-                    "engine_integrity",
-                    format!("{} has an unexpected size", locked.path),
-                ));
-            }
-            let digest = sha256_reader(&mut file)?;
-            if !constant_time_ascii_eq(&digest, &locked.sha256) {
-                return Err(RuntimeError::new(
-                    "engine_integrity",
-                    format!("{} failed SHA-256 verification", locked.path),
-                ));
-            }
-            match locked.path.as_str() {
-                ENGINE_EXE if locked.kind == "executable" => held_executable = Some(file),
-                CRONET_DLL if locked.kind == "library" => held_cronet = Some(file),
-                _ => {}
-            }
-        }
-        let files = VerifiedFiles {
-            _directory: held_directory,
-            _executable: held_executable.ok_or_else(|| {
-                RuntimeError::new("engine_integrity", "locked executable is missing")
-            })?,
-            _cronet: held_cronet.ok_or_else(|| {
-                RuntimeError::new("engine_integrity", "locked libcronet is missing")
-            })?,
-        };
+        let files = verify_runtime_directory(&self.engine_dir, lock)?;
         Ok((files, lock.version.clone()))
     }
+}
+
+fn embedded_engine_lock() -> Result<EngineLock, RuntimeError> {
+    serde_json::from_str(EMBEDDED_ENGINE_LOCK)
+        .map_err(|_| RuntimeError::new("engine_integrity", "embedded lock is invalid"))
+}
+
+fn verify_runtime_directory(
+    engine_dir: &Path,
+    lock: &EngineLock,
+) -> Result<VerifiedFiles, RuntimeError> {
+    let held_directory = open_engine_directory_guard(engine_dir)?;
+    reject_unlocked_binaries(engine_dir, &lock.runtime_files)?;
+    let mut held_files = BTreeMap::new();
+    let mut executable_valid = false;
+    let mut cronet_valid = false;
+    for locked in &lock.runtime_files {
+        if Path::new(&locked.path).file_name() != Some(OsStr::new(&locked.path)) {
+            return Err(RuntimeError::new(
+                "engine_integrity",
+                "engine lock contains a nested runtime path",
+            ));
+        }
+        let path = engine_dir.join(&locked.path);
+        reject_reparse(&path)?;
+        let mut file = open_verified_file(&path)?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| RuntimeError::new("engine_integrity", error.to_string()))?;
+        if !metadata.is_file() || metadata.len() != locked.size {
+            return Err(RuntimeError::new(
+                "engine_integrity",
+                format!("{} has an unexpected size", locked.path),
+            ));
+        }
+        let digest = sha256_reader(&mut file)?;
+        if !constant_time_ascii_eq(&digest, &locked.sha256) {
+            return Err(RuntimeError::new(
+                "engine_integrity",
+                format!("{} failed SHA-256 verification", locked.path),
+            ));
+        }
+        match locked.path.as_str() {
+            ENGINE_EXE if locked.kind == "executable" => executable_valid = true,
+            CRONET_DLL if locked.kind == "library" => cronet_valid = true,
+            _ => {}
+        }
+        held_files.insert(locked.path.clone(), file);
+    }
+    if !executable_valid {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "locked executable is missing",
+        ));
+    }
+    if !cronet_valid {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "locked libcronet is missing",
+        ));
+    }
+    Ok(VerifiedFiles {
+        _directory: held_directory,
+        files: held_files,
+    })
 }
 
 fn open_engine_directory_guard(path: &Path) -> Result<File, RuntimeError> {
@@ -315,6 +332,790 @@ fn open_verified_file(path: &Path) -> Result<File, RuntimeError> {
     options
         .open(path)
         .map_err(|error| RuntimeError::new("engine_integrity", error.to_string()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SealedObjectIdentity {
+    #[cfg(windows)]
+    volume_serial: u64,
+    #[cfg(windows)]
+    file_id: [u8; 16],
+    #[cfg(windows)]
+    security_descriptor: Vec<u8>,
+    #[cfg(not(windows))]
+    length: u64,
+}
+
+struct SealedEngine {
+    directory: PathBuf,
+    executable: PathBuf,
+    identities: BTreeMap<String, SealedObjectIdentity>,
+    cleanup_lock: EngineLock,
+}
+
+impl SealedEngine {
+    fn create(
+        session_directory: &Path,
+        lock: &EngineLock,
+        source: &VerifiedFiles,
+    ) -> Result<Self, RuntimeError> {
+        #[cfg(not(windows))]
+        {
+            let _ = (session_directory, lock, source);
+            return Err(RuntimeError::new(
+                "engine_integrity",
+                "sealed engine execution is supported only on Windows",
+            ));
+        }
+        #[cfg(windows)]
+        {
+            let execution_lock = execution_lock(lock)?;
+            reject_reparse(session_directory)?;
+            let directory = session_directory.join(format!("engine-run-{}", random_hex(16)?));
+            create_private_directory(&directory)
+                .map_err(|error| RuntimeError::new("engine_integrity", error.message))?;
+            let result = (|| {
+                let directory_guard = open_engine_directory_guard(&directory)?;
+                ensure_supported_seal_volume(&directory, &directory_guard)?;
+                for locked in &execution_lock.runtime_files {
+                    if Path::new(&locked.path).file_name() != Some(OsStr::new(&locked.path)) {
+                        return Err(RuntimeError::new(
+                            "engine_integrity",
+                            "engine lock contains a nested runtime path",
+                        ));
+                    }
+                    let source_file = source.files.get(&locked.path).ok_or_else(|| {
+                        RuntimeError::new(
+                            "engine_integrity",
+                            "verified source file handle is missing",
+                        )
+                    })?;
+                    copy_verified_file(source_file, &directory.join(&locked.path), locked.size)?;
+                }
+                for locked in &execution_lock.runtime_files {
+                    apply_sealed_acl(&directory.join(&locked.path))?;
+                }
+                apply_sealed_acl(&directory)?;
+                drop(directory_guard);
+
+                let verified = verify_runtime_directory(&directory, &execution_lock)?;
+                let identities = sealed_identities(&verified)?;
+                verify_sealed_directory_is_read_only(&directory)?;
+                Ok(Self {
+                    executable: directory.join(ENGINE_EXE),
+                    directory: directory.clone(),
+                    identities,
+                    cleanup_lock: execution_lock.clone(),
+                })
+            })();
+            if result.is_err() {
+                let _ = cleanup_owned_engine_directory(&directory, &execution_lock);
+            }
+            result
+        }
+    }
+
+    fn verify_for_launch(&self) -> Result<VerifiedFiles, RuntimeError> {
+        let verified = verify_runtime_directory(&self.directory, &self.cleanup_lock)?;
+        let identities = sealed_identities(&verified)?;
+        if identities != self.identities {
+            return Err(RuntimeError::new(
+                "engine_integrity",
+                "sealed engine file identity, owner, or ACL changed before launch",
+            ));
+        }
+        verify_sealed_directory_is_read_only(&self.directory)?;
+        Ok(verified)
+    }
+}
+
+fn execution_lock(lock: &EngineLock) -> Result<EngineLock, RuntimeError> {
+    let has_disguised_binary = lock.runtime_files.iter().any(|entry| {
+        let folded = entry.path.to_ascii_lowercase();
+        matches!(
+            Path::new(&folded).extension().and_then(OsStr::to_str),
+            Some("exe" | "dll")
+        ) && !matches!(
+            (entry.path.as_str(), entry.kind.as_str()),
+            (ENGINE_EXE, "executable") | (CRONET_DLL, "library")
+        )
+    });
+    let runtime_files = lock
+        .runtime_files
+        .iter()
+        .filter(|entry| matches!(entry.kind.as_str(), "executable" | "library"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if has_disguised_binary
+        || runtime_files.len() != 2
+        || !runtime_files
+            .iter()
+            .any(|entry| entry.path == ENGINE_EXE && entry.kind == "executable")
+        || !runtime_files
+            .iter()
+            .any(|entry| entry.path == CRONET_DLL && entry.kind == "library")
+    {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "engine lock does not define the exact execution file set",
+        ));
+    }
+    Ok(EngineLock {
+        schema_version: lock.schema_version,
+        engine: lock.engine.clone(),
+        version: lock.version.clone(),
+        runtime_files,
+    })
+}
+
+impl Drop for SealedEngine {
+    fn drop(&mut self) {
+        let _ = cleanup_owned_engine_directory(&self.directory, &self.cleanup_lock);
+    }
+}
+
+#[cfg(windows)]
+fn copy_verified_file(
+    source: &File,
+    destination: &Path,
+    expected_size: u64,
+) -> Result<(), RuntimeError> {
+    let mut source = source
+        .try_clone()
+        .map_err(|error| RuntimeError::new("engine_integrity", error.to_string()))?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| RuntimeError::new("engine_integrity", error.to_string()))?;
+    let mut destination_file = create_private_config_file(destination)
+        .map_err(|error| RuntimeError::new("engine_integrity", error.message))?;
+    let copied = std::io::copy(
+        &mut source.take(expected_size.saturating_add(1)),
+        &mut destination_file,
+    )
+    .map_err(|error| RuntimeError::new("engine_integrity", error.to_string()))?;
+    if copied != expected_size {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "verified source changed size while sealing",
+        ));
+    }
+    destination_file
+        .sync_all()
+        .map_err(|error| RuntimeError::new("engine_integrity", error.to_string()))
+}
+
+#[cfg(windows)]
+fn cleanup_owned_engine_directory(directory: &Path, lock: &EngineLock) -> Result<(), RuntimeError> {
+    if !directory.exists() {
+        return Ok(());
+    }
+    reject_reparse(directory)?;
+    let allowed = lock
+        .runtime_files
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect::<BTreeSet<_>>();
+    for entry in fs::read_dir(directory)
+        .map_err(|error| RuntimeError::new("session_recovery", error.to_string()))?
+    {
+        let entry =
+            entry.map_err(|error| RuntimeError::new("session_recovery", error.to_string()))?;
+        reject_reparse(&entry.path())?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            RuntimeError::new(
+                "session_recovery",
+                "sealed engine contains a non-Unicode entry",
+            )
+        })?;
+        if !allowed.contains(name)
+            || !entry
+                .file_type()
+                .map_err(|error| RuntimeError::new("session_recovery", error.to_string()))?
+                .is_file()
+        {
+            return Err(RuntimeError::new(
+                "session_recovery",
+                "sealed engine cleanup found an unrecognized entry",
+            ));
+        }
+        fs::remove_file(entry.path())
+            .map_err(|error| RuntimeError::new("session_recovery", error.to_string()))?;
+    }
+    fs::remove_dir(directory)
+        .map_err(|error| RuntimeError::new("session_recovery", error.to_string()))
+}
+
+#[cfg(not(windows))]
+fn cleanup_owned_engine_directory(
+    _directory: &Path,
+    _lock: &EngineLock,
+) -> Result<(), RuntimeError> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_supported_seal_volume(path: &Path, directory: &File) -> Result<(), RuntimeError> {
+    use std::{os::windows::ffi::OsStrExt, os::windows::io::AsRawHandle, ptr};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDriveTypeW, GetVolumeInformationByHandleW, GetVolumePathNameW,
+    };
+
+    const DRIVE_FIXED_VALUE: u32 = 3;
+    let wide_path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut volume_path = vec![0_u16; 32_768];
+    if unsafe {
+        GetVolumePathNameW(
+            wide_path.as_ptr(),
+            volume_path.as_mut_ptr(),
+            volume_path.len() as u32,
+        )
+    } == 0
+        || unsafe { GetDriveTypeW(volume_path.as_ptr()) } != DRIVE_FIXED_VALUE
+    {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "sealed engine execution requires a local fixed volume",
+        ));
+    }
+
+    let mut flags = 0_u32;
+    let mut filesystem = [0_u16; 32];
+    if unsafe {
+        GetVolumeInformationByHandleW(
+            directory.as_raw_handle(),
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut flags,
+            filesystem.as_mut_ptr(),
+            filesystem.len() as u32,
+        )
+    } == 0
+    {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "could not verify the sealed engine filesystem",
+        ));
+    }
+    let length = filesystem
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(filesystem.len());
+    let filesystem = String::from_utf16_lossy(&filesystem[..length]);
+    if !seal_volume_supported(DRIVE_FIXED_VALUE, flags, &filesystem) {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "sealed engine execution requires NTFS or ReFS with persistent ACLs",
+        ));
+    }
+    Ok(())
+}
+
+fn seal_volume_supported(drive_type: u32, filesystem_flags: u32, filesystem: &str) -> bool {
+    const DRIVE_FIXED_VALUE: u32 = 3;
+    const FILE_PERSISTENT_ACLS_VALUE: u32 = 0x0000_0008;
+    drive_type == DRIVE_FIXED_VALUE
+        && filesystem_flags & FILE_PERSISTENT_ACLS_VALUE != 0
+        && matches!(filesystem.to_ascii_uppercase().as_str(), "NTFS" | "REFS")
+}
+
+#[cfg(windows)]
+fn apply_sealed_acl(path: &Path) -> Result<(), RuntimeError> {
+    let user_sid = current_user_sid_string()?;
+    let inheritance = if path
+        .metadata()
+        .map_err(|error| RuntimeError::new("engine_integrity", error.to_string()))?
+        .is_dir()
+    {
+        "OICI"
+    } else {
+        ""
+    };
+    apply_protected_acl(
+        path,
+        &format!("O:{user_sid}D:P(A;{inheritance};GRGXSD;;;{user_sid})(A;{inheritance};FA;;;SY)"),
+    )
+}
+
+#[cfg(windows)]
+fn apply_protected_acl(path: &Path, descriptor_sddl: &str) -> Result<(), RuntimeError> {
+    apply_protected_acl_inner(path, descriptor_sddl, true)
+}
+
+#[cfg(all(windows, test))]
+fn apply_protected_dacl_for_test(path: &Path, descriptor_sddl: &str) -> Result<(), RuntimeError> {
+    apply_protected_acl_inner(path, descriptor_sddl, false)
+}
+
+#[cfg(windows)]
+fn apply_protected_acl_inner(
+    path: &Path,
+    descriptor_sddl: &str,
+    set_owner: bool,
+) -> Result<(), RuntimeError> {
+    use std::{os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::{
+        Foundation::{LocalFree, ERROR_SUCCESS},
+        Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+                SDDL_REVISION_1, SE_FILE_OBJECT,
+            },
+            GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, DACL_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        },
+    };
+
+    // Owner can read, execute, and later delete exact owned files, but cannot add or write.
+    // SYSTEM remains the only recovery principal. The DACL is protected from inheritance.
+    let descriptor_text = OsStr::new(descriptor_sddl)
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            descriptor_text.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "could not construct the sealed engine ACL",
+        ));
+    }
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut dacl = ptr::null_mut();
+    let dacl_ok =
+        unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) };
+    if dacl_ok == 0 || present == 0 || dacl.is_null() {
+        unsafe { LocalFree(descriptor) };
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "sealed engine ACL did not contain a DACL",
+        ));
+    }
+    let mut owner = ptr::null_mut();
+    let mut owner_defaulted = 0;
+    if unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut owner_defaulted) } == 0
+        || owner.is_null()
+    {
+        unsafe { LocalFree(descriptor) };
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "sealed engine ACL did not contain an explicit owner",
+        ));
+    }
+    let mut wide_path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let security_information = DACL_SECURITY_INFORMATION
+        | PROTECTED_DACL_SECURITY_INFORMATION
+        | if set_owner {
+            OWNER_SECURITY_INFORMATION
+        } else {
+            0
+        };
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            wide_path.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            security_information,
+            if set_owner { owner } else { ptr::null_mut() },
+            ptr::null_mut(),
+            dacl,
+            ptr::null_mut(),
+        )
+    };
+    unsafe { LocalFree(descriptor) };
+    if status != ERROR_SUCCESS {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "could not apply the sealed engine ACL",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sealed_identities(
+    verified: &VerifiedFiles,
+) -> Result<BTreeMap<String, SealedObjectIdentity>, RuntimeError> {
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        ".".to_owned(),
+        sealed_object_identity(&verified._directory, true)?,
+    );
+    for (name, file) in &verified.files {
+        identities.insert(name.clone(), sealed_object_identity(file, false)?);
+    }
+    Ok(identities)
+}
+
+#[cfg(windows)]
+fn sealed_object_identity(
+    file: &File,
+    expect_directory: bool,
+) -> Result<SealedObjectIdentity, RuntimeError> {
+    use std::{mem::size_of, os::windows::io::AsRawHandle, ptr, slice};
+    use windows_sys::Win32::{
+        Foundation::{LocalFree, ERROR_SUCCESS},
+        Security::{
+            Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
+            GetSecurityDescriptorControl, GetSecurityDescriptorLength, DACL_SECURITY_INFORMATION,
+            GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+            SE_DACL_PROTECTED,
+        },
+        Storage::FileSystem::{
+            FileAttributeTagInfo, FileIdInfo, GetFileInformationByHandle,
+            GetFileInformationByHandleEx, GetFileType, BY_HANDLE_FILE_INFORMATION,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_ID_INFO, FILE_TYPE_DISK,
+        },
+    };
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| RuntimeError::new("engine_integrity", error.to_string()))?;
+    if metadata.is_dir() != expect_directory || (!expect_directory && !metadata.is_file()) {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "sealed engine object type changed",
+        ));
+    }
+    let handle = file.as_raw_handle();
+    if unsafe { GetFileType(handle) } != FILE_TYPE_DISK {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "sealed engine object is not a disk file",
+        ));
+    }
+    let mut attributes = FILE_ATTRIBUTE_TAG_INFO::default();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            (&mut attributes as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    } == 0
+        || attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "sealed engine object is a reparse point or its attributes are unavailable",
+        ));
+    }
+    let mut basic = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(handle, &mut basic) } == 0
+        || (!expect_directory && basic.nNumberOfLinks != 1)
+    {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "sealed engine object has an unsupported link identity",
+        ));
+    }
+    let mut information = FILE_ID_INFO::default();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&mut information as *mut FILE_ID_INFO).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "could not read sealed engine file identity",
+        ));
+    }
+
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let mut owner = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() || owner.is_null() || dacl.is_null() {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "could not read sealed engine owner or ACL",
+        ));
+    }
+    let acl_matches = sealed_acl_matches(owner, dacl, expect_directory);
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    let control_ok =
+        unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
+    let descriptor_length = unsafe { GetSecurityDescriptorLength(descriptor) } as usize;
+    if !acl_matches || control_ok == 0 || descriptor_length == 0 || control & SE_DACL_PROTECTED == 0
+    {
+        unsafe { LocalFree(descriptor) };
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "sealed engine owner or protected ACL is invalid",
+        ));
+    }
+    let security_descriptor =
+        unsafe { slice::from_raw_parts(descriptor.cast(), descriptor_length) }.to_vec();
+    unsafe { LocalFree(descriptor) };
+    Ok(SealedObjectIdentity {
+        volume_serial: information.VolumeSerialNumber,
+        file_id: information.FileId.Identifier,
+        security_descriptor,
+    })
+}
+
+#[cfg(windows)]
+fn sealed_acl_matches(
+    owner: windows_sys::Win32::Security::PSID,
+    dacl: *const windows_sys::Win32::Security::ACL,
+    expect_directory: bool,
+) -> bool {
+    use std::{mem::size_of, ptr};
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, CreateWellKnownSid, EqualSid, GetAce, GetAclInformation,
+        WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
+        INHERIT_ONLY_ACE, OBJECT_INHERIT_ACE, SECURITY_MAX_SID_SIZE,
+    };
+
+    const ACCESS_ALLOWED_ACE_TYPE_VALUE: u8 = 0;
+    const OWNER_GENERIC_RX_DELETE: u32 = 0xa001_0000;
+    const OWNER_FILE_RX_DELETE: u32 = 0x0013_00a9;
+    const SYSTEM_FILE_ALL: u32 = 0x001f_01ff;
+    const SYSTEM_GENERIC_ALL: u32 = 0x1000_0000;
+    let current = match current_user_sid() {
+        Ok(sid) => sid,
+        Err(_) => return false,
+    };
+    if unsafe { EqualSid(owner, current.as_ptr().cast_mut().cast()) } == 0 {
+        return false;
+    }
+    let mut system = vec![0_u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut system_size = system.len() as u32;
+    if unsafe {
+        CreateWellKnownSid(
+            WinLocalSystemSid,
+            ptr::null_mut(),
+            system.as_mut_ptr().cast(),
+            &mut system_size,
+        )
+    } == 0
+    {
+        return false;
+    }
+    system.truncate(system_size as usize);
+
+    let mut information = ACL_SIZE_INFORMATION::default();
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut information as *mut ACL_SIZE_INFORMATION).cast(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return false;
+    }
+    let mut saw_current_effective = false;
+    let mut saw_current_inheritable = false;
+    let mut saw_system = false;
+    for index in 0..information.AceCount {
+        let mut raw = ptr::null_mut();
+        if unsafe { GetAce(dacl, index, &mut raw) } == 0 || raw.is_null() {
+            return false;
+        }
+        let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
+        if ace.Header.AceType != ACCESS_ALLOWED_ACE_TYPE_VALUE
+            || ace.Header.AceSize < size_of::<ACCESS_ALLOWED_ACE>() as u16
+        {
+            return false;
+        }
+        let sid = (&ace.SidStart as *const u32).cast_mut().cast();
+        if unsafe { EqualSid(sid, current.as_ptr().cast_mut().cast()) } != 0 {
+            if ace.Header.AceFlags == 0 && ace.Mask == OWNER_FILE_RX_DELETE {
+                if saw_current_effective {
+                    return false;
+                }
+                saw_current_effective = true;
+            } else if expect_directory
+                && ace.Header.AceFlags
+                    == (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE) as u8
+                && ace.Mask == OWNER_GENERIC_RX_DELETE
+            {
+                if saw_current_inheritable {
+                    return false;
+                }
+                saw_current_inheritable = true;
+            } else {
+                return false;
+            }
+        } else if unsafe { EqualSid(sid, system.as_ptr().cast_mut().cast()) } != 0 {
+            let flags_match = if expect_directory {
+                ace.Header.AceFlags == (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8
+            } else {
+                ace.Header.AceFlags == 0
+            };
+            if saw_system
+                || !flags_match
+                || !matches!(ace.Mask, SYSTEM_FILE_ALL | SYSTEM_GENERIC_ALL)
+            {
+                return false;
+            }
+            saw_system = true;
+        } else {
+            return false;
+        }
+    }
+    saw_current_effective && (!expect_directory || saw_current_inheritable) && saw_system
+}
+
+#[cfg(windows)]
+fn current_user_sid() -> Result<Vec<u8>, RuntimeError> {
+    use std::{mem::size_of, ptr, slice};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER},
+        Security::{GetLengthSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    let mut token = ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "could not open the current user token",
+        ));
+    }
+    let mut byte_count = 0_u32;
+    let first =
+        unsafe { GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut byte_count) };
+    if first != 0
+        || unsafe { windows_sys::Win32::Foundation::GetLastError() } != ERROR_INSUFFICIENT_BUFFER
+        || byte_count < size_of::<TOKEN_USER>() as u32
+    {
+        unsafe { CloseHandle(token) };
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "could not size the current user SID",
+        ));
+    }
+    let mut storage = vec![0_usize; (byte_count as usize).div_ceil(size_of::<usize>())];
+    let loaded = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            storage.as_mut_ptr().cast(),
+            byte_count,
+            &mut byte_count,
+        )
+    };
+    if loaded == 0 {
+        unsafe { CloseHandle(token) };
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "could not read the current user SID",
+        ));
+    }
+    let sid = unsafe { (&*storage.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let sid_length = unsafe { GetLengthSid(sid) } as usize;
+    if sid_length == 0 {
+        unsafe { CloseHandle(token) };
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "current user SID is invalid",
+        ));
+    }
+    let bytes = unsafe { slice::from_raw_parts(sid.cast::<u8>(), sid_length) }.to_vec();
+    unsafe { CloseHandle(token) };
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn current_user_sid_string() -> Result<String, RuntimeError> {
+    use std::{os::windows::ffi::OsStringExt, ptr};
+    use windows_sys::Win32::{
+        Foundation::LocalFree, Security::Authorization::ConvertSidToStringSidW,
+    };
+
+    let sid = current_user_sid()?;
+    let mut text = ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(sid.as_ptr().cast_mut().cast(), &mut text) } == 0
+        || text.is_null()
+    {
+        return Err(RuntimeError::new(
+            "engine_integrity",
+            "could not format the current user SID",
+        ));
+    }
+    let mut length = 0_usize;
+    while unsafe { *text.add(length) } != 0 {
+        length += 1;
+    }
+    let result = std::ffi::OsString::from_wide(unsafe { std::slice::from_raw_parts(text, length) })
+        .to_string_lossy()
+        .into_owned();
+    unsafe { LocalFree(text.cast()) };
+    Ok(result)
+}
+
+#[cfg(windows)]
+fn verify_sealed_directory_is_read_only(directory: &Path) -> Result<(), RuntimeError> {
+    let probe = directory.join(".routedeck-late-write-probe.dll");
+    match OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Err(error) if error.raw_os_error() == Some(5) => Ok(()),
+        Ok(file) => {
+            drop(file);
+            let _ = fs::remove_file(probe);
+            Err(RuntimeError::new(
+                "engine_integrity",
+                "sealed engine directory still permits late file creation",
+            ))
+        }
+        Err(_) => Err(RuntimeError::new(
+            "engine_integrity",
+            "sealed engine write-denial probe was inconclusive",
+        )),
+    }
+}
+
+#[cfg(not(windows))]
+fn sealed_identities(
+    _verified: &VerifiedFiles,
+) -> Result<BTreeMap<String, SealedObjectIdentity>, RuntimeError> {
+    Err(RuntimeError::new(
+        "engine_integrity",
+        "sealed engine execution is supported only on Windows",
+    ))
+}
+
+#[cfg(not(windows))]
+fn verify_sealed_directory_is_read_only(_directory: &Path) -> Result<(), RuntimeError> {
+    Err(RuntimeError::new(
+        "engine_integrity",
+        "sealed engine execution is supported only on Windows",
+    ))
 }
 
 fn sha256_reader(reader: &mut File) -> Result<String, RuntimeError> {
@@ -454,6 +1255,10 @@ impl SessionConfig {
 
     pub(crate) fn path(&self) -> &Path {
         &self.config_path
+    }
+
+    fn directory(&self) -> &Path {
+        &self.directory
     }
 
     pub(crate) fn revalidate_for_launch(&self) -> Result<File, RuntimeError> {
@@ -920,6 +1725,7 @@ pub(crate) struct VerifiedEngineLauncher {
 struct PreparedVerification {
     config_path: PathBuf,
     verified_files: VerifiedFiles,
+    sealed_engine: SealedEngine,
     _config_guard: File,
 }
 
@@ -939,13 +1745,17 @@ impl EngineLauncher for VerifiedEngineLauncher {
         redactor: Redactor,
         diagnostics: Arc<Mutex<DiagnosticBuffer>>,
     ) -> Result<String, RuntimeError> {
-        let (_check_guards, version) = self.layout.verify()?;
+        let (source_guards, version) = self.layout.verify()?;
+        let lock = embedded_engine_lock()?;
+        let sealed_engine = SealedEngine::create(config.directory(), &lock, &source_guards)?;
+        drop(source_guards);
         let _config_guard = config.revalidate_for_launch()?;
-        let mut suspended = create_suspended_engine(
-            &self.layout.executable,
-            &self.layout.engine_dir,
+        let (mut suspended, check_guards) = create_suspended_engine(
+            &sealed_engine.executable,
+            &sealed_engine.directory,
             EngineAction::Check,
             config.path(),
+            || sealed_engine.verify_for_launch(),
         )
         .map_err(as_config_check_error)?;
         let stderr = suspended.take_stderr().map_err(as_config_check_error)?;
@@ -999,7 +1809,8 @@ impl EngineLauncher for VerifiedEngineLauncher {
             ));
         }
 
-        let (verified_files, _) = self.layout.verify()?;
+        drop(check_guards);
+        let verified_files = sealed_engine.verify_for_launch()?;
         let config_guard = config.revalidate_for_launch()?;
         *self
             .prepared
@@ -1007,6 +1818,7 @@ impl EngineLauncher for VerifiedEngineLauncher {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PreparedVerification {
             config_path: config.path().to_owned(),
             verified_files,
+            sealed_engine,
             _config_guard: config_guard,
         });
 
@@ -1032,11 +1844,12 @@ impl EngineLauncher for VerifiedEngineLauncher {
                 )
             })?;
         let config_guard = config.revalidate_for_launch()?;
-        let mut suspended = create_suspended_engine(
-            &self.layout.executable,
-            &self.layout.engine_dir,
+        let (mut suspended, run_guards) = create_suspended_engine(
+            &prepared.sealed_engine.executable,
+            &prepared.sealed_engine.directory,
             EngineAction::Run,
             config.path(),
+            || prepared.sealed_engine.verify_for_launch(),
         )?;
         let stderr = suspended.take_stderr()?;
         let diagnostic_target = diagnostics.clone();
@@ -1048,10 +1861,12 @@ impl EngineLauncher for VerifiedEngineLauncher {
             })
             .map_err(|_| RuntimeError::new("start_engine", "could not start stderr reader"))?;
         let child = suspended.resume()?;
+        drop(prepared.verified_files);
         Ok(Box::new(RealManagedChild {
             child,
             stderr_thread: Some(stderr_thread),
-            _verified_files: prepared.verified_files,
+            _verified_files: run_guards,
+            _sealed_engine: prepared.sealed_engine,
             _config_guard: config_guard,
         }))
     }
@@ -1129,6 +1944,7 @@ struct RealManagedChild {
     child: PlatformProcess,
     stderr_thread: Option<thread::JoinHandle<()>>,
     _verified_files: VerifiedFiles,
+    _sealed_engine: SealedEngine,
     _config_guard: File,
 }
 
@@ -1243,7 +2059,7 @@ mod tests {
         };
         assert_eq!(error.stage(), "engine_integrity");
         fs::remove_file(fixture.layout.engine_dir.join("extra.exe")).unwrap();
-        fs::write(&fixture.layout.executable, b"wrong size").unwrap();
+        fs::write(fixture.layout.engine_dir.join(ENGINE_EXE), b"wrong size").unwrap();
         assert!(fixture.layout.verify_lock(&fixture.lock).is_err());
     }
 
@@ -1275,6 +2091,55 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn execution_lock_contains_only_the_executable_and_adjacent_library() {
+        let fixture = FixtureLayout::create();
+        let execution = execution_lock(&fixture.lock).unwrap();
+        assert_eq!(execution.runtime_files.len(), 2);
+        assert!(execution
+            .runtime_files
+            .iter()
+            .any(|entry| entry.path == ENGINE_EXE));
+        assert!(execution
+            .runtime_files
+            .iter()
+            .any(|entry| entry.path == CRONET_DLL));
+        assert!(!execution
+            .runtime_files
+            .iter()
+            .any(|entry| entry.path == "LICENSE"));
+
+        let mut ambiguous = fixture.lock.clone();
+        ambiguous.runtime_files.push(LockedFile {
+            path: "late.dll".into(),
+            kind: "library".into(),
+            size: 1,
+            sha256: digest(b"x"),
+        });
+        assert!(execution_lock(&ambiguous).is_err());
+
+        let mut disguised = fixture.lock.clone();
+        disguised.runtime_files.push(LockedFile {
+            path: "late.dll".into(),
+            kind: "license".into(),
+            size: 1,
+            sha256: digest(b"x"),
+        });
+        assert!(execution_lock(&disguised).is_err());
+    }
+
+    #[test]
+    fn seal_volume_policy_rejects_remote_removable_and_non_acl_filesystems() {
+        const FIXED: u32 = 3;
+        const REMOTE: u32 = 4;
+        const PERSISTENT_ACLS: u32 = 8;
+        assert!(seal_volume_supported(FIXED, PERSISTENT_ACLS, "NTFS"));
+        assert!(seal_volume_supported(FIXED, PERSISTENT_ACLS, "ReFS"));
+        assert!(!seal_volume_supported(REMOTE, PERSISTENT_ACLS, "NTFS"));
+        assert!(!seal_volume_supported(FIXED, 0, "NTFS"));
+        assert!(!seal_volume_supported(FIXED, PERSISTENT_ACLS, "exFAT"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn verified_engine_guards_block_directory_replacement_and_file_mutation() {
@@ -1287,10 +2152,82 @@ mod tests {
         .is_err());
         assert!(OpenOptions::new()
             .write(true)
-            .open(&fixture.layout.executable)
+            .open(fixture.layout.engine_dir.join(ENGINE_EXE))
             .is_err());
         drop(guards);
         fs::write(fixture.layout.engine_dir.join("late.dll"), b"foreign").unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sealed_engine_copy_blocks_late_names_and_detects_acl_tamper() {
+        let fixture = FixtureLayout::create();
+        let session = fixture
+            .root
+            .join(format!("session-{}", random_hex(16).unwrap()));
+        create_private_directory(&session).unwrap();
+        let (source, _) = fixture.layout.verify_lock(&fixture.lock).unwrap();
+        let sealed = SealedEngine::create(&session, &fixture.lock, &source).unwrap();
+        drop(source);
+
+        assert!(sealed.directory.starts_with(&session));
+        assert_ne!(sealed.directory, fixture.layout.engine_dir);
+        assert!(sealed.directory.join(ENGINE_EXE).is_file());
+        assert!(sealed.directory.join(CRONET_DLL).is_file());
+        assert!(!sealed.directory.join("LICENSE").exists());
+        assert!(OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(sealed.directory.join("late.dll"))
+            .is_err());
+        assert!(OpenOptions::new()
+            .write(true)
+            .open(sealed.directory.join(ENGINE_EXE))
+            .is_err());
+        let guards = sealed.verify_for_launch().unwrap();
+        assert_eq!(guards.files.len(), 2);
+        drop(guards);
+
+        let user = current_user_sid_string().unwrap();
+        apply_protected_dacl_for_test(
+            &sealed.directory.join(ENGINE_EXE),
+            &format!("O:{user}D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)"),
+        )
+        .unwrap();
+        assert!(sealed.verify_for_launch().is_err());
+        let sealed_directory = sealed.directory.clone();
+        drop(sealed);
+        assert!(!sealed_directory.exists());
+        fs::remove_dir(session).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sealed_engine_exact_preflight_rejects_a_late_dll_after_acl_tamper() {
+        let fixture = FixtureLayout::create();
+        let session = fixture
+            .root
+            .join(format!("session-{}", random_hex(16).unwrap()));
+        create_private_directory(&session).unwrap();
+        let (source, _) = fixture.layout.verify_lock(&fixture.lock).unwrap();
+        let sealed = SealedEngine::create(&session, &fixture.lock, &source).unwrap();
+        drop(source);
+
+        let user = current_user_sid_string().unwrap();
+        apply_protected_dacl_for_test(
+            &sealed.directory,
+            &format!("O:{user}D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)"),
+        )
+        .unwrap();
+        let late = sealed.directory.join("late.dll");
+        fs::write(&late, b"foreign").unwrap();
+        assert!(sealed.verify_for_launch().is_err());
+
+        fs::remove_file(late).unwrap();
+        let sealed_directory = sealed.directory.clone();
+        drop(sealed);
+        assert!(!sealed_directory.exists());
+        fs::remove_dir(session).unwrap();
     }
 
     #[test]

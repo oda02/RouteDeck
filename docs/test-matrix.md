@@ -57,6 +57,11 @@ restore, and termination or reconfiguration of another VPN are forbidden in ever
 | SC-08 | C | Run `sing-box version`; compare to lock | Exact `1.13.19`; mismatch blocks release. |
 | SC-09 | W | Defender scans unpacked engine and assembled portable directory | No detection; scan result recorded without allow-listing. |
 | SC-10 | U | npm/Cargo/frontend build examined for engine download hooks | No build/start hook downloads or executes engine artifacts. |
+| SC-11 | U/W | Seal destination is removable, remote, FAT/exFAT, or lacks persistent ACLs | Fail closed before copying or executing the engine. |
+| SC-12 | W | Sealed execution directory owner/DACL is changed, a reparse point appears, or a third name is planted | Immediately adjacent preflight rejects it; engine is not executed. |
+| SC-13 | W | Another unelevated Windows user attempts to read/write/replace the sealed engine files or create a late DLL | Protected DACL denies access; exact preflight remains valid. |
+| SC-14 | W | Same-user hostile test changes the DACL and races a late DLL between validation and launch | Test records the documented same-user boundary; no claim of resistance without OS isolation/elevated broker. |
+| SC-15 | W | Crash leaves a sealed session; unknown file/reparse point is present during cleanup | Exact non-recursive cleanup preserves ambiguity; next startup enters `RecoveryRequired`. |
 
 ## 4. Subscription fetch and parser tests
 
