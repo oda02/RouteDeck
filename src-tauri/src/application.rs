@@ -3611,6 +3611,59 @@ mod tests {
     }
 
     #[test]
+    fn reality_stop_preserves_front_error_when_both_processes_fail() {
+        struct FailingStopChild {
+            message: &'static str,
+            attempts: Arc<AtomicUsize>,
+        }
+
+        impl ManagedChild for FailingStopChild {
+            fn pid(&self) -> u32 {
+                std::process::id()
+            }
+
+            fn is_alive(&mut self) -> Result<bool, RuntimeError> {
+                Ok(true)
+            }
+
+            fn stop(&mut self) -> Result<(), RuntimeError> {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                Err(RuntimeError::new("stop_engine", self.message))
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "routedeck-reality-double-stop-test-{}",
+            random_hex(8).expect("test random")
+        ));
+        let front_attempts = Arc::new(AtomicUsize::new(0));
+        let sidecar_attempts = Arc::new(AtomicUsize::new(0));
+        let sidecar_config = SessionConfig::create(&root, "{}").unwrap();
+        let mut pair = RealityProcessPair {
+            front: Box::new(FailingStopChild {
+                message: "front stop failed",
+                attempts: Arc::clone(&front_attempts),
+            }),
+            sidecar: Box::new(FailingStopChild {
+                message: "sidecar stop failed",
+                attempts: Arc::clone(&sidecar_attempts),
+            }),
+            sidecar_port: 1,
+            listener: Arc::new(FakeListener(true)),
+            _sidecar_config: sidecar_config,
+        };
+
+        let error = pair.stop().unwrap_err();
+
+        assert_eq!(error.stage(), "stop_engine");
+        assert_eq!(error.message(), "front stop failed");
+        assert_eq!(front_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(sidecar_attempts.load(Ordering::SeqCst), 1);
+        drop(pair);
+        let _ = std::fs::remove_dir(root);
+    }
+
+    #[test]
     fn reality_system_proxy_restores_windows_before_stopping_both_engines() {
         let provider = Arc::new(DualEngineProvider::new());
         let proxy = Arc::new(FakeSystemProxy::new(Arc::clone(&provider.sing_box_alive)));
