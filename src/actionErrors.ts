@@ -7,13 +7,13 @@ export function toPublicActionError(error: unknown): PublicActionError {
   if (error instanceof RouteDeckError) {
     switch (error.code) {
       case "backend-unavailable":
-        return { message: "Backend RouteDeck недоступен. Перезапустите приложение." };
+        return { message: "Не удалось связаться с RouteDeck. Перезапустите приложение." };
       case "backend-response-invalid":
         return { message: "Не удалось прочитать состояние подключения. Перезапустите RouteDeck." };
       case "capability-unavailable":
-        return { message: "Эта возможность ещё не подключена к проверенному Windows-backend." };
+        return { message: "Эта функция пока недоступна." };
       case "runtime-failure":
-        return { message: "Локальный backend не завершил действие. Откройте безопасную диагностику и повторите попытку." };
+        return { message: "Не удалось выполнить действие. Повторите попытку или откройте диагностику." };
       case "node-not-selected":
         return { message: "Сначала импортируйте и выберите сервер." };
       case "subscription-import-rejected":
@@ -42,7 +42,7 @@ export function toPublicActionError(error: unknown): PublicActionError {
     return { message: "Windows не разрешила доступ к буферу обмена. Проверьте разрешение и повторите действие." };
   }
   return {
-    message: "Действие не выполнено. Технические сведения скрыты, чтобы не показать секреты.",
-    redactedDetail: "Откройте безопасный диагностический отчёт или повторите действие.",
+    message: "Не удалось выполнить действие. Повторите попытку.",
+    redactedDetail: "Подробности доступны в диагностике.",
   };
 }

@@ -20,7 +20,6 @@ import {
   ImportIcon,
   InfoIcon,
   LoaderIcon,
-  PlusIcon,
   RefreshIcon,
   RoutingIcon,
   SearchIcon,
@@ -279,7 +278,6 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
     : hasLiveCore
       ? localDiagnostic ? "Остановить локальный прокси" : "Отключить"
       : snapshot.phase === "failed" ? "Повторить" : "Подключить";
-  const visibleProofs = snapshot.proofs.filter((proof) => proof.id !== "config");
   const boundaryNotice = snapshot.notice?.id === "backend-unavailable" || snapshot.notice?.id === "backend-response-invalid";
   const vpnApps = snapshot.routing.apps.filter((app) => app.route === "vpn");
   const directApps = snapshot.routing.apps.filter((app) => app.route === "direct");
@@ -352,8 +350,6 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
           secondaryAction={{ label: "Открыть диагностику", onClick: () => onNavigate("diagnostics") }}
         />
       ) : null}
-
-      <ProofCard proofs={visibleProofs} historical={snapshot.phase === "disconnected"} />
 
       <button className="summary-card" type="button" onClick={() => onNavigate("routing")}>
         <span className="summary-icon"><RoutingIcon size={20} /></span>
@@ -502,12 +498,11 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
         <p className="effective-summary"><RoutingIcon size={18} />{summary}</p>
       </section>
 
-      <OpaqueNotice notice={{ id: "proxy-routing-scope", kind: "info", title: "Правила готовы для следующего подключения", body: "Они управляют только трафиком приложений, которые используют прокси Windows. Правила отдельных приложений применяются по возможности; остальные приложения могут продолжить работать напрямую. Выбор из запущенных приложений появится позже." }} />
+      <OpaqueNotice notice={{ id: "proxy-routing-scope", kind: "info", title: "Правила готовы для следующего подключения", body: "Они управляют только трафиком приложений, которые используют прокси Windows. Правила отдельных приложений применяются по возможности; остальные приложения могут продолжить работать напрямую." }} />
 
       <section className="card app-rules-card">
         <div className="section-heading">
           <div><p className="overline">Исключения</p><h2>Приложения</h2></div>
-          <button className="secondary-button compact-button" type="button" disabled title="Выбор приложения появится с Tauri dialog adapter"><PlusIcon size={18} />Добавить · скоро</button>
         </div>
         <div className="app-rule-list">
           {draft.apps.length > 0 ? draft.apps.map((app) => (
@@ -532,7 +527,7 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
             <div className="empty-state">
               <RoutingIcon size={24} />
               <strong>Исключений пока нет</strong>
-              <span>Трафик, дошедший до прокси Windows, использует общий маршрут. Выбор приложений появится в следующем обновлении.</span>
+              <span>Трафик, дошедший до прокси Windows, использует общий маршрут.</span>
             </div>
           )}
         </div>
@@ -596,13 +591,10 @@ function SettingsPage({ headingRef, snapshot, draft, onDraftChange, onSave, onRe
       </section>
 
       <section className="card settings-group">
-        <div className="section-heading compact-heading"><div><p className="overline">Владение Windows</p><h2>Совместимость с другими VPN</h2></div></div>
+        <div className="section-heading compact-heading"><div><p className="overline">Системный прокси</p><h2>Совместимость с другими VPN</h2></div></div>
         <label className="radio-setting"><input type="radio" disabled={settingsUnavailable} name="proxy-policy" value="never-overwrite" checked={draft.proxyConflictPolicy === "never-overwrite"} onChange={() => onDraftChange({ ...draft, proxyConflictPolicy: "never-overwrite" })} /><span><strong>Не заменять настройки другой программы</strong><small>При конфликте RouteDeck покажет ошибку</small></span></label>
-        <label className="radio-setting"><input type="radio" disabled={settingsUnavailable} name="proxy-policy" value="ask" checked={draft.proxyConflictPolicy === "ask"} onChange={() => onDraftChange({ ...draft, proxyConflictPolicy: "ask" })} /><span><strong>Спрашивать перед заменой</strong><small>Этот вариант появится позже</small></span></label>
         <div className="persistent-hint" data-kind="info"><InfoIcon size={18} /><p>Windows использует один эффективный системный прокси. Разные локальные порты не создают двух владельцев.</p></div>
       </section>
-
-      <details className="card advanced-settings"><summary>Расширенные настройки</summary><div className="details-body"><p>Строгая маршрутизация TUN уменьшает утечки DNS, но может конфликтовать с виртуальными адаптерами. Диагностика покажет конкретную причину до UAC.</p><p>Сервис, драйвер и задача автозапуска в первой версии не устанавливаются.</p></div></details>
 
       <button className="primary-button" type="button" disabled={settingsUnavailable || !dirty || !portsValid || saving} aria-busy={saving} onClick={save} title={settingsUnavailable ? "Сохранение настроек ещё не подключено" : undefined}>{saving ? <LoaderIcon size={20} /> : <CheckIcon size={20} />}{saving ? "Сохраняем…" : settingsUnavailable ? "Сохранение недоступно" : "Сохранить изменения"}</button>
 
@@ -624,7 +616,7 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
   const run = () => {
     void runAsyncAction({
       page: "diagnostics",
-      title: "Не удалось обновить снимок состояния",
+      title: "Не удалось обновить состояние",
       setBusy: setChecking,
       action: controller.runDiagnostics,
       retry: run,
@@ -633,11 +625,11 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
   const copyReport = () => {
     void runAsyncAction({
       page: "diagnostics",
-      title: "Не удалось скопировать безопасный отчёт",
+      title: "Не удалось скопировать отчёт",
       setBusy: setCopying,
       action: () => navigator.clipboard.writeText(controller.getSanitizedReport()),
       retry: copyReport,
-      onSuccess: () => onToast("Безопасный отчёт скопирован", "success"),
+      onSuccess: () => onToast("Отчёт скопирован", "success"),
     });
   };
   const externalNotice: AppNotice = {
@@ -645,19 +637,19 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
     kind: "warning",
     title: "Обнаружен другой VPN",
     body: `${snapshot.environment.otherVpnName ?? "Другой клиент"} использует системный прокси ${snapshot.environment.externalProxyEndpoint ?? "Windows"}. RouteDeck не изменяет его без явного выбора.`,
-    redactedDetail: "Локальные proxy listeners могут работать на разных портах, но эффективный системный прокси Windows только один.",
+    redactedDetail: "Локальные прокси могут работать на разных портах, но эффективный системный прокси Windows только один.",
   };
   return (
     <div className="page">
-      <div className="page-title-row"><div><p className="overline">Безопасный снимок контроллера</p><h1 ref={headingRef} tabIndex={-1}>Диагностика</h1></div>{snapshot.diagnostics.snapshotReceivedAt ? <span className="quiet-badge">Получен {snapshot.diagnostics.snapshotReceivedAt}</span> : null}</div>
+      <div className="page-title-row"><div><p className="overline">Состояние приложения</p><h1 ref={headingRef} tabIndex={-1}>Диагностика</h1></div>{snapshot.diagnostics.snapshotReceivedAt ? <span className="quiet-badge">Обновлено {snapshot.diagnostics.snapshotReceivedAt}</span> : null}</div>
       <ActionFailureNotice failure={actionFailure} page="diagnostics" onClear={onClearFailure} />
-      <p className="field-help">Кнопка получает уже сохранённое состояние контроллера. Она не запускает новую проверку локальных портов или HTTPS-маршрута.</p>
-      <button className="primary-button" type="button" disabled={checking || snapshot.diagnostics.running} aria-busy={checking || snapshot.diagnostics.running} onClick={run}>{checking || snapshot.diagnostics.running ? <LoaderIcon size={20} /> : <ActivityIcon size={20} />}{checking || snapshot.diagnostics.running ? "Обновляем снимок…" : "Обновить снимок состояния"}</button>
-      {snapshot.environment.otherVpnDetected ? <OpaqueNotice notice={externalNotice} primaryAction={{ label: "Обновить снимок", onClick: run }} /> : null}
-      <ProofCard proofs={snapshot.diagnostics.steps} title="Снимок доказательств" />
-      {snapshot.diagnostics.snapshotReceivedAt ? <p className="diagnostic-duration">Снимок получен в {snapshot.diagnostics.snapshotReceivedAt}; время отдельных этапов отображается только когда его сообщает контроллер.</p> : null}
-      <button className="secondary-button full-width" type="button" disabled={copying} aria-busy={copying} onClick={copyReport}>{copying ? <LoaderIcon size={19} /> : <CopyIcon size={19} />}{copying ? "Копируем…" : "Копировать безопасный отчёт"}</button>
-      <details className="card log-viewer"><summary>Технический журнал</summary><div className="details-body"><p className="field-help">Секреты и адрес подписки удаляются до отображения и копирования.</p><pre>{snapshot.diagnostics.sanitizedLog.join("\n")}</pre></div></details>
+      <p className="field-help">Здесь показано последнее состояние подключения. Обновление не запускает новое сетевое подключение.</p>
+      <button className="primary-button" type="button" disabled={checking || snapshot.diagnostics.running} aria-busy={checking || snapshot.diagnostics.running} onClick={run}>{checking || snapshot.diagnostics.running ? <LoaderIcon size={20} /> : <ActivityIcon size={20} />}{checking || snapshot.diagnostics.running ? "Обновляем…" : "Обновить состояние"}</button>
+      {snapshot.environment.otherVpnDetected ? <OpaqueNotice notice={externalNotice} primaryAction={{ label: "Обновить", onClick: run }} /> : null}
+      <ProofCard proofs={snapshot.diagnostics.steps} title="Проверки" />
+      {snapshot.diagnostics.snapshotReceivedAt ? <p className="diagnostic-duration">Состояние обновлено в {snapshot.diagnostics.snapshotReceivedAt}; время отдельных этапов отображается только при наличии данных.</p> : null}
+      <button className="secondary-button full-width" type="button" disabled={copying} aria-busy={copying} onClick={copyReport}>{copying ? <LoaderIcon size={19} /> : <CopyIcon size={19} />}{copying ? "Копируем…" : "Копировать отчёт"}</button>
+      <details className="card log-viewer"><summary>Технический журнал</summary><div className="details-body"><p className="field-help">Личные данные удаляются из отчёта автоматически.</p><pre>{snapshot.diagnostics.sanitizedLog.join("\n")}</pre></div></details>
     </div>
   );
 }
@@ -824,7 +816,7 @@ export default function App() {
             kind: "error",
             title,
             body: publicError.message,
-            redactedDetail: publicError.redactedDetail ?? "Действие остановлено безопасно. Повторите попытку или откройте диагностику; зелёный статус не выставлен.",
+            redactedDetail: publicError.redactedDetail ?? "Повторите попытку или откройте диагностику.",
           },
         });
       }
@@ -971,7 +963,7 @@ export default function App() {
   const disconnect = () => {
     void runAsyncAction({
       page: "home",
-      title: "Не удалось безопасно отключиться",
+      title: "Не удалось отключиться",
       action: controller.disconnect,
       retry: disconnect,
     });
@@ -1004,7 +996,7 @@ export default function App() {
   return (
     <div className="app-shell" data-demo={snapshot.isDemo || undefined}>
       <header className="app-header">
-        <div className="brand"><span className="brand-mark"><RoutingIcon size={20} /></span><span><strong>RouteDeck</strong><small>sing-box controller</small></span></div>
+        <div className="brand"><span className="brand-mark"><RoutingIcon size={20} /></span><span><strong>RouteDeck</strong><small>VPN-клиент</small></span></div>
         <StatusBadge phase={snapshot.phase} />
       </header>
       {snapshot.isDemo ? (
@@ -1024,7 +1016,7 @@ export default function App() {
       {dialog === "import" ? (
         <Dialog
           title="Импорт подписки"
-          description="Вставьте HTTPS-ссылку от провайдера. RouteDeck добавит поддерживаемые серверы."
+          description="Вставьте ссылку от провайдера — RouteDeck добавит серверы."
           focusKey="subscription-url"
           onClose={closeDialog}
           busy={importing}
@@ -1038,7 +1030,7 @@ export default function App() {
             <div className="dialog-field">
               <label htmlFor="subscription-url">Ссылка на подписку</label>
               <input ref={subscriptionInputRef} id="subscription-url" type="url" inputMode="url" autoComplete="url" defaultValue="" disabled={importing} data-autofocus data-error-autofocus={importError ? "true" : undefined} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-help"} placeholder="https://provider.example/subscription" onInput={() => setImportError("")} />
-              <small id="import-help">Можно вставить ссылку обычным Ctrl+V. Поддерживаются подписки по HTTPS.</small>
+              <small id="import-help">Вставьте ссылку и нажмите «Импортировать».</small>
               {importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}
             </div>
           </form>
@@ -1048,26 +1040,26 @@ export default function App() {
       {dialog === "tun-preflight" ? (
         <Dialog
           title="Обнаружен другой VPN"
-          description="Выберите, как подключать выбранный сервер. RouteDeck перепроверит интерфейс до запроса UAC."
+          description="Выберите, как RouteDeck будет работать вместе с текущим VPN."
           onClose={closeDialog}
           actions={<><button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Отмена</button><button className="primary-button dialog-primary" type="button" disabled={!tunChoice || (tunChoice === "physical" && !adapterId)} onClick={connectTun}><ShieldIcon size={19} />Продолжить</button></>}
         >
           <div className="choice-list">
             <label className="choice-card" data-selected={tunChoice === "nested"}><input type="radio" name="tun-path" checked={tunChoice === "nested"} onChange={() => setTunChoice("nested")} /><span><strong>Через текущий VPN</strong><small>RouteDeck будет вложен в существующий путь. Результат помечается как nested.</small></span></label>
-            <label className="choice-card" data-selected={tunChoice === "physical"}><input type="radio" name="tun-path" checked={tunChoice === "physical"} onChange={() => setTunChoice("physical")} /><span><strong>Через физический адаптер</strong><small>Попытаться обойти текущий VPN через проверенный интерфейс.</small></span></label>
+            <label className="choice-card" data-selected={tunChoice === "physical"}><input type="radio" name="tun-path" checked={tunChoice === "physical"} onChange={() => setTunChoice("physical")} /><span><strong>Через физический адаптер</strong><small>Использовать выбранный сетевой адаптер напрямую.</small></span></label>
           </div>
           {tunChoice === "physical" ? <label className="dialog-field"><span>Физический адаптер</span><select value={adapterId} onChange={(event) => setAdapterId(event.target.value)}>{snapshot.environment.physicalAdapters.map((adapter) => <option value={adapter.id} key={adapter.id}>{adapter.label}</option>)}</select></label> : null}
-          <div className="persistent-hint" data-kind="warning"><WarningIcon size={18} /><p>Совместимость не предполагается заранее: после запуска нужен свежий HTTPS-proof выбранного outbound.</p></div>
+          <div className="persistent-hint" data-kind="warning"><WarningIcon size={18} /><p>После запуска RouteDeck проверит соединение с выбранным сервером.</p></div>
         </Dialog>
       ) : null}
 
       {dialog === "mode-change" && pendingMode ? (
         <Dialog
           title="Сменить режим подключения?"
-          description="RouteDeck сначала безопасно остановит текущую сессию. Новый режим не запустится автоматически."
+          description="RouteDeck остановит текущее подключение. Новый режим не запустится автоматически."
           onClose={closeDialog}
-          actions={<><button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Оставить текущий</button><button className="primary-button dialog-primary" type="button" onClick={() => { const mode = pendingMode; closeDialog(); void runAsyncAction({ page: "home", title: "Не удалось безопасно сменить режим", action: async () => { await controller.disconnect(); controller.setMode(mode); }, retry: () => handleModeChange(mode) }); }}><CheckIcon size={19} />Отключить и выбрать</button></>}
-        ><p className="dialog-copy">Будет выбран режим <strong>{pendingMode === "tun" ? "TUN" : "Системный прокси"}</strong>. После восстановления Windows-состояния нажмите «Подключить».</p></Dialog>
+          actions={<><button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Оставить текущий</button><button className="primary-button dialog-primary" type="button" onClick={() => { const mode = pendingMode; closeDialog(); void runAsyncAction({ page: "home", title: "Не удалось сменить режим", action: async () => { await controller.disconnect(); controller.setMode(mode); }, retry: () => handleModeChange(mode) }); }}><CheckIcon size={19} />Отключить и выбрать</button></>}
+        ><p className="dialog-copy">Будет выбран режим <strong>{pendingMode === "tun" ? "TUN" : "Системный прокси"}</strong>. После смены режима нажмите «Подключить».</p></Dialog>
       ) : null}
 
       {dialog === "reset" ? (
@@ -1076,7 +1068,7 @@ export default function App() {
           description="Будут удалены только локальные настройки и черновики RouteDeck. Чужой VPN и Windows не изменяются."
           onClose={closeDialog}
           actions={<><button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Отмена</button><button className="danger-button" type="button" onClick={() => { closeDialog(); void runAsyncAction({ page: "settings", title: "Не удалось сбросить локальное состояние", action: controller.resetLocalState, retry: () => setDialog("reset"), onSuccess: () => { setRoutingDraft(controller.getSnapshot().routing); setSettingsDraft(controller.getSnapshot().settings); showToast("Локальное состояние сброшено", "info"); } }); }}><TrashIcon size={19} />Сбросить RouteDeck</button></>}
-        ><p className="dialog-copy">Активное соединение будет безопасно остановлено контроллером. Перед сбросом backend обязан подтвердить восстановление принадлежащего RouteDeck состояния.</p></Dialog>
+        ><p className="dialog-copy">Активное подключение будет остановлено, а настройки RouteDeck — сброшены.</p></Dialog>
       ) : null}
     </div>
   );

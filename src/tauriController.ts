@@ -60,7 +60,7 @@ const emptyProofs = (): ConnectionProof[] => [
   { id: "local-ingress", label: "Локальный прокси", state: "idle", summary: "Не проверялся" },
   { id: "windows-mode", label: "Прокси Windows", state: "idle", summary: "Не включён" },
   { id: "outbound-proof", label: "VPN-маршрут", state: "idle", summary: "Не проверялся" },
-  { id: "egress-ip", label: "VPN egress IP", state: "skipped", summary: "Backend пока не измеряет egress IP" },
+  { id: "egress-ip", label: "VPN IP", state: "skipped", summary: "Пока не измеряется" },
 ];
 
 const defaultSettings = (): SettingsConfig => ({
@@ -108,8 +108,8 @@ const initialTauriSnapshot = (): ControllerSnapshot => ({
   notice: {
     id: "backend-initializing",
     kind: "info",
-    title: "Проверяем backend RouteDeck",
-    body: "Подключаемся к локальному контроллеру и сверяем его состояние.",
+    title: "Запускаем RouteDeck",
+    body: "Подготавливаем подключение.",
   },
   routing: loadRouting(),
   settings: defaultSettings(),
@@ -219,7 +219,7 @@ function projectIngressProof(status: RuntimeStatusDto): ConnectionProof {
     id: "local-ingress",
     label: "Локальный прокси",
     state,
-    summary: proofSummary(state, "Локальные listeners принадлежат sing-box"),
+    summary: proofSummary(state, "Локальный прокси работает"),
     value,
     durationMs: Math.max(0, ...members.map((proof) => proof.latencyMs ?? 0)) || undefined,
   };
@@ -234,7 +234,7 @@ export function projectRuntimeProofs(status: RuntimeStatusDto): ConnectionProof[
     "selected_outbound_https",
     "outbound-proof",
     "VPN-маршрут",
-    "HTTPS через выбранный outbound подтверждён",
+    "Соединение с сервером работает",
     status.routeCheckMs === undefined ? undefined : `${status.routeCheckMs} мс`,
   );
   const windowsProxy = projectSingleProof(
@@ -269,7 +269,7 @@ function runtimeNotice(status: RuntimeStatusDto): AppNotice | undefined {
       kind: "warning",
       title: "Локальный прокси проверен, но режим Windows не применён",
       body: `Трафик через выбранный сервер подтверждён на ${endpoint}. Системный прокси и TUN пока не включены, поэтому обычные приложения продолжают использовать прежний маршрут.`,
-      redactedDetail: "Это локальная проверка outbound, а не подтверждение системной маршрутизации.",
+      redactedDetail: "Обычные приложения продолжат использовать прежний маршрут, пока системный прокси не включён.",
     };
   }
   if (status.phase === "blocked_by_conflict" || status.error?.stage === "system_proxy_ownership") {
@@ -432,15 +432,15 @@ export class TauriController implements RouteDeckController {
     this.publish({
       backendAvailable: false,
       phase: "failed",
-      proofs: emptyProofs().map((proof) => ({ ...proof, state: "skipped", summary: "Backend недоступен" })),
+      proofs: emptyProofs().map((proof) => ({ ...proof, state: "skipped", summary: "Не удалось проверить" })),
       notice: {
         id: code,
         kind: "error",
-        title: code === "backend-response-invalid" ? "Backend вернул неожиданные данные" : "Backend RouteDeck недоступен",
+        title: code === "backend-response-invalid" ? "Не удалось обновить состояние" : "RouteDeck недоступен",
         body: code === "backend-response-invalid"
           ? "Не удалось прочитать состояние подключения. Перезапустите RouteDeck."
           : "Управление подключением сейчас недоступно. Перезапустите RouteDeck.",
-        redactedDetail: "Технические подробности ответа не показаны.",
+        redactedDetail: "Перезапустите RouteDeck и повторите попытку.",
       },
     });
   }

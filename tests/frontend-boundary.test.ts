@@ -93,7 +93,7 @@ test("URL import uses automatic backend transport without a renderer selector", 
   assert.doesNotMatch(source, /SubscriptionFetchTransport|subscriptionTransport|Транспорт HTTPS-загрузки|subscription-transport-help|current_loopback_system_proxy/);
   assert.doesNotMatch(model, /SubscriptionFetchTransport|current_loopback_system_proxy/);
   assert.doesNotMatch(styles, /subscription-transport/);
-  assert.match(source, /Поддерживаются подписки по HTTPS/);
+  assert.match(source, /Вставьте ссылку и нажмите «Импортировать»/);
   assert.match(source, /importing \? "Импортируем…" : "Импортировать"/);
   assert.doesNotMatch(source, /Источник подписки|importMethod|clipboardSource|file-adapter-note|import-preview/);
   assert.doesNotMatch(source, /Безопасно загрузить|опасные перенаправления|заблокирует .*локальные адреса/);
@@ -138,10 +138,21 @@ test("live System Proxy transition keeps final proof summary coherent", () => {
 });
 
 test("invalid backend copy stays simple and actionable", () => {
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const controllerSource = readFileSync(new URL("../src/tauriController.ts", import.meta.url), "utf8");
   const actionSource = readFileSync(new URL("../src/actionErrors.ts", import.meta.url), "utf8");
-  assert.doesNotMatch(`${controllerSource}\n${actionSource}`, /безопасно заблокирован|непроверенное состояние/i);
+  assert.doesNotMatch(`${appSource}\n${controllerSource}\n${actionSource}`, /безопасн(?:ый|ая|о|ую)|Backend RouteDeck|Windows-backend|Локальный backend|listeners принадлежат|outbound подтверждён|Снимок доказательств/i);
   assert.match(toPublicActionError(new RouteDeckError("backend-response-invalid")).message, /Перезапустите RouteDeck/);
+});
+
+test("home stays focused on connection controls while detailed checks remain in diagnostics", () => {
+  const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const home = source.slice(source.indexOf("function HomePage"), source.indexOf("function ServersPage"));
+  const diagnostics = source.slice(source.indexOf("function DiagnosticsPage"), source.indexOf("function Dialog"));
+  assert.doesNotMatch(home, /<ProofCard/);
+  assert.match(diagnostics, /<ProofCard proofs=\{snapshot\.diagnostics\.steps\} title="Проверки"/);
+  assert.match(source, /<small>VPN-клиент<\/small>/);
+  assert.doesNotMatch(source, /Добавить · скоро|Этот вариант появится позже|advanced-settings/);
 });
 
 test("revision gate rejects a stale initial snapshot after a newer event", () => {
