@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-running-applications"
+description = "Enables the list_running_applications command without any pre-configured scope."
+commands.allow = ["list_running_applications"]
+
+[[permission]]
+identifier = "deny-list-running-applications"
+description = "Denies the list_running_applications command without any pre-configured scope."
+commands.deny = ["list_running_applications"]

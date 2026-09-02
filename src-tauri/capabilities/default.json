@@ -10,11 +10,16 @@
     "allow-confirm-import",
     "allow-start-local-proxy",
     "allow-start-system-proxy",
+    "allow-start-tun",
     "allow-runtime-status",
+    "allow-confirmed-nodes",
+    "allow-reset-local-state",
     "allow-stop-local-proxy",
     "allow-stop-system-proxy",
+    "allow-stop-tun",
     "allow-retry-session-recovery",
     "allow-runtime-diagnostics",
+    "allow-list-running-applications",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]
