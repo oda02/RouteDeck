@@ -9,6 +9,7 @@ import {
   ContractViolation,
   RuntimeRevisionGate,
   parsePublicError,
+  parseRunningApplications,
   parseRuntimeStatus,
   parseUnitResponse,
   type RuntimeStatusDto,
@@ -20,13 +21,14 @@ import {
 } from "../src/tauriController.ts";
 
 function runtimeStatus(revision: number, phase: RuntimeStatusDto["phase"]): RuntimeStatusDto {
-  const ready = phase === "local_proxy_ready" || phase === "system_proxy_ready";
+  const ready = phase === "local_proxy_ready" || phase === "system_proxy_ready" || phase === "tun_ready";
   const systemProxy = phase === "system_proxy_ready";
+  const tun = phase === "tun_ready";
   return {
     revision,
     sessionId: phase === "disconnected" ? undefined : "fixture-session",
-    scope: systemProxy ? "system_proxy" : "local_only",
-    mode: systemProxy ? "system_proxy" : "local_only",
+    scope: tun ? "tun" : systemProxy ? "system_proxy" : "local_only",
+    mode: tun ? "tun" : systemProxy ? "system_proxy" : "local_only",
     phase,
     nodeId: phase === "disconnected" ? undefined : "fixture-node",
     ports: phase === "disconnected" ? undefined : { http: 24080, socks: 24081, health: 24082 },
@@ -42,6 +44,15 @@ function runtimeStatus(revision: number, phase: RuntimeStatusDto["phase"]): Runt
       { kind: "local_scope_ownership", state: phase === "disconnected" ? "not_run" : "passed" },
       { kind: "system_proxy_ownership", state: systemProxy ? "passed" : "not_run" },
     ],
+  };
+}
+
+function withEmptyConfirmedNodes(transport: TauriTransport): TauriTransport {
+  return {
+    ...transport,
+    invoke: (command, arguments_) => command === "confirmed_nodes"
+      ? Promise.resolve([])
+      : transport.invoke(command, arguments_),
   };
 }
 
@@ -120,6 +131,19 @@ test("verified System Proxy readiness maps to Connected", () => {
   );
 });
 
+test("verified TUN readiness maps to Connected without pretending to own System Proxy", () => {
+  const ready = runtimeStatus(6, "tun_ready");
+  assert.equal(runtimePhaseToConnectionPhase("tun_ready"), "connected");
+  assert.doesNotThrow(() => parseRuntimeStatus(ready));
+  assert.throws(() => parseRuntimeStatus({ ...ready, scope: "system_proxy", mode: "system_proxy" }), ContractViolation);
+  assert.throws(() => parseRuntimeStatus({
+    ...ready,
+    proofs: ready.proofs.map((proof) => proof.kind === "system_proxy_ownership"
+      ? { ...proof, state: "passed" as const }
+      : proof),
+  }), ContractViolation);
+});
+
 test("live System Proxy transition keeps final proof summary coherent", () => {
   const ready = runtimeStatus(9, "system_proxy_ready");
   const applying = {
@@ -155,6 +179,18 @@ test("home stays focused on connection controls while detailed checks remain in 
   assert.doesNotMatch(source, /Добавить · скоро|Этот вариант появится позже|advanced-settings/);
 });
 
+test("TUN and application routing use ordinary-client copy without extra ceremonies", () => {
+  const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  assert.match(source, /value: "tun", label: "TUN · скоро", disabled: true/);
+  assert.match(source, /Добавить приложение/);
+  assert.match(source, /controller\.listRunningApplications\(\)/);
+  assert.match(source, /route: draft\.defaultRoute === "direct" \? "vpn" : "direct"/);
+  assert.match(source, /Правила отдельных приложений применяются в режиме TUN/);
+  assert.doesNotMatch(source, /tun-preflight|nested|Физический адаптер|security mode|режим безопасности/i);
+  assert.doesNotMatch(source, /запустите .*администратор/i);
+  assert.doesNotMatch(source, /Проверить задержки|controller\.refreshServers/);
+});
+
 test("revision gate rejects a stale initial snapshot after a newer event", () => {
   const gate = new RuntimeRevisionGate();
   assert.equal(gate.accept(runtimeStatus(2, "local_proxy_ready")), true);
@@ -174,7 +210,7 @@ test("listen-first initialization preserves the event that wins the snapshot rac
       return runtimeStatus(1, "disconnected");
     },
   };
-  const controller = new TauriController(async () => transport);
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
 
   const snapshot = controller.getSnapshot();
@@ -187,13 +223,85 @@ test("listen-first initialization preserves the event that wins the snapshot rac
   assert.equal(unlistenCalls, 1);
 });
 
+test("cold initialization restores public nodes and follows an active TUN runtime", async () => {
+  const calls: string[] = [];
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command) => {
+      calls.push(command);
+      if (command === "runtime_status") return runtimeStatus(7, "tun_ready");
+      if (command === "confirmed_nodes") return [{
+        id: "fixture-node",
+        displayName: "Restored HY2",
+        protocol: "hysteria2",
+        insecureTls: false,
+      }];
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+
+  const snapshot = controller.getSnapshot();
+  assert.equal(snapshot.mode, "tun");
+  assert.equal(snapshot.runtimeScope, "tun");
+  assert.equal(snapshot.selectedServerId, "fixture-node");
+  assert.equal(snapshot.subscriptionName, "Подписка");
+  assert.deepEqual(snapshot.servers, [{
+    id: "fixture-node",
+    name: "Restored HY2",
+    country: "—",
+    protocol: "Hysteria2",
+    detail: "Импортировано из подписки",
+    source: "Подписка",
+    latencyState: "ready",
+    latencyMs: 84,
+    checkedAt: "сейчас",
+  }]);
+  assert.deepEqual(calls, ["runtime_status", "confirmed_nodes"]);
+  assert.doesNotMatch(JSON.stringify(snapshot), /https?:\/\//);
+  controller.dispose();
+});
+
+test("runtime event received while nodes restore wins the server latency race", async () => {
+  let emitRuntime!: (payload: unknown) => void;
+  const transport: TauriTransport = {
+    listen: async (_event, handler) => {
+      emitRuntime = handler;
+      return () => undefined;
+    },
+    invoke: async (command) => {
+      if (command === "runtime_status") return runtimeStatus(1, "system_proxy_ready");
+      if (command === "confirmed_nodes") {
+        emitRuntime(runtimeStatus(2, "disconnected"));
+        return [{
+          id: "fixture-node",
+          displayName: "Restored VLESS",
+          protocol: "vless",
+          insecureTls: false,
+        }];
+      }
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+
+  const snapshot = controller.getSnapshot();
+  assert.equal(snapshot.phase, "disconnected");
+  assert.equal(snapshot.servers[0]?.latencyState, "unavailable");
+  assert.equal(snapshot.servers[0]?.latencyMs, undefined);
+  assert.equal(snapshot.servers[0]?.checkedAt, undefined);
+  controller.dispose();
+});
+
 test("malformed runtime DTO fails closed without surfacing raw payload", async () => {
   const secret = "fixture-super-secret";
   const transport: TauriTransport = {
     listen: async () => () => undefined,
     invoke: async () => ({ ...runtimeStatus(1, "local_proxy_ready"), revision: "bad", leaked: secret }),
   };
-  const controller = new TauriController(async () => transport);
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
 
   const snapshot = controller.getSnapshot();
@@ -213,6 +321,20 @@ test("schema validator rejects duplicate proofs and invalid enum values", () => 
     () => parseRuntimeStatus({ ...runtimeStatus(1, "disconnected"), scope: "system_proxy" }),
     ContractViolation,
   );
+});
+
+test("running application contract is finite, exact, and deduplicated by executable", () => {
+  const applications = [{
+    processName: "browser.exe",
+    executablePath: "C:\\Apps\\Browser.exe",
+    displayName: "Browser.exe",
+  }];
+  assert.deepEqual(parseRunningApplications(applications), applications);
+  assert.throws(() => parseRunningApplications([{ ...applications[0], pid: 7 }]), ContractViolation);
+  assert.throws(() => parseRunningApplications([
+    applications[0],
+    { ...applications[0], executablePath: "c:/apps/browser.exe" },
+  ]), ContractViolation);
 });
 
 test("subscription fetch errors require the exact finite contract", () => {
@@ -310,7 +432,7 @@ test("cancelled import cannot retain or publish a late preview", async () => {
       throw new Error("unexpected command");
     },
   };
-  const controller = new TauriController(async () => transport);
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
   const pending = controller.previewSubscription({ type: "clipboard", value: "vless://hidden-fixture" });
   await previewInvoked;
@@ -340,7 +462,7 @@ test("cancelled import waiting for transport never sends secret-bearing IPC", as
       throw new Error("unexpected command");
     },
   };
-  const controller = new TauriController(async () => loader);
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(await loader));
   const pending = controller.previewSubscription({ type: "url", value: secret });
   controller.cancelImportPreview();
   resolveLoader(transport);
@@ -369,7 +491,7 @@ test("HTTPS URL preview uses the exact typed command and retains no secret", asy
       throw new Error("unexpected command");
     },
   };
-  const controller = new TauriController(async () => transport);
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
   const preview = await controller.previewSubscription({ type: "url", value: secret });
   assert.deepEqual(calls[1], { command: "preview_import_url", arguments_: { url: secret } });
@@ -395,7 +517,7 @@ test("automatic URL fetch failure performs one backend request", async () => {
       throw new Error("unexpected command");
     },
   };
-  const controller = new TauriController(async () => transport);
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
   await assert.rejects(
     controller.previewSubscription({ type: "url", value: secret }),
@@ -433,7 +555,7 @@ test("stale HTTPS URL preview is discarded without publishing its secret", async
       throw new Error("unexpected command");
     },
   };
-  const controller = new TauriController(async () => transport);
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
   const pending = controller.previewSubscription({ type: "url", value: secret });
   await previewInvoked;
@@ -468,7 +590,7 @@ test("HTTPS fetch failures map to finite localized errors without backend detail
       throw new Error("unexpected command");
     },
   };
-  const controller = new TauriController(async () => transport);
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
   for (const [code, stage, message, expectedCode] of cases) {
     const secret = `https://provider.example/${code}?token=never-display`;
@@ -506,7 +628,7 @@ test("known import rejection is localized instead of masked as a runtime failure
       throw new Error("unexpected command");
     },
   };
-  const controller = new TauriController(async () => transport);
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
 
   await assert.rejects(
@@ -540,7 +662,7 @@ test("malformed backend error closes the renderer boundary", async () => {
       throw new Error("unexpected command");
     },
   };
-  const controller = new TauriController(async () => transport);
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
 
   await assert.rejects(
@@ -572,7 +694,7 @@ test("closing a known preview discards its opaque token with exact arguments", a
       throw new Error("unexpected command");
     },
   };
-  const controller = new TauriController(async () => transport);
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
   await controller.previewSubscription({ type: "clipboard", value: "vless://hidden-fixture" });
   controller.cancelImportPreview();
@@ -604,7 +726,7 @@ test("cancel during confirm cannot hide the reconciled import result", async () 
       throw new Error("unexpected command");
     },
   };
-  const controller = new TauriController(async () => transport);
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
   const preview = await controller.previewSubscription({ type: "clipboard", value: "hysteria2://hidden-fixture" });
   const confirming = controller.commitSubscription(preview);
@@ -621,7 +743,7 @@ test("System Proxy routing is saved for the next connection while unsupported se
     listen: async () => () => undefined,
     invoke: async () => runtimeStatus(1, "disconnected"),
   };
-  const controller = new TauriController(async () => transport);
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
   assert.equal(controller.getSnapshot().runtimeScope, "system-proxy");
   await controller.applyRouting({ defaultRoute: "vpn", apps: [] });
@@ -649,7 +771,7 @@ test("connect and disconnect use the typed System Proxy commands and routing dra
       throw new Error("unexpected command");
     },
   };
-  const controller = new TauriController(async () => transport);
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
   const preview = await controller.previewSubscription({ type: "clipboard", value: "fixture" });
   await controller.commitSubscription(preview);
@@ -666,12 +788,114 @@ test("connect and disconnect use the typed System Proxy commands and routing dra
         nodeId: "fixture-node",
         routing: {
           defaultRoute: "direct",
-          apps: [{ processPath: "C:\\Apps\\browser.exe", processName: "browser.exe", route: "vpn" }],
+          apps: [],
         },
       },
     },
     { command: "stop_system_proxy", arguments_: undefined },
   ]);
+  controller.dispose();
+});
+
+test("TUN controller path uses typed start and stop commands with current routing", async () => {
+  const calls: Array<{ command: string; arguments_?: Record<string, unknown> }> = [];
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command, arguments_) => {
+      calls.push({ command, arguments_ });
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "preview_import_content") return {
+        previewId: "preview-tun",
+        nodes: [{ id: "fixture-node", displayName: "Fixture", protocol: "hysteria2", insecureTls: false }],
+        rejected: [],
+        warnings: [],
+      };
+      if (command === "confirm_import") return { imported: 1, nodeIds: ["fixture-node"] };
+      if (command === "start_tun") return runtimeStatus(2, "tun_ready");
+      if (command === "stop_tun") return runtimeStatus(3, "disconnected");
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
+  await controller.ready();
+  const preview = await controller.previewSubscription({ type: "clipboard", value: "fixture" });
+  await controller.commitSubscription(preview);
+  controller.setMode("tun");
+  await controller.applyRouting({
+    defaultRoute: "vpn",
+    apps: [{ id: "browser", name: "Browser", path: "C:\\Apps\\browser.exe", route: "direct" }],
+  });
+  await controller.connect();
+  assert.equal(controller.getSnapshot().runtimeScope, "tun");
+  await controller.disconnect();
+  assert.deepEqual(calls.slice(-2), [
+    {
+      command: "start_tun",
+      arguments_: {
+        nodeId: "fixture-node",
+        routing: {
+          defaultRoute: "vpn",
+          apps: [{ processPath: "C:\\Apps\\browser.exe", processName: "browser.exe", route: "direct" }],
+        },
+      },
+    },
+    { command: "stop_tun", arguments_: undefined },
+  ]);
+  controller.dispose();
+});
+
+test("ordinary TUN privilege failure maps to plain finite copy", async () => {
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command) => {
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "preview_import_content") return {
+        previewId: "preview-tun-admin",
+        nodes: [{ id: "fixture-node", displayName: "Fixture", protocol: "hysteria2", insecureTls: false }],
+        rejected: [],
+        warnings: [],
+      };
+      if (command === "confirm_import") return { imported: 1, nodeIds: ["fixture-node"] };
+      if (command === "start_tun") throw {
+        code: "runtime_failure",
+        stage: "start",
+        message: "TUN requires RouteDeck to be run as administrator",
+      };
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
+  await controller.ready();
+  const preview = await controller.previewSubscription({ type: "clipboard", value: "fixture" });
+  await controller.commitSubscription(preview);
+  controller.setMode("tun");
+  await assert.rejects(controller.connect(), { code: "tun-admin-required" });
+  const message = toPublicActionError(new RouteDeckError("tun-admin-required")).message;
+  assert.match(message, /TUN пока недоступен/);
+  assert.doesNotMatch(message, /administrator|администратор|elevat/i);
+  controller.dispose();
+});
+
+test("running application picker uses one typed finite backend call", async () => {
+  const calls: string[] = [];
+  const applications = [{
+    processName: "browser.exe",
+    executablePath: "C:\\Apps\\browser.exe",
+    displayName: "Browser.exe",
+  }];
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command) => {
+      calls.push(command);
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "list_running_applications") return applications;
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
+  await controller.ready();
+  assert.deepEqual(await controller.listRunningApplications(), applications);
+  assert.equal(calls.filter((command) => command === "list_running_applications").length, 1);
   controller.dispose();
 });
 
@@ -697,7 +921,7 @@ test("runtime detail is available only as expandable detail while the main error
       throw new Error("unexpected command");
     },
   };
-  const controller = new TauriController(async () => transport);
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
   const preview = await controller.previewSubscription({ type: "clipboard", value: "fixture" });
   await controller.commitSubscription(preview);
@@ -719,7 +943,7 @@ test("malformed diagnostics always clears the running flag and fails closed", as
       ? runtimeStatus(1, "disconnected")
       : { status: { ...runtimeStatus(2, "disconnected"), unexpected: true }, lines: [] },
   };
-  const controller = new TauriController(async () => transport);
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
   await assert.rejects(controller.runDiagnostics(), { code: "backend-response-invalid" });
   assert.equal(controller.getSnapshot().diagnostics.running, false);
@@ -734,7 +958,7 @@ test("runtime diagnostics is labelled as a received snapshot, not a fresh proof 
       ? runtimeStatus(1, "disconnected")
       : { status: runtimeStatus(2, "disconnected"), lines: ["sanitized"] },
   };
-  const controller = new TauriController(async () => transport);
+  const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
   await controller.runDiagnostics();
   const diagnostics = controller.getSnapshot().diagnostics;

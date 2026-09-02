@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useDeferredValue,
   useEffect,
   useId,
   useMemo,
@@ -20,7 +21,7 @@ import {
   ImportIcon,
   InfoIcon,
   LoaderIcon,
-  RefreshIcon,
+  PlusIcon,
   RoutingIcon,
   SearchIcon,
   ServersIcon,
@@ -41,11 +42,11 @@ import {
   type ControllerSnapshot,
   type Destination,
   type RoutingConfig,
+  type RunningApplication,
   type SettingsConfig,
-  type TunPathChoice,
 } from "./model";
 
-type DialogKind = "import" | "tun-preflight" | "mode-change" | "reset" | null;
+type DialogKind = "import" | "mode-change" | "reset" | null;
 type ToastKind = "success" | "info" | "warning";
 type ToastState = { message: string; kind: ToastKind };
 type ActionFailure = { page: Destination; notice: AppNotice; retry?: () => void };
@@ -281,9 +282,11 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
   const boundaryNotice = snapshot.notice?.id === "backend-unavailable" || snapshot.notice?.id === "backend-response-invalid";
   const vpnApps = snapshot.routing.apps.filter((app) => app.route === "vpn");
   const directApps = snapshot.routing.apps.filter((app) => app.route === "direct");
-  const routeSummary = snapshot.routing.defaultRoute === "direct"
-    ? `Прокси Windows: напрямую · ${vpnApps.length} ${vpnApps.length === 1 ? "исключение" : "исключений"} через VPN`
-    : `Прокси Windows: через VPN · ${directApps.length} исключений напрямую`;
+  const routeSummary = snapshot.mode === "tun"
+    ? snapshot.routing.defaultRoute === "direct"
+      ? `TUN: напрямую · ${vpnApps.length} ${vpnApps.length === 1 ? "исключение" : "исключений"} через VPN`
+      : `TUN: через VPN · ${directApps.length} исключений напрямую`
+    : `Прокси Windows: ${snapshot.routing.defaultRoute === "direct" ? "напрямую" : "через VPN"}`;
 
   return (
     <div className="page home-page">
@@ -326,7 +329,9 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
           <p>
             {localDiagnostic
               ? "Диагностическая сессия проверяет локальные HTTP/SOCKS-порты и не меняет настройки Windows."
-              : "Подключает трафик приложений, которые используют прокси Windows. Общий маршрут и исключения задаются в разделе «Правила»."}
+              : snapshot.mode === "tun"
+                ? "Перехватывает трафик через виртуальный адаптер. Обычный запуск станет доступен после добавления запроса прав Windows."
+                : "Подключает приложения, которые используют прокси Windows. Общий маршрут задаётся в разделе «Правила»."}
           </p>
         </div>
       </section>
@@ -356,7 +361,7 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
         <span className="selection-copy">
           <span className="selection-label">Маршрутизация</span>
           <strong>{routeSummary}</strong>
-          <span>Для приложений, которые используют прокси Windows</span>
+          <span>{snapshot.mode === "tun" ? "Общий маршрут и исключения для приложений" : "Для приложений, которые используют прокси Windows"}</span>
         </span>
         <ChevronRightIcon size={20} />
       </button>
@@ -364,34 +369,19 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
   );
 }
 
-function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onToast, runAsyncAction, actionFailure, onClearFailure }: {
+function ServersPage({ snapshot, headingRef, search, onSearch, onImport, actionFailure, onClearFailure }: {
   snapshot: ControllerSnapshot;
   headingRef: React.RefObject<HTMLHeadingElement | null>;
   search: string;
   onSearch: (value: string) => void;
   onImport: () => void;
-  onToast: (message: string, kind?: ToastKind) => void;
-  runAsyncAction: RunAsyncAction;
   actionFailure: ActionFailure | null;
   onClearFailure: () => void;
 }) {
-  const [refreshing, setRefreshing] = useState(false);
   const filtered = useMemo(() => {
     const query = search.trim().toLocaleLowerCase("ru-RU");
     return snapshot.servers.filter((server) => !query || `${server.country} ${server.name} ${server.protocol}`.toLocaleLowerCase("ru-RU").includes(query));
   }, [search, snapshot.servers]);
-
-  const refresh = () => {
-    if (refreshing) return;
-    void runAsyncAction({
-      page: "servers",
-      title: "Не удалось проверить задержки серверов",
-      setBusy: setRefreshing,
-      action: controller.refreshServers,
-      retry: refresh,
-      onSuccess: () => onToast("Задержки серверов обновлены", "success"),
-    });
-  };
 
   return (
     <div className="page">
@@ -407,9 +397,6 @@ function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onToast
           <SearchIcon size={18} />
           <input value={search} type="search" placeholder="Поиск по имени или протоколу" onChange={(event) => onSearch(event.target.value)} />
         </label>
-        <button className="icon-button bordered" type="button" aria-label="Проверить задержки" title="Проверить задержки" disabled={refreshing} onClick={refresh}>
-          {refreshing ? <LoaderIcon size={19} /> : <RefreshIcon size={19} />}
-        </button>
       </div>
       <div className="subscription-meta">
         <span><strong>{snapshot.subscriptionName}</strong> · обновлено {snapshot.subscriptionUpdatedAt}</span>
@@ -456,11 +443,27 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
   onClearFailure: () => void;
 }) {
   const [applying, setApplying] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerLoading, setPickerLoading] = useState(false);
+  const [pickerSearch, setPickerSearch] = useState("");
+  const [pickerError, setPickerError] = useState("");
+  const [runningApplications, setRunningApplications] = useState<RunningApplication[]>([]);
+  const deferredPickerSearch = useDeferredValue(pickerSearch);
   const connectionActive = snapshot.phase !== "disconnected" && snapshot.phase !== "failed";
   const dirty = JSON.stringify(draft) !== JSON.stringify(snapshot.routing);
-  const summary = draft.defaultRoute === "direct"
-    ? `Трафик прокси Windows по умолчанию напрямую · ${draft.apps.filter((app) => app.route === "vpn").length} исключений через VPN`
-    : `Трафик прокси Windows по умолчанию через VPN · ${draft.apps.filter((app) => app.route === "direct").length} исключений напрямую`;
+  const summary = snapshot.mode === "tun"
+    ? draft.defaultRoute === "direct"
+      ? `TUN: по умолчанию напрямую · ${draft.apps.filter((app) => app.route === "vpn").length} исключений через VPN`
+      : `TUN: по умолчанию через VPN · ${draft.apps.filter((app) => app.route === "direct").length} исключений напрямую`
+    : `Прокси Windows: по умолчанию ${draft.defaultRoute === "direct" ? "напрямую" : "через VPN"}`;
+  const selectedPaths = useMemo(() => new Set(
+    draft.apps.map((app) => app.path.replaceAll("/", "\\").toLocaleLowerCase("en-US")),
+  ), [draft.apps]);
+  const filteredApplications = useMemo(() => {
+    const query = deferredPickerSearch.trim().toLocaleLowerCase("ru-RU");
+    return runningApplications.filter((application) => !query
+      || `${application.displayName} ${application.processName} ${application.executablePath}`.toLocaleLowerCase("ru-RU").includes(query));
+  }, [deferredPickerSearch, runningApplications]);
 
   const updateApp = (id: string, route: AppRouteChoice) => onDraftChange({
     ...draft,
@@ -476,6 +479,33 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
       action: onApply,
       retry: apply,
       onSuccess: () => onToast("Правила маршрутизации применены", "success"),
+    });
+  };
+
+  const openApplicationPicker = () => {
+    if (connectionActive || pickerLoading) return;
+    setPickerOpen(true);
+    setPickerLoading(true);
+    setPickerSearch("");
+    setPickerError("");
+    void controller.listRunningApplications()
+      .then(setRunningApplications)
+      .catch((error) => setPickerError(toPublicActionError(error).message))
+      .finally(() => setPickerLoading(false));
+  };
+
+  const addApplication = (application: RunningApplication) => {
+    const canonicalPath = application.executablePath.replaceAll("/", "\\").toLocaleLowerCase("en-US");
+    if (selectedPaths.has(canonicalPath)) return;
+    const name = application.displayName.replace(/\.exe$/i, "") || application.displayName;
+    onDraftChange({
+      ...draft,
+      apps: [...draft.apps, {
+        id: canonicalPath,
+        name,
+        path: application.executablePath,
+        route: draft.defaultRoute === "direct" ? "vpn" : "direct",
+      }],
     });
   };
 
@@ -498,11 +528,16 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
         <p className="effective-summary"><RoutingIcon size={18} />{summary}</p>
       </section>
 
-      <OpaqueNotice notice={{ id: "proxy-routing-scope", kind: "info", title: "Правила готовы для следующего подключения", body: "Они управляют только трафиком приложений, которые используют прокси Windows. Правила отдельных приложений применяются по возможности; остальные приложения могут продолжить работать напрямую." }} />
+      <OpaqueNotice notice={snapshot.mode === "tun"
+        ? { id: "tun-routing-scope", kind: "info", title: "Правила применятся при следующем подключении", body: "TUN использует общий маршрут для трафика Windows, а выбранные приложения — как исключения." }
+        : { id: "proxy-routing-scope", kind: "info", title: "Системный прокси", body: "Общий маршрут действует для приложений, которые используют прокси Windows. Правила отдельных приложений применяются в режиме TUN." }} />
 
       <section className="card app-rules-card">
         <div className="section-heading">
           <div><p className="overline">Исключения</p><h2>Приложения</h2></div>
+          <button className="secondary-button compact-action" type="button" disabled={connectionActive || pickerLoading} onClick={openApplicationPicker} title={connectionActive ? "Сначала отключитесь, чтобы изменить правила" : undefined}>
+            {pickerLoading ? <LoaderIcon size={18} /> : <PlusIcon size={18} />}Добавить приложение
+          </button>
         </div>
         <div className="app-rule-list">
           {draft.apps.length > 0 ? draft.apps.map((app) => (
@@ -520,14 +555,16 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
                 disabled={connectionActive}
               />
               <p className="rule-effective">
-                {app.route === "direct" ? "По возможности: прокси-трафик приложения напрямую" : app.route === "vpn" ? "По возможности: прокси-трафик приложения через VPN" : `Использует общий маршрут: ${draft.defaultRoute === "direct" ? "напрямую" : "VPN"}`}
+                {snapshot.mode === "tun"
+                  ? `В TUN: трафик приложения ${app.route === "direct" ? "напрямую" : "через VPN"}`
+                  : "Это правило применяется в режиме TUN"}
               </p>
             </div>
           )) : (
             <div className="empty-state">
               <RoutingIcon size={24} />
               <strong>Исключений пока нет</strong>
-              <span>Трафик, дошедший до прокси Windows, использует общий маршрут.</span>
+              <span>{snapshot.mode === "tun" ? "Добавьте запущенное приложение, чтобы задать ему другой маршрут." : "Правила приложений используются в режиме TUN."}</span>
             </div>
           )}
         </div>
@@ -535,6 +572,40 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
       <button className="primary-button" type="button" disabled={connectionActive || !dirty || applying} aria-busy={applying} onClick={apply} title={connectionActive ? "Сначала отключитесь, чтобы изменить правила" : undefined}>
         {applying ? <LoaderIcon size={20} /> : <CheckIcon size={20} />}{applying ? "Сохраняем…" : "Сохранить правила"}
       </button>
+
+      {pickerOpen ? (
+        <Dialog
+          title="Добавить приложение"
+          description="Выберите приложение из запущенных сейчас."
+          focusKey="application-picker-search"
+          onClose={() => setPickerOpen(false)}
+          busy={pickerLoading}
+          actions={<button className="secondary-button" type="button" onClick={() => setPickerOpen(false)}>Готово</button>}
+        >
+          {pickerLoading ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><LoaderIcon size={17} />Ищем запущенные приложения…</p> : (
+            <>
+              <label className="search-field application-search" htmlFor="application-picker-search">
+                <SearchIcon size={18} /><span className="sr-only">Поиск приложений</span>
+                <input id="application-picker-search" value={pickerSearch} onChange={(event) => setPickerSearch(event.target.value)} placeholder="Найти приложение" autoComplete="off" data-autofocus />
+              </label>
+              {pickerError ? <p className="field-error" role="alert">{pickerError}</p> : null}
+              {!pickerError ? <div className="application-picker-list">
+                {filteredApplications.length > 0 ? filteredApplications.map((application) => {
+                  const canonicalPath = application.executablePath.replaceAll("/", "\\").toLocaleLowerCase("en-US");
+                  const added = selectedPaths.has(canonicalPath);
+                  return (
+                    <button className="application-picker-row" type="button" disabled={added} onClick={() => addApplication(application)} key={canonicalPath}>
+                      <span className="app-monogram" aria-hidden="true">{application.displayName.slice(0, 1).toUpperCase()}</span>
+                      <span className="app-copy"><strong>{application.displayName}</strong><span title={application.executablePath}>{application.executablePath}</span></span>
+                      <span className="picker-row-state">{added ? "Добавлено" : draft.defaultRoute === "direct" ? "Через VPN" : "Напрямую"}</span>
+                    </button>
+                  );
+                }) : <div className="empty-state compact-empty"><SearchIcon size={22} /><strong>Приложения не найдены</strong><span>{pickerSearch ? "Измените запрос." : "Запустите приложение и откройте список снова."}</span></div>}
+              </div> : null}
+            </>
+          )}
+        </Dialog>
+      ) : null}
     </div>
   );
 }
@@ -758,8 +829,6 @@ export default function App() {
   const [activePage, setActivePage] = useState<Destination>("home");
   const [dialog, setDialog] = useState<DialogKind>(null);
   const [pendingMode, setPendingMode] = useState<ConnectionMode | null>(null);
-  const [tunChoice, setTunChoice] = useState<"" | "nested" | "physical">("");
-  const [adapterId, setAdapterId] = useState(snapshot.environment.physicalAdapters[0]?.id ?? "");
   const [search, setSearch] = useState("");
   const [routingDraft, setRoutingDraft] = useState<RoutingConfig>(snapshot.routing);
   const [settingsDraft, setSettingsDraft] = useState<SettingsConfig>(snapshot.settings);
@@ -886,31 +955,11 @@ export default function App() {
   };
 
   const handleConnect = () => {
-    if (snapshot.mode === "tun" && snapshot.environment.otherVpnDetected) {
-      setTunChoice("");
-      setDialog("tun-preflight");
-      return;
-    }
     void runAsyncAction({
       page: "home",
-      title: "Не удалось подключиться",
+      title: snapshot.mode === "tun" ? "Не удалось запустить TUN" : "Не удалось подключиться",
       action: () => controller.connect(),
       retry: handleConnect,
-    });
-  };
-
-  const connectTun = () => {
-    if (!tunChoice) return;
-    const choice: TunPathChoice = tunChoice === "nested" ? { type: "nested" } : { type: "physical", adapterId };
-    closeDialog();
-    void runAsyncAction({
-      page: "home",
-      title: "Не удалось запустить TUN",
-      action: () => controller.connect(choice),
-      retry: () => {
-        setTunChoice("");
-        setDialog("tun-preflight");
-      },
     });
   };
 
@@ -983,7 +1032,7 @@ export default function App() {
       case "home":
         return <HomePage snapshot={snapshot} headingRef={headingRef} onNavigate={navigate} onModeChange={handleModeChange} onConnect={handleConnect} onDisconnect={disconnect} onRetry={retryConnection} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "servers":
-        return <ServersPage snapshot={snapshot} headingRef={headingRef} search={search} onSearch={setSearch} onImport={() => { invalidateImport(); clearSubscriptionUrl(); setDialog("import"); }} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
+        return <ServersPage snapshot={snapshot} headingRef={headingRef} search={search} onSearch={setSearch} onImport={() => { invalidateImport(); clearSubscriptionUrl(); setDialog("import"); }} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "routing":
         return <RoutingPage snapshot={snapshot} headingRef={headingRef} draft={routingDraft} onDraftChange={setRoutingDraft} onApply={applyRouting} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "settings":
@@ -1034,22 +1083,6 @@ export default function App() {
               {importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}
             </div>
           </form>
-        </Dialog>
-      ) : null}
-
-      {dialog === "tun-preflight" ? (
-        <Dialog
-          title="Обнаружен другой VPN"
-          description="Выберите, как RouteDeck будет работать вместе с текущим VPN."
-          onClose={closeDialog}
-          actions={<><button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Отмена</button><button className="primary-button dialog-primary" type="button" disabled={!tunChoice || (tunChoice === "physical" && !adapterId)} onClick={connectTun}><ShieldIcon size={19} />Продолжить</button></>}
-        >
-          <div className="choice-list">
-            <label className="choice-card" data-selected={tunChoice === "nested"}><input type="radio" name="tun-path" checked={tunChoice === "nested"} onChange={() => setTunChoice("nested")} /><span><strong>Через текущий VPN</strong><small>RouteDeck будет вложен в существующий путь. Результат помечается как nested.</small></span></label>
-            <label className="choice-card" data-selected={tunChoice === "physical"}><input type="radio" name="tun-path" checked={tunChoice === "physical"} onChange={() => setTunChoice("physical")} /><span><strong>Через физический адаптер</strong><small>Использовать выбранный сетевой адаптер напрямую.</small></span></label>
-          </div>
-          {tunChoice === "physical" ? <label className="dialog-field"><span>Физический адаптер</span><select value={adapterId} onChange={(event) => setAdapterId(event.target.value)}>{snapshot.environment.physicalAdapters.map((adapter) => <option value={adapter.id} key={adapter.id}>{adapter.label}</option>)}</select></label> : null}
-          <div className="persistent-hint" data-kind="warning"><WarningIcon size={18} /><p>После запуска RouteDeck проверит соединение с выбранным сервером.</p></div>
         </Dialog>
       ) : null}
 

@@ -64,6 +64,12 @@ export interface RoutingConfig {
   apps: AppRule[];
 }
 
+export interface RunningApplication {
+  processName: string;
+  executablePath: string;
+  displayName: string;
+}
+
 export type ThemePreference = "dark" | "light" | "system";
 export type CloseBehavior = "tray" | "exit";
 export type ProxyConflictPolicy = "never-overwrite" | "ask";
@@ -108,7 +114,7 @@ export interface DiagnosticsState {
 
 export interface ControllerSnapshot {
   isDemo: boolean;
-  runtimeScope: "demo" | "system-proxy" | "local-only" | "unavailable";
+  runtimeScope: "demo" | "system-proxy" | "tun" | "local-only" | "unavailable";
   backendAvailable: boolean;
   phase: ConnectionPhase;
   mode: ConnectionMode;
@@ -140,6 +146,7 @@ export type RouteDeckErrorCode =
   | "backend-unavailable"
   | "backend-response-invalid"
   | "capability-unavailable"
+  | "tun-admin-required"
   | "runtime-failure"
   | "node-not-selected"
   | "subscription-import-rejected"
@@ -178,6 +185,7 @@ export interface RouteDeckController {
   previewSubscription: (source: SubscriptionImportSource) => Promise<SubscriptionPreview>;
   cancelImportPreview: () => void;
   commitSubscription: (preview: SubscriptionPreview) => Promise<void>;
+  listRunningApplications: () => Promise<RunningApplication[]>;
   applyRouting: (routing: RoutingConfig) => Promise<void>;
   saveSettings: (settings: SettingsConfig) => Promise<void>;
   runDiagnostics: () => Promise<void>;

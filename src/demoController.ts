@@ -332,6 +332,12 @@ class DevelopmentDemoController implements RouteDeckController {
     this.publish({ subscriptionName: "DEMO imported provider", subscriptionUpdatedAt: "только что" });
   };
 
+  listRunningApplications = async () => this.snapshot.routing.apps.map((app) => ({
+    processName: app.path.split(/[\\/]/).at(-1) ?? app.name,
+    executablePath: app.path,
+    displayName: app.name,
+  }));
+
   applyRouting = async (routing: RoutingConfig) => {
     await wait(240);
     this.publish({ routing });

@@ -9,6 +9,7 @@ const runtimePhases = [
   "applying_system_proxy",
   "local_proxy_ready",
   "system_proxy_ready",
+  "tun_ready",
   "restoring_system_proxy",
   "blocked_by_conflict",
   "degraded",
@@ -98,8 +99,8 @@ export interface RuntimeProofDto {
 export interface RuntimeStatusDto {
   revision: number;
   sessionId?: string;
-  scope: "local_only" | "system_proxy";
-  mode: "local_only" | "system_proxy";
+  scope: "local_only" | "system_proxy" | "tun";
+  mode: "local_only" | "system_proxy" | "tun";
   phase: RuntimePhaseDto;
   nodeId?: string;
   ports?: { http: number; socks: number; health: number };
@@ -107,6 +108,12 @@ export interface RuntimeStatusDto {
   engineVersion?: string;
   proofs: RuntimeProofDto[];
   error?: PublicErrorDto;
+}
+
+export interface RunningApplicationDto {
+  processName: string;
+  executablePath: string;
+  displayName: string;
 }
 
 export interface ImportPreviewDto {
@@ -120,6 +127,8 @@ export interface ImportPreviewDto {
   rejected: Array<{ index: number; reason: string }>;
   warnings: string[];
 }
+
+export type ConfirmedNodeDto = ImportPreviewDto["nodes"][number];
 
 export interface ConfirmedImportDto {
   imported: number;
@@ -247,8 +256,8 @@ export function parseRuntimeStatus(value: unknown): RuntimeStatusDto {
   const status: RuntimeStatusDto = {
     revision: finiteInteger(input.revision),
     sessionId: optionalIdentifier(input.sessionId, 256),
-    scope: member(input.scope, ["local_only", "system_proxy"] as const),
-    mode: member(input.mode, ["local_only", "system_proxy"] as const),
+    scope: member(input.scope, ["local_only", "system_proxy", "tun"] as const),
+    mode: member(input.mode, ["local_only", "system_proxy", "tun"] as const),
     phase: member(input.phase, runtimePhases),
     nodeId: optionalIdentifier(input.nodeId, 256),
     ports,
@@ -274,7 +283,7 @@ const readyProofKinds = [
 const allProofKinds = [...readyProofKinds, "system_proxy_ownership"] as const;
 
 function validateRuntimeRelationships(status: RuntimeStatusDto): void {
-  if ((status.scope === "local_only") !== (status.mode === "local_only")) throw new ContractViolation();
+  if (status.scope !== status.mode) throw new ContractViolation();
   const systemOnlyPhases: RuntimePhaseDto[] = [
     "applying_system_proxy",
     "system_proxy_ready",
@@ -282,6 +291,7 @@ function validateRuntimeRelationships(status: RuntimeStatusDto): void {
     "blocked_by_conflict",
   ];
   if (systemOnlyPhases.includes(status.phase) && status.scope !== "system_proxy") throw new ContractViolation();
+  if (status.phase === "tun_ready" && status.scope !== "tun") throw new ContractViolation();
   for (const proof of status.proofs) {
     if (proof.latencyMs !== undefined && proof.state !== "passed") throw new ContractViolation();
     if (proof.kind !== "selected_outbound_https" && proof.latencyMs !== undefined) throw new ContractViolation();
@@ -326,6 +336,22 @@ function validateRuntimeRelationships(status: RuntimeStatusDto): void {
     }
     const outbound = status.proofs.find((proof) => proof.kind === "selected_outbound_https");
     if (outbound?.latencyMs === undefined || outbound.latencyMs !== status.routeCheckMs) throw new ContractViolation();
+  }
+
+  if (status.phase === "tun_ready") {
+    if (status.scope !== "tun" || status.mode !== "tun" || !status.sessionId || !status.nodeId
+      || !status.ports || status.error || status.routeCheckMs === undefined || status.proofs.length !== allProofKinds.length) {
+      throw new ContractViolation();
+    }
+    for (const kind of readyProofKinds) {
+      const proof = status.proofs.find((candidate) => candidate.kind === kind);
+      if (!proof || proof.state !== "passed") throw new ContractViolation();
+    }
+    const outbound = status.proofs.find((proof) => proof.kind === "selected_outbound_https");
+    if (outbound?.latencyMs === undefined || outbound.latencyMs !== status.routeCheckMs) throw new ContractViolation();
+    if (status.proofs.find((proof) => proof.kind === "system_proxy_ownership")?.state !== "not_run") {
+      throw new ContractViolation();
+    }
   }
 
   if (status.phase === "applying_system_proxy") {
@@ -375,6 +401,53 @@ export function isVerifiedSystemProxyReady(status: RuntimeStatusDto): boolean {
   }
 }
 
+export function isVerifiedTunReady(status: RuntimeStatusDto): boolean {
+  if (status.phase !== "tun_ready") return false;
+  try {
+    validateRuntimeRelationships(status);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function parseRunningApplications(value: unknown): RunningApplicationDto[] {
+  if (!Array.isArray(value) || value.length > 256) throw new ContractViolation();
+  const applications = value.map((entry): RunningApplicationDto => {
+    const input = record(entry);
+    exactKeys(input, ["processName", "executablePath", "displayName"]);
+    return {
+      processName: boundedString(input.processName, 260),
+      executablePath: boundedString(input.executablePath, 4096),
+      displayName: boundedString(input.displayName, 260),
+    };
+  });
+  const paths = applications.map((application) => application.executablePath.replaceAll("/", "\\").toLocaleLowerCase("en-US"));
+  if (new Set(paths).size !== paths.length) throw new ContractViolation();
+  return applications;
+}
+
+function parseConfirmedNodeArray(value: unknown): ConfirmedNodeDto[] {
+  if (!Array.isArray(value) || value.length > 2000) throw new ContractViolation();
+  const nodes = value.map((entry): ConfirmedNodeDto => {
+    const node = record(entry);
+    exactKeys(node, ["id", "displayName", "protocol", "insecureTls"]);
+    if (typeof node.insecureTls !== "boolean") throw new ContractViolation();
+    return {
+      id: boundedString(node.id, 256),
+      displayName: boundedString(node.displayName, 512),
+      protocol: member(node.protocol, protocols),
+      insecureTls: node.insecureTls,
+    };
+  });
+  if (new Set(nodes.map((node) => node.id)).size !== nodes.length) throw new ContractViolation();
+  return nodes;
+}
+
+export function parseConfirmedNodes(value: unknown): ConfirmedNodeDto[] {
+  return parseConfirmedNodeArray(value);
+}
+
 export function parseImportPreview(value: unknown): ImportPreviewDto {
   const input = record(value);
   exactKeys(input, ["previewId", "nodes", "rejected", "warnings"]);
@@ -383,17 +456,7 @@ export function parseImportPreview(value: unknown): ImportPreviewDto {
   if (!Array.isArray(input.warnings) || input.warnings.length > 64) throw new ContractViolation();
   const preview: ImportPreviewDto = {
     previewId: boundedString(input.previewId, 256),
-    nodes: input.nodes.map((entry) => {
-      const node = record(entry);
-      exactKeys(node, ["id", "displayName", "protocol", "insecureTls"]);
-      if (typeof node.insecureTls !== "boolean") throw new ContractViolation();
-      return {
-        id: boundedString(node.id, 256),
-        displayName: boundedString(node.displayName, 512),
-        protocol: member(node.protocol, protocols),
-        insecureTls: node.insecureTls,
-      };
-    }),
+    nodes: parseConfirmedNodeArray(input.nodes),
     rejected: input.rejected.map((entry) => {
       const rejection = record(entry);
       exactKeys(rejection, ["index", "reason"]);
@@ -404,7 +467,6 @@ export function parseImportPreview(value: unknown): ImportPreviewDto {
     }),
     warnings: input.warnings.map((warning) => boundedString(warning, 1024)),
   };
-  if (new Set(preview.nodes.map((node) => node.id)).size !== preview.nodes.length) throw new ContractViolation();
   return preview;
 }
 

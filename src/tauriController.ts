@@ -8,6 +8,7 @@ import type {
   Protocol,
   RouteDeckController,
   RoutingConfig,
+  RunningApplication,
   Server,
   SettingsConfig,
   SubscriptionImportSource,
@@ -19,13 +20,17 @@ import {
   RuntimeRevisionGate,
   isVerifiedLocalReady,
   isVerifiedSystemProxyReady,
+  isVerifiedTunReady,
   parseConfirmedImport,
+  parseConfirmedNodes,
   parseDiagnostics,
   parseImportPreview,
   parsePublicError,
+  parseRunningApplications,
   parseRuntimeStatus,
   parseUnitResponse,
   type ImportPreviewDto,
+  type ConfirmedNodeDto,
   type ProofStateDto,
   type PublicErrorDto,
   type RuntimePhaseDto,
@@ -82,7 +87,7 @@ function loadRouting(): RoutingConfig {
       return { defaultRoute: "direct", apps: [] };
     }
     const apps = candidate.apps.filter((app): app is RoutingConfig["apps"][number] => Boolean(
-      app && typeof app.id === "string" && app.id.length > 0 && app.id.length <= 256
+      app && typeof app.id === "string" && app.id.length > 0 && app.id.length <= 4096
       && typeof app.name === "string" && app.name.length > 0 && app.name.length <= 260
       && typeof app.path === "string" && app.path.length > 0 && app.path.length <= 4096
       && (app.route === "direct" || app.route === "vpn"),
@@ -147,6 +152,7 @@ export function runtimePhaseToConnectionPhase(phase: RuntimePhaseDto): Connectio
     case "local_proxy_ready":
       return "degraded";
     case "system_proxy_ready":
+    case "tun_ready":
       return "connected";
     case "degraded":
       return "degraded";
@@ -237,14 +243,16 @@ export function projectRuntimeProofs(status: RuntimeStatusDto): ConnectionProof[
     "Соединение с сервером работает",
     status.routeCheckMs === undefined ? undefined : `${status.routeCheckMs} мс`,
   );
-  const windowsProxy = projectSingleProof(
-    status,
-    "system_proxy_ownership",
-    "windows-mode",
-    "Прокси Windows",
-    "Системный прокси включён",
-    status.scope === "system_proxy" && status.ports ? `127.0.0.1:${status.ports.http}` : undefined,
-  );
+  const windowsProxy = status.scope === "tun"
+    ? projectSingleProof(status, "local_scope_ownership", "windows-mode", "TUN", "TUN включён")
+    : projectSingleProof(
+      status,
+      "system_proxy_ownership",
+      "windows-mode",
+      "Прокси Windows",
+      "Системный прокси включён",
+      status.scope === "system_proxy" && status.ports ? `127.0.0.1:${status.ports.http}` : undefined,
+    );
   return [
     config,
     core,
@@ -261,7 +269,7 @@ export function projectRuntimeProofs(status: RuntimeStatusDto): ConnectionProof[
 }
 
 function runtimeNotice(status: RuntimeStatusDto): AppNotice | undefined {
-  if (isVerifiedSystemProxyReady(status)) return undefined;
+  if (isVerifiedSystemProxyReady(status) || isVerifiedTunReady(status)) return undefined;
   if (isVerifiedLocalReady(status)) {
     const endpoint = status.ports ? `127.0.0.1:${status.ports.http}` : "локальном порту";
     return {
@@ -324,7 +332,42 @@ function protocolName(protocol: ImportPreviewDto["nodes"][number]["protocol"]): 
   }
 }
 
+function projectConfirmedNodes(nodes: readonly ConfirmedNodeDto[]): Server[] {
+  return nodes.map((node) => ({
+    id: node.id,
+    name: node.displayName,
+    country: "—",
+    protocol: protocolName(node.protocol),
+    detail: node.insecureTls ? "Отключена проверка TLS" : "Импортировано из подписки",
+    source: "Подписка",
+    latencyState: "unavailable",
+  }));
+}
+
+function projectRuntimeLatency(servers: readonly Server[], status: RuntimeStatusDto): Server[] {
+  const latencyMs = isVerifiedSystemProxyReady(status) || isVerifiedTunReady(status)
+    ? status.routeCheckMs
+    : undefined;
+  return servers.map((server) => latencyMs !== undefined && server.id === status.nodeId
+    ? {
+      ...server,
+      latencyState: "ready",
+      latencyMs,
+      checkedAt: "сейчас",
+    }
+    : {
+      ...server,
+      latencyState: "unavailable",
+      latencyMs: undefined,
+      checkedAt: undefined,
+    });
+}
+
 function routeDeckErrorFromBackend(error: PublicErrorDto): RouteDeckError {
+  if (error.code === "runtime_failure" && error.stage === "start"
+    && error.message === "TUN requires RouteDeck to be run as administrator") {
+    return new RouteDeckError("tun-admin-required");
+  }
   switch (error.code) {
     case "import_rejected":
       return new RouteDeckError("subscription-import-rejected");
@@ -388,8 +431,21 @@ export class TauriController implements RouteDeckController {
       // the older invoke snapshot instead of regressing the UI.
       const status = parseRuntimeStatus(await transport.invoke("runtime_status"));
       this.acceptRuntime(status);
+      const restoredNodes = parseConfirmedNodes(await transport.invoke("confirmed_nodes"));
+      if (this.disposed || this.boundaryFailed) return;
+      const authoritativeStatus = this.runtime ?? status;
+      const servers = projectRuntimeLatency(projectConfirmedNodes(restoredNodes), authoritativeStatus);
+      const activeNodeId = this.runtime?.nodeId;
+      this.publish({
+        servers,
+        selectedServerId: activeNodeId && servers.some((server) => server.id === activeNodeId)
+          ? activeNodeId
+          : servers[0]?.id ?? "",
+        subscriptionName: servers.length > 0 ? "Подписка" : "Подписка не импортирована",
+        subscriptionUpdatedAt: servers.length > 0 ? "сохранена" : "—",
+      });
       if (!this.boundaryFailed && this.snapshot.notice?.id === "backend-initializing") {
-        this.publish({ notice: runtimeNotice(status) });
+        this.publish({ notice: runtimeNotice(authoritativeStatus) });
       }
     } catch (error) {
       this.failBoundary(error instanceof ContractViolation ? "backend-response-invalid" : "backend-unavailable");
@@ -415,13 +471,20 @@ export class TauriController implements RouteDeckController {
   private acceptRuntime(status: RuntimeStatusDto): void {
     if (this.boundaryFailed || !this.revisions.accept(status)) return;
     this.runtime = status;
+    const activeMode = status.phase !== "disconnected" && status.mode !== "local_only"
+      ? status.mode === "tun" ? "tun" : "proxy"
+      : this.snapshot.mode;
     this.publish({
       backendAvailable: true,
-      runtimeScope: status.scope === "system_proxy"
-        ? "system-proxy"
-        : status.phase === "disconnected"
+      mode: activeMode,
+      servers: projectRuntimeLatency(this.snapshot.servers, status),
+      runtimeScope: status.scope === "tun"
+        ? "tun"
+        : status.scope === "system_proxy"
           ? "system-proxy"
-          : "local-only",
+          : status.phase === "disconnected"
+            ? this.snapshot.mode === "tun" ? "tun" : "system-proxy"
+            : "local-only",
       phase: runtimePhaseToConnectionPhase(status.phase),
       proofs: projectRuntimeProofs(status),
       notice: runtimeNotice(status),
@@ -502,26 +565,32 @@ export class TauriController implements RouteDeckController {
   connect = async (_tunPath?: TunPathChoice): Promise<void> => {
     // Check the trust boundary before interpreting any optimistic UI state.
     await this.requireTransport();
-    if (this.snapshot.mode === "tun") throw new RouteDeckError("capability-unavailable");
     if (!this.snapshot.selectedServerId) throw new RouteDeckError("node-not-selected");
-    await this.invokeStatus("start_system_proxy", {
+    await this.invokeStatus(this.snapshot.mode === "tun" ? "start_tun" : "start_system_proxy", {
       nodeId: this.snapshot.selectedServerId,
       routing: {
         defaultRoute: this.snapshot.routing.defaultRoute,
-        apps: this.snapshot.routing.apps
-          .filter((app) => app.route !== "inherit")
-          .map((app) => ({
-            processPath: app.path,
-            processName: app.path.split(/[\\/]/).at(-1) || undefined,
-            route: app.route,
-          })),
+        apps: this.snapshot.mode === "tun"
+          ? this.snapshot.routing.apps
+            .filter((app) => app.route !== "inherit")
+            .map((app) => ({
+              processPath: app.path,
+              processName: app.path.split(/[\\/]/).at(-1) || undefined,
+              route: app.route,
+            }))
+          : [],
       },
     });
   };
 
-  disconnect = async (): Promise<void> => this.invokeStatus(
-    this.runtime?.mode === "local_only" ? "stop_local_proxy" : "stop_system_proxy",
-  );
+  disconnect = async (): Promise<void> => {
+    const command = this.runtime?.mode === "tun"
+      ? "stop_tun"
+      : this.runtime?.mode === "local_only"
+        ? "stop_local_proxy"
+        : "stop_system_proxy";
+    await this.invokeStatus(command);
+  };
 
   retry = async (): Promise<void> => {
     if (this.runtime?.phase === "recovery_required") {
@@ -647,17 +716,7 @@ export class TauriController implements RouteDeckController {
       }
       if (generation !== this.importGeneration) throw new RouteDeckError("stale-subscription-preview");
       const confirmedIds = new Set(confirmed.nodeIds);
-      const servers: Server[] = pending.dto.nodes
-        .filter((node) => confirmedIds.has(node.id))
-        .map((node) => ({
-          id: node.id,
-          name: node.displayName,
-          country: "—",
-          protocol: protocolName(node.protocol),
-          detail: node.insecureTls ? "Отключена проверка TLS" : "Импортировано из подписки",
-          source: "Подписка",
-          latencyState: "unavailable",
-        }));
+      const servers = projectConfirmedNodes(pending.dto.nodes.filter((node) => confirmedIds.has(node.id)));
       this.pendingImport = undefined;
       this.publish({
         servers,
@@ -667,6 +726,22 @@ export class TauriController implements RouteDeckController {
       });
     } finally {
       this.confirmingImport = false;
+    }
+  };
+
+  listRunningApplications = async (): Promise<RunningApplication[]> => {
+    const transport = await this.requireTransport();
+    let raw: unknown;
+    try {
+      raw = await transport.invoke("list_running_applications");
+    } catch (error) {
+      throw this.invokeError(error);
+    }
+    try {
+      return parseRunningApplications(raw);
+    } catch {
+      this.failBoundary("backend-response-invalid");
+      throw new RouteDeckError("backend-response-invalid");
     }
   };
 

@@ -12,6 +12,8 @@ export function toPublicActionError(error: unknown): PublicActionError {
         return { message: "Не удалось прочитать состояние подключения. Перезапустите RouteDeck." };
       case "capability-unavailable":
         return { message: "Эта функция пока недоступна." };
+      case "tun-admin-required":
+        return { message: "TUN пока недоступен в обычном режиме запуска." };
       case "runtime-failure":
         return {
           message: "Не удалось выполнить действие. Повторите попытку или откройте диагностику.",
