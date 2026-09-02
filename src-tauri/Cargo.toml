@@ -37,8 +37,10 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_Networking_WinSock",
     "Win32_Networking_WinInet",
     "Win32_System_JobObjects",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Memory",
     "Win32_System_Pipes",
+    "Win32_System_RemoteDesktop",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }

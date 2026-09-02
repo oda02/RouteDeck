@@ -8,6 +8,7 @@ use crate::{
         PublicErrorCode, PublicErrorStage, RuntimeStatus, SystemProxyRouting, TunRouting,
     },
     domain::DefaultRoute,
+    running_applications::{self, RunningApplication},
 };
 
 #[tauri::command]
@@ -146,6 +147,18 @@ pub async fn retry_session_recovery(
 #[tauri::command]
 pub fn runtime_diagnostics(controller: State<'_, Arc<ApplicationController>>) -> Diagnostics {
     controller.diagnostics()
+}
+
+/// Lists distinct executable images in the current interactive Windows session.
+/// Processes whose image path cannot be queried are deliberately omitted.
+#[tauri::command]
+pub fn list_running_applications() -> Result<Vec<RunningApplication>, PublicError> {
+    running_applications::list().map_err(|_| PublicError {
+        code: PublicErrorCode::CommandFailed,
+        stage: PublicErrorStage::Command,
+        message: "Could not enumerate running applications".into(),
+        detail: None,
+    })
 }
 
 fn command_join_error(_error: impl std::fmt::Display) -> PublicError {

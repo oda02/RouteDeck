@@ -5,6 +5,7 @@ pub mod domain;
 pub mod engine_runtime;
 pub mod health;
 pub mod redaction;
+pub mod running_applications;
 mod runtime_constants;
 pub mod subscription;
 pub mod subscription_fetch;
@@ -46,6 +47,7 @@ pub fn run() {
             commands::stop_tun,
             commands::retry_session_recovery,
             commands::runtime_diagnostics,
+            commands::list_running_applications,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build RouteDeck");
