@@ -34,6 +34,7 @@ use crate::{
     },
     subscription_store::SubscriptionStore,
     system_proxy::{SystemProxyControl, SystemProxyManager, SystemProxyRestoreOutcome},
+    tun_helper::reconcile_stale_tun_sessions,
     xray_config::{generate_xray_bridge_config, XrayBridgeRequest},
 };
 
@@ -601,7 +602,9 @@ impl ApplicationController {
         system_proxy: Arc<dyn SystemProxyControl>,
         expected_tun_helper_sha256: Option<&'static str>,
     ) -> Result<Arc<Self>, RuntimeError> {
-        let engine_recovery_error = reconcile_stale_sessions(&session_root).err();
+        let engine_recovery_error = reconcile_stale_tun_sessions(&session_root)
+            .and_then(|_| reconcile_stale_sessions(&session_root))
+            .err();
         let proxy_recovery_error = system_proxy.reconcile_stale_journal().err();
         let subscription_store = SubscriptionStore::new(
             session_root
@@ -2202,7 +2205,9 @@ impl ApplicationController {
                 return Ok(state.status.clone());
             }
         }
-        if let Err(error) = reconcile_stale_sessions(&self.session_root) {
+        if let Err(error) = reconcile_stale_tun_sessions(&self.session_root)
+            .and_then(|_| reconcile_stale_sessions(&self.session_root))
+        {
             let public = public_runtime_error(error, &Redactor::default());
             let mut state = self.lock_state();
             state.recovery_required = true;

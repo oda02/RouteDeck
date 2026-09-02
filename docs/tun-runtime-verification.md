@@ -14,8 +14,9 @@ its LUID and owned route keys, and verifies all of the following before reportin
 as usable:
 
 - the recorded LUID is still the only `RouteDeck` adapter;
-- owned routes cover representative public IPv4 and IPv6 destinations;
-- `GetBestRoute2` selects that exact LUID for both families;
+- owned routes cover representative public destinations for every address family enabled
+  by the protected TUN config (an IPv4-only config does not require IPv6);
+- `GetBestRoute2` selects that exact LUID for each enabled family;
 - no foreign full-tunnel adapter became active.
 
 The GUI then makes both proofs: the authenticated loopback health request proves the
@@ -30,3 +31,11 @@ disappear. Normal stop uses the same bounded wait. RouteDeck does not delete an 
 a fallback: if the exact owned LUID remains or another same-name adapter appears, the
 journal is preserved and the controller reports recovery instead of touching foreign
 state.
+
+On the next app start, RouteDeck removes a stale session directory only when its strict
+versioned TUN journal still identifies the engine process, creation time, adapter LUID,
+owned route keys, and config digest, while Windows proves that the recorded process,
+same-name adapter, and routes are all gone. A live or reused PID, identity mismatch,
+same-name adapter, remaining route on the recorded LUID, missing journal, reparse point,
+or unrecognized file is preserved as a recovery conflict. Recovery removes only the
+recognized RouteDeck config and journal files; it never deletes adapters or routes.

@@ -5,6 +5,7 @@ mod windows {
         fs::{self, File, OpenOptions},
         io::{Read, Seek, SeekFrom, Write},
         mem::size_of,
+        net::IpAddr,
         os::windows::{
             ffi::{OsStrExt, OsStringExt},
             fs::{MetadataExt, OpenOptionsExt},
@@ -17,12 +18,14 @@ mod windows {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
+    use serde::Deserialize;
     use sha2::{Digest, Sha256};
     use windows_sys::Win32::{
         Foundation::{
             CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS,
-            ERROR_BUFFER_OVERFLOW, ERROR_CANCELLED, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING,
-            GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+            ERROR_BUFFER_OVERFLOW, ERROR_CANCELLED, ERROR_INVALID_PARAMETER, ERROR_PIPE_CONNECTED,
+            ERROR_PIPE_LISTENING, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+            WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         NetworkManagement::IpHelper::{
             FreeMibTable, GetAdaptersAddresses, GetBestRoute2, GetIfEntry2, GetIpForwardTable2,
@@ -73,7 +76,7 @@ mod windows {
         },
         redaction::Redactor,
         tun_helper_protocol::{
-            pipe_suffix, read_frame, session_id, write_frame, CleanupState, Frame,
+            exact_hex, pipe_suffix, read_frame, session_id, write_frame, CleanupState, Frame,
             HelperFailureCode, HelperPhase, ServerState, TunInterfaceState, UpstreamChoice,
             MAX_CONFIG_BYTES, PROTOCOL_VERSION,
         },
@@ -590,6 +593,7 @@ mod windows {
                 let journal = &mut running.journal;
                 let engine_created = running.engine_created;
                 let owned_luid = running.owned_luid;
+                let expected_families = running.expected_families;
                 let engine_pid = child.pid();
                 write_frame(
                     &mut pipe,
@@ -607,6 +611,7 @@ mod windows {
                     child.as_mut(),
                     journal,
                     owned_luid,
+                    expected_families,
                 )
             }
             Err(error) => {
@@ -636,6 +641,7 @@ mod windows {
         journal: TunJournal,
         engine_created: u64,
         owned_luid: Option<u64>,
+        expected_families: ExpectedFamilies,
     }
 
     fn start_engine_session(
@@ -659,7 +665,7 @@ mod windows {
         let config = duplicate_config(parent.raw(), request)?;
         let config_directory = protected_config_directory(&config)?;
         let contents = read_verified_config(config, request)?;
-        validate_tun_config(&contents)?;
+        let expected_families = validate_tun_config(&contents)?;
 
         let session = SessionConfig::create(&config_directory, &contents)?;
         let diagnostics = Arc::new(Mutex::new(DiagnosticBuffer::default()));
@@ -704,15 +710,19 @@ mod windows {
             thread::sleep(Duration::from_millis(50));
         };
         let route_deadline = Instant::now() + Duration::from_secs(5);
+        if let Err(error) = journal.mark_adapter(child.pid(), engine_created, owned_luid) {
+            rollback_failed_start(child.as_mut(), &mut journal, Some(owned_luid))?;
+            return Err(error);
+        }
         loop {
-            if inspect_owned_capture(owned_luid).is_ok() {
+            if inspect_owned_capture(owned_luid, expected_families).is_ok() {
                 break;
             }
             if Instant::now() >= route_deadline {
                 rollback_failed_start(child.as_mut(), &mut journal, Some(owned_luid))?;
                 return Err(RuntimeError::new(
                     "tun_capture",
-                    "RouteDeck TUN adapter appeared, but its IPv4/IPv6 capture routes did not become effective",
+                    "RouteDeck TUN adapter appeared, but its enabled address-family capture routes did not become effective",
                 ));
             }
             thread::sleep(Duration::from_millis(50));
@@ -721,7 +731,7 @@ mod windows {
             rollback_failed_start(child.as_mut(), &mut journal, Some(owned_luid))?;
             return Err(error);
         }
-        if let Err(error) = inspect_owned_capture(owned_luid) {
+        if let Err(error) = inspect_owned_capture(owned_luid, expected_families) {
             rollback_failed_start(child.as_mut(), &mut journal, Some(owned_luid))?;
             return Err(error);
         }
@@ -733,6 +743,7 @@ mod windows {
             journal,
             engine_created,
             owned_luid: Some(owned_luid),
+            expected_families,
         })
     }
 
@@ -780,6 +791,7 @@ mod windows {
         child: &mut dyn ManagedChild,
         journal: &mut TunJournal,
         owned_luid: Option<u64>,
+        expected_families: ExpectedFamilies,
     ) -> Result<(), RuntimeError> {
         loop {
             let frame = match read_frame(pipe) {
@@ -809,7 +821,9 @@ mod windows {
                 Frame::Status { request_id, .. } => {
                     let alive = child.is_alive()?;
                     if alive {
-                        match owned_luid.and_then(|luid| inspect_owned_capture(luid).ok()) {
+                        match owned_luid
+                            .and_then(|luid| inspect_owned_capture(luid, expected_families).ok())
+                        {
                             Some(capture) => write_frame(
                                 pipe,
                                 &Frame::State {
@@ -1040,7 +1054,13 @@ mod windows {
         }
     }
 
-    fn validate_tun_config(contents: &str) -> Result<(), RuntimeError> {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ExpectedFamilies {
+        ipv4: bool,
+        ipv6: bool,
+    }
+
+    fn validate_tun_config(contents: &str) -> Result<ExpectedFamilies, RuntimeError> {
         let root: serde_json::Value = serde_json::from_str(contents).map_err(|_| {
             RuntimeError::new(
                 "tun_helper_config",
@@ -1065,6 +1085,10 @@ mod windows {
                 RuntimeError::new("tun_helper_config", "protected TUN inbounds are invalid")
             })?;
         let mut tun_count = 0;
+        let mut expected_families = ExpectedFamilies {
+            ipv4: false,
+            ipv6: false,
+        };
         for inbound in inbounds {
             let inbound = inbound.as_object().ok_or_else(|| {
                 RuntimeError::new("tun_helper_config", "protected TUN inbound is invalid")
@@ -1091,6 +1115,32 @@ mod windows {
                         "protected TUN inbound policy is invalid",
                     ));
                 }
+                let addresses = inbound
+                    .get("address")
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|addresses| !addresses.is_empty() && addresses.len() <= 2)
+                    .ok_or_else(|| {
+                        RuntimeError::new(
+                            "tun_helper_config",
+                            "protected TUN address families are invalid",
+                        )
+                    })?;
+                for address in addresses {
+                    let address = address
+                        .as_str()
+                        .and_then(|address| address.split('/').next())
+                        .and_then(|address| address.parse::<IpAddr>().ok())
+                        .ok_or_else(|| {
+                            RuntimeError::new(
+                                "tun_helper_config",
+                                "protected TUN address is invalid",
+                            )
+                        })?;
+                    match address {
+                        IpAddr::V4(_) => expected_families.ipv4 = true,
+                        IpAddr::V6(_) => expected_families.ipv6 = true,
+                    }
+                }
             } else if inbound.get("listen").and_then(serde_json::Value::as_str) != Some("127.0.0.1")
             {
                 return Err(RuntimeError::new(
@@ -1112,7 +1162,7 @@ mod windows {
                 "protected TUN route policy is invalid",
             ));
         }
-        Ok(())
+        Ok(expected_families)
     }
 
     struct HelperInvocation {
@@ -1742,6 +1792,10 @@ mod windows {
                 == (address[whole] & (0xff << (8 - remaining)))
     }
 
+    fn enabled_capture_is_valid(expected: ExpectedFamilies, ipv4: bool, ipv6: bool) -> bool {
+        (!expected.ipv4 || ipv4) && (!expected.ipv6 || ipv6)
+    }
+
     fn best_route_luid_v4(address: [u8; 4]) -> Result<u64, RuntimeError> {
         let destination = SOCKADDR_INET {
             Ipv4: SOCKADDR_IN {
@@ -1796,7 +1850,10 @@ mod windows {
         Ok(unsafe { route.InterfaceLuid.Value })
     }
 
-    fn inspect_owned_capture(luid: u64) -> Result<TunInterfaceState, RuntimeError> {
+    fn inspect_owned_capture(
+        luid: u64,
+        expected: ExpectedFamilies,
+    ) -> Result<TunInterfaceState, RuntimeError> {
         let adapters = adapter_states()?;
         if adapters
             .iter()
@@ -1827,14 +1884,12 @@ mod windows {
         let owns_v6 = routes
             .iter()
             .any(|route| route.luid == luid && address_is_covered(route, AF_INET6, &v6));
-        if !owns_v4
-            || !owns_v6
-            || best_route_luid_v4(v4)? != luid
-            || best_route_luid_v6(v6)? != luid
-        {
+        let ipv4_valid = !expected.ipv4 || (owns_v4 && best_route_luid_v4(v4)? == luid);
+        let ipv6_valid = !expected.ipv6 || (owns_v6 && best_route_luid_v6(v6)? == luid);
+        if !enabled_capture_is_valid(expected, ipv4_valid, ipv6_valid) {
             return Err(RuntimeError::new(
                 "tun_capture",
-                "RouteDeck does not own the effective IPv4 and IPv6 capture routes",
+                "RouteDeck does not own every enabled TUN address-family capture route",
             ));
         }
         let mut row = MIB_IF_ROW2::default();
@@ -1866,14 +1921,28 @@ mod windows {
     }
 
     fn verify_cleanup(owned_luid: Option<u64>) -> CleanupState {
-        match find_tun_adapter_luids() {
-            Ok(current) => match owned_luid {
-                Some(luid) if current.contains(&luid) => CleanupState::Conflict,
-                _ if current.is_empty() => CleanupState::Complete,
-                _ => CleanupState::Conflict,
-            },
-            Err(_) => CleanupState::Conflict,
+        match (find_tun_adapter_luids(), route_states()) {
+            (Ok(current), Ok(routes)) => cleanup_state_from(
+                &current,
+                &routes.iter().map(|route| route.luid).collect::<Vec<_>>(),
+                owned_luid,
+            ),
+            _ => CleanupState::Conflict,
         }
+    }
+
+    fn cleanup_state_from(
+        same_name_luids: &[u64],
+        route_luids: &[u64],
+        owned_luid: Option<u64>,
+    ) -> CleanupState {
+        if !same_name_luids.is_empty() {
+            return CleanupState::Conflict;
+        }
+        if owned_luid.is_some_and(|luid| route_luids.contains(&luid)) {
+            return CleanupState::Conflict;
+        }
+        CleanupState::Complete
     }
 
     fn wait_for_cleanup(owned_luid: Option<u64>, timeout: Duration) -> CleanupState {
@@ -1887,11 +1956,360 @@ mod windows {
         }
     }
 
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct StoredTunJournal {
+        schema_version: u32,
+        session: String,
+        phase: String,
+        config_sha256: String,
+        #[serde(default)]
+        engine_pid: Option<u32>,
+        #[serde(default)]
+        engine_created: Option<u64>,
+        #[serde(default)]
+        owned_interface_luid: Option<u64>,
+        #[serde(default)]
+        owned_routes: Vec<StoredRouteKey>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct StoredRouteKey {
+        family: u16,
+        prefix: String,
+        prefix_length: u8,
+        metric: u32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum StaleProcessIdentity {
+        Absent,
+        Matching,
+        Mismatched,
+        Unknown,
+    }
+
+    #[derive(Debug)]
+    struct StaleTunCandidate {
+        directory: PathBuf,
+        nested_directories: Vec<PathBuf>,
+        outer_config: Option<PathBuf>,
+        journal_path: PathBuf,
+        journal: StoredTunJournal,
+    }
+
+    pub(crate) fn reconcile_stale_tun_sessions(root: &Path) -> Result<(), RuntimeError> {
+        fs::create_dir_all(root).map_err(|error| recovery_error(error.to_string()))?;
+        reject_reparse_directory(root)?;
+
+        let same_name_luids = find_tun_adapter_luids()
+            .map_err(|_| recovery_error("could not inspect RouteDeck adapter ownership"))?;
+        if !same_name_luids.is_empty() {
+            return Err(recovery_error(
+                "an existing RouteDeck adapter has no live session owner",
+            ));
+        }
+
+        let mut candidates = Vec::new();
+        for entry in fs::read_dir(root).map_err(|error| recovery_error(error.to_string()))? {
+            let entry = entry.map_err(|error| recovery_error(error.to_string()))?;
+            candidates.push(inspect_stale_tun_candidate(entry.path())?);
+        }
+
+        let route_luids = if candidates
+            .iter()
+            .any(|candidate| candidate.journal.owned_interface_luid.is_some())
+        {
+            route_states()
+                .map_err(|_| recovery_error("could not inspect stale RouteDeck route ownership"))?
+                .into_iter()
+                .map(|route| route.luid)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        for candidate in &candidates {
+            let process = stale_process_identity(
+                candidate.journal.engine_pid,
+                candidate.journal.engine_created,
+            );
+            if !stale_recovery_is_safe(
+                true,
+                &same_name_luids,
+                &route_luids,
+                candidate.journal.owned_interface_luid,
+                process,
+            ) {
+                return Err(recovery_error(
+                    "stale TUN state is still active or its identity is ambiguous",
+                ));
+            }
+        }
+
+        for candidate in candidates {
+            remove_stale_tun_candidate(candidate)?;
+        }
+        Ok(())
+    }
+
+    fn inspect_stale_tun_candidate(directory: PathBuf) -> Result<StaleTunCandidate, RuntimeError> {
+        reject_reparse_directory(&directory)?;
+        let name = directory
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.strip_prefix("session-"))
+            .ok_or_else(|| recovery_error("session directory identity is invalid"))?;
+        session_id(name).map_err(|_| recovery_error("session directory identity is invalid"))?;
+
+        let mut outer_config = None;
+        let mut journal_path = None;
+        let mut nested_directories = Vec::new();
+        for entry in fs::read_dir(&directory).map_err(|error| recovery_error(error.to_string()))? {
+            let entry = entry.map_err(|error| recovery_error(error.to_string()))?;
+            let path = entry.path();
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|error| recovery_error(error.to_string()))?;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(recovery_error("stale TUN session contains a reparse point"));
+            }
+            match entry.file_name().to_str() {
+                Some("config.json") if metadata.is_file() && outer_config.is_none() => {
+                    outer_config = Some(path);
+                }
+                Some("tun-journal.json") if metadata.is_file() && journal_path.is_none() => {
+                    journal_path = Some(path);
+                }
+                Some(name) if metadata.is_dir() && valid_session_directory_name(name) => {
+                    inspect_nested_session_directory(&path)?;
+                    nested_directories.push(path);
+                }
+                _ => {
+                    return Err(recovery_error(
+                        "stale TUN session contains an unrecognized entry",
+                    ));
+                }
+            }
+        }
+        if nested_directories.len() > 1 {
+            return Err(recovery_error(
+                "stale TUN session contains multiple helper sessions",
+            ));
+        }
+        let journal_path = journal_path.ok_or_else(|| {
+            recovery_error("session has no exact TUN ownership journal; preserved for review")
+        })?;
+        let journal = read_stored_tun_journal(&journal_path)?;
+        validate_stored_tun_journal(&journal)?;
+        if let Some(path) = outer_config.as_ref() {
+            verify_stale_config_digest(path, &journal.config_sha256)?;
+        }
+        for nested in &nested_directories {
+            let path = nested.join("config.json");
+            if path.exists() {
+                verify_stale_config_digest(&path, &journal.config_sha256)?;
+            }
+        }
+        Ok(StaleTunCandidate {
+            directory,
+            nested_directories,
+            outer_config,
+            journal_path,
+            journal,
+        })
+    }
+
+    fn valid_session_directory_name(name: &str) -> bool {
+        name.strip_prefix("session-")
+            .is_some_and(|value| session_id(value).is_ok())
+    }
+
+    fn inspect_nested_session_directory(directory: &Path) -> Result<(), RuntimeError> {
+        reject_reparse_directory(directory)?;
+        for entry in fs::read_dir(directory).map_err(|error| recovery_error(error.to_string()))? {
+            let entry = entry.map_err(|error| recovery_error(error.to_string()))?;
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(|error| recovery_error(error.to_string()))?;
+            if !metadata.is_file()
+                || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                || entry.file_name() != OsStr::new("config.json")
+            {
+                return Err(recovery_error(
+                    "stale helper session contains an unrecognized entry",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn reject_reparse_directory(path: &Path) -> Result<(), RuntimeError> {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|error| recovery_error(error.to_string()))?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(recovery_error("stale TUN directory identity was rejected"));
+        }
+        Ok(())
+    }
+
+    fn read_stored_tun_journal(path: &Path) -> Result<StoredTunJournal, RuntimeError> {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|error| recovery_error(error.to_string()))?;
+        if !metadata.is_file()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || metadata.len() > 64 * 1024
+        {
+            return Err(recovery_error("stale TUN journal identity was rejected"));
+        }
+        let bytes = fs::read(path).map_err(|error| recovery_error(error.to_string()))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|_| recovery_error("stale TUN journal schema was rejected"))
+    }
+
+    fn validate_stored_tun_journal(journal: &StoredTunJournal) -> Result<(), RuntimeError> {
+        if journal.schema_version != 2
+            || session_id(&journal.session).is_err()
+            || exact_hex(&journal.config_sha256, 64).is_err()
+            || journal.engine_pid == Some(0)
+            || journal.engine_created == Some(0)
+            || journal.owned_interface_luid == Some(0)
+            || journal.engine_pid.is_some() != journal.engine_created.is_some()
+            || (!journal.owned_routes.is_empty() && journal.owned_interface_luid.is_none())
+            || journal
+                .owned_routes
+                .iter()
+                .any(|route| !stored_route_is_valid(route))
+        {
+            return Err(recovery_error("stale TUN journal metadata was rejected"));
+        }
+        let valid_phase = match journal.phase.as_str() {
+            "starting" => {
+                journal.engine_pid.is_none()
+                    && journal.owned_interface_luid.is_none()
+                    && journal.owned_routes.is_empty()
+            }
+            "running" => {
+                journal.engine_pid.is_some()
+                    && journal.owned_interface_luid.is_none()
+                    && journal.owned_routes.is_empty()
+            }
+            "adapter_observed" => {
+                journal.engine_pid.is_some() && journal.owned_interface_luid.is_some()
+            }
+            "capture_verified" => {
+                journal.engine_pid.is_some()
+                    && journal.owned_interface_luid.is_some()
+                    && !journal.owned_routes.is_empty()
+            }
+            "conflict" => true,
+            _ => false,
+        };
+        if !valid_phase {
+            return Err(recovery_error("stale TUN journal phase was rejected"));
+        }
+        Ok(())
+    }
+
+    fn stored_route_is_valid(route: &StoredRouteKey) -> bool {
+        let prefix_length_valid = match route.family {
+            family if family == AF_INET => route.prefix_length <= 32,
+            family if family == AF_INET6 => route.prefix_length <= 128,
+            _ => false,
+        };
+        let _ = route.metric;
+        prefix_length_valid && exact_hex(&route.prefix, 32).is_ok()
+    }
+
+    fn verify_stale_config_digest(path: &Path, expected: &str) -> Result<(), RuntimeError> {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|error| recovery_error(error.to_string()))?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(recovery_error("stale TUN config identity was rejected"));
+        }
+        let mut file = File::open(path).map_err(|error| recovery_error(error.to_string()))?;
+        let (_, actual) = hash_config(&mut file)
+            .map_err(|_| recovery_error("stale TUN config could not be hashed"))?;
+        if !constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+            return Err(recovery_error(
+                "stale TUN config digest did not match its journal",
+            ));
+        }
+        Ok(())
+    }
+
+    fn stale_process_identity(pid: Option<u32>, created: Option<u64>) -> StaleProcessIdentity {
+        let (Some(pid), Some(created)) = (pid, created) else {
+            return StaleProcessIdentity::Absent;
+        };
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return if unsafe { GetLastError() } == ERROR_INVALID_PARAMETER {
+                StaleProcessIdentity::Absent
+            } else {
+                StaleProcessIdentity::Unknown
+            };
+        }
+        let process = match OwnedHandle::new(
+            process,
+            "session_recovery",
+            "could not inspect the stale TUN engine process",
+        ) {
+            Ok(process) => process,
+            Err(_) => return StaleProcessIdentity::Unknown,
+        };
+        match process_creation_time(process.raw()) {
+            Ok(actual) if actual == created => StaleProcessIdentity::Matching,
+            Ok(_) => StaleProcessIdentity::Mismatched,
+            Err(_) => StaleProcessIdentity::Unknown,
+        }
+    }
+
+    fn stale_recovery_is_safe(
+        has_journal: bool,
+        same_name_luids: &[u64],
+        route_luids: &[u64],
+        owned_luid: Option<u64>,
+        process: StaleProcessIdentity,
+    ) -> bool {
+        has_journal
+            && same_name_luids.is_empty()
+            && !owned_luid.is_some_and(|luid| route_luids.contains(&luid))
+            && process == StaleProcessIdentity::Absent
+    }
+
+    fn remove_stale_tun_candidate(candidate: StaleTunCandidate) -> Result<(), RuntimeError> {
+        for nested in candidate.nested_directories {
+            let config = nested.join("config.json");
+            if config.exists() {
+                fs::remove_file(&config).map_err(|error| recovery_error(error.to_string()))?;
+            }
+            fs::remove_dir(&nested).map_err(|error| recovery_error(error.to_string()))?;
+        }
+        if let Some(config) = candidate.outer_config {
+            fs::remove_file(config).map_err(|error| recovery_error(error.to_string()))?;
+        }
+        fs::remove_file(candidate.journal_path)
+            .map_err(|error| recovery_error(error.to_string()))?;
+        fs::remove_dir(candidate.directory).map_err(|error| recovery_error(error.to_string()))
+    }
+
+    fn recovery_error(message: impl Into<String>) -> RuntimeError {
+        let _ = message.into();
+        RuntimeError::new(
+            "session_recovery",
+            "stale TUN session requires review; preserved ambiguous state",
+        )
+    }
+
     struct TunJournal {
         path: PathBuf,
         file: Option<File>,
         session: String,
         config_sha256: String,
+        engine_pid: Option<u32>,
+        engine_created: Option<u64>,
+        owned_luid: Option<u64>,
+        owned_routes: Vec<RouteState>,
     }
 
     impl TunJournal {
@@ -1924,6 +2342,10 @@ mod windows {
                 file: Some(file),
                 session: session.to_owned(),
                 config_sha256: config_sha256.to_owned(),
+                engine_pid: None,
+                engine_created: None,
+                owned_luid: None,
+                owned_routes: Vec::new(),
             })
         }
 
@@ -1932,23 +2354,41 @@ mod windows {
             engine_pid: u32,
             engine_created: u64,
         ) -> Result<(), RuntimeError> {
-            self.write(serde_json::json!({
-                "schemaVersion": 2,
-                "session": self.session,
-                "phase": "running",
-                "configSha256": self.config_sha256,
-                "enginePid": engine_pid,
-                "engineCreated": engine_created,
-            }))
+            self.engine_pid = Some(engine_pid);
+            self.engine_created = Some(engine_created);
+            let value = self.value("running");
+            self.write(value)
         }
 
         fn mark_conflict(&mut self) -> Result<(), RuntimeError> {
-            self.write(serde_json::json!({
-                "schemaVersion": 2,
-                "session": self.session,
-                "phase": "conflict",
-                "configSha256": self.config_sha256,
-            }))
+            if let Some(owned_luid) = self.owned_luid {
+                if let Ok(routes) = route_states() {
+                    for route in routes.into_iter().filter(|route| route.luid == owned_luid) {
+                        if !self.owned_routes.contains(&route) {
+                            self.owned_routes.push(route);
+                        }
+                    }
+                }
+            }
+            let value = self.value("conflict");
+            self.write(value)
+        }
+
+        fn mark_adapter(
+            &mut self,
+            engine_pid: u32,
+            engine_created: u64,
+            owned_luid: u64,
+        ) -> Result<(), RuntimeError> {
+            self.engine_pid = Some(engine_pid);
+            self.engine_created = Some(engine_created);
+            self.owned_luid = Some(owned_luid);
+            self.owned_routes = route_states()?
+                .into_iter()
+                .filter(|route| route.luid == owned_luid)
+                .collect();
+            let value = self.value("adapter_observed");
+            self.write(value)
         }
 
         fn mark_capture(
@@ -1957,9 +2397,21 @@ mod windows {
             engine_created: u64,
             owned_luid: u64,
         ) -> Result<(), RuntimeError> {
-            let routes = route_states()?
+            self.engine_pid = Some(engine_pid);
+            self.engine_created = Some(engine_created);
+            self.owned_luid = Some(owned_luid);
+            self.owned_routes = route_states()?
                 .into_iter()
                 .filter(|route| route.luid == owned_luid)
+                .collect::<Vec<_>>();
+            let value = self.value("capture_verified");
+            self.write(value)
+        }
+
+        fn value(&self, phase: &str) -> serde_json::Value {
+            let routes = self
+                .owned_routes
+                .iter()
                 .map(|route| {
                     serde_json::json!({
                         "family": route.family,
@@ -1969,16 +2421,16 @@ mod windows {
                     })
                 })
                 .collect::<Vec<_>>();
-            self.write(serde_json::json!({
+            serde_json::json!({
                 "schemaVersion": 2,
                 "session": self.session,
-                "phase": "capture_verified",
+                "phase": phase,
                 "configSha256": self.config_sha256,
-                "enginePid": engine_pid,
-                "engineCreated": engine_created,
-                "ownedInterfaceLuid": owned_luid,
+                "enginePid": self.engine_pid,
+                "engineCreated": self.engine_created,
+                "ownedInterfaceLuid": self.owned_luid,
                 "ownedRoutes": routes,
-            }))
+            })
         }
 
         fn write(&mut self, value: serde_json::Value) -> Result<(), RuntimeError> {
@@ -2087,7 +2539,7 @@ mod windows {
         match stage {
             "tun_preflight" => "TUN could not start because the adapter state is not ready",
             "tun_capture" => {
-                "TUN started but did not obtain effective IPv4 and IPv6 capture routes"
+                "TUN started but did not obtain every enabled address-family capture route"
             }
             "tun_helper_config" | "config_check" => "The generated TUN configuration was rejected",
             "engine_integrity" | "engine_layout" => {
@@ -2189,12 +2641,28 @@ mod windows {
                 "dns": {},
                 "inbounds": [
                     {"type":"http","listen":"127.0.0.1"},
-                    {"type":"tun","tag":"tun-in","interface_name":"RouteDeck","auto_route":true,"strict_route":true,"stack":"system"}
+                    {"type":"tun","tag":"tun-in","interface_name":"RouteDeck","address":["172.19.0.1/30"],"auto_route":true,"strict_route":true,"stack":"system"}
                 ],
                 "outbounds": [],
                 "route": {"auto_detect_interface":true}
             });
-            assert!(validate_tun_config(&valid.to_string()).is_ok());
+            assert_eq!(
+                validate_tun_config(&valid.to_string()).unwrap(),
+                ExpectedFamilies {
+                    ipv4: true,
+                    ipv6: false,
+                }
+            );
+            let mut dual = valid.clone();
+            dual["inbounds"][1]["address"] =
+                serde_json::json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"]);
+            assert_eq!(
+                validate_tun_config(&dual.to_string()).unwrap(),
+                ExpectedFamilies {
+                    ipv4: true,
+                    ipv6: true,
+                }
+            );
             let mut foreign = valid.clone();
             foreign["inbounds"][0]["listen"] = serde_json::json!("0.0.0.0");
             assert!(validate_tun_config(&foreign.to_string()).is_err());
@@ -2353,6 +2821,172 @@ mod windows {
             assert!(!address_is_covered(&route, AF_INET, &[1, 1, 1, 1]));
             assert!(address_is_covered(&route, AF_INET, &[200, 1, 1, 1]));
             assert!(!address_is_covered(&route, AF_INET6, &[0; 16]));
+
+            assert!(enabled_capture_is_valid(
+                ExpectedFamilies {
+                    ipv4: true,
+                    ipv6: false,
+                },
+                true,
+                false,
+            ));
+            assert!(!enabled_capture_is_valid(
+                ExpectedFamilies {
+                    ipv4: true,
+                    ipv6: true,
+                },
+                true,
+                false,
+            ));
+        }
+
+        #[test]
+        fn cleanup_requires_the_exact_owned_adapter_and_routes_to_be_gone() {
+            assert_eq!(
+                cleanup_state_from(&[7], &[], Some(7)),
+                CleanupState::Conflict
+            );
+            assert_eq!(
+                cleanup_state_from(&[], &[7], Some(7)),
+                CleanupState::Conflict
+            );
+            assert_eq!(
+                cleanup_state_from(&[], &[99], Some(7)),
+                CleanupState::Complete
+            );
+            assert_eq!(
+                cleanup_state_from(&[], &[], Some(7)),
+                CleanupState::Complete
+            );
+        }
+
+        #[test]
+        fn stale_recovery_fails_closed_for_foreign_or_ambiguous_identity() {
+            assert!(stale_recovery_is_safe(
+                true,
+                &[],
+                &[],
+                Some(7),
+                StaleProcessIdentity::Absent,
+            ));
+            assert!(!stale_recovery_is_safe(
+                false,
+                &[],
+                &[],
+                Some(7),
+                StaleProcessIdentity::Absent,
+            ));
+            assert!(!stale_recovery_is_safe(
+                true,
+                &[99],
+                &[],
+                Some(7),
+                StaleProcessIdentity::Absent,
+            ));
+            assert!(!stale_recovery_is_safe(
+                true,
+                &[],
+                &[7],
+                Some(7),
+                StaleProcessIdentity::Absent,
+            ));
+            for identity in [
+                StaleProcessIdentity::Matching,
+                StaleProcessIdentity::Mismatched,
+                StaleProcessIdentity::Unknown,
+            ] {
+                assert!(!stale_recovery_is_safe(true, &[], &[], Some(7), identity));
+            }
+        }
+
+        #[test]
+        fn conflict_journal_preserves_process_adapter_and_route_ownership() {
+            let root = std::env::temp_dir().join(format!(
+                "routedeck-journal-preserve-test-{}",
+                random_hex(8).unwrap()
+            ));
+            fs::create_dir(&root).unwrap();
+            let mut journal =
+                TunJournal::create(&root, &"01".repeat(16), &"02".repeat(32)).unwrap();
+            journal.engine_pid = Some(123);
+            journal.engine_created = Some(456);
+            journal.owned_luid = Some(7);
+            journal.owned_routes = vec![default_route(7, AF_INET, 0)];
+            journal.mark_conflict().unwrap();
+
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&journal.path).unwrap()).unwrap();
+            assert_eq!(value["phase"], "conflict");
+            assert_eq!(value["enginePid"], 123);
+            assert_eq!(value["engineCreated"], 456);
+            assert_eq!(value["ownedInterfaceLuid"], 7);
+            assert_eq!(value["ownedRoutes"].as_array().unwrap().len(), 1);
+            validate_stored_tun_journal(&read_stored_tun_journal(&journal.path).unwrap()).unwrap();
+
+            journal.complete().unwrap();
+            fs::remove_dir(root).unwrap();
+        }
+
+        #[test]
+        fn exact_stale_journal_shape_can_be_removed_without_recursive_cleanup() {
+            let root = std::env::temp_dir().join(format!(
+                "routedeck-stale-shape-test-{}",
+                random_hex(8).unwrap()
+            ));
+            fs::create_dir(&root).unwrap();
+            let directory = root.join(format!("session-{}", "01".repeat(16)));
+            fs::create_dir(&directory).unwrap();
+            let config = br#"{"inbounds":[]}"#;
+            fs::write(directory.join("config.json"), config).unwrap();
+            let config_sha256 = format!("{:x}", Sha256::digest(config));
+            fs::write(
+                directory.join("tun-journal.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "schemaVersion": 2,
+                    "session": "02".repeat(16),
+                    "phase": "starting",
+                    "configSha256": config_sha256,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let candidate = inspect_stale_tun_candidate(directory.clone()).unwrap();
+            remove_stale_tun_candidate(candidate).unwrap();
+            assert!(!directory.exists());
+            fs::remove_dir(root).unwrap();
+        }
+
+        #[test]
+        fn journal_without_exact_identity_metadata_is_preserved() {
+            let root = std::env::temp_dir().join(format!(
+                "routedeck-stale-invalid-test-{}",
+                random_hex(8).unwrap()
+            ));
+            fs::create_dir(&root).unwrap();
+            let directory = root.join(format!("session-{}", "01".repeat(16)));
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("config.json"), b"{}").unwrap();
+            fs::write(
+                directory.join("tun-journal.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "schemaVersion": 2,
+                    "session": "02".repeat(16),
+                    "phase": "running",
+                    "configSha256": format!("{:x}", Sha256::digest(b"{}")),
+                    "enginePid": 123,
+                    "engineCreated": null,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            assert!(inspect_stale_tun_candidate(directory.clone()).is_err());
+            assert!(directory.join("tun-journal.json").exists());
+            fs::remove_file(directory.join("tun-journal.json")).unwrap();
+            fs::remove_file(directory.join("config.json")).unwrap();
+            fs::remove_dir(directory).unwrap();
+            fs::remove_dir(root).unwrap();
         }
 
         #[test]
@@ -2366,6 +3000,20 @@ mod windows {
 
 #[cfg(windows)]
 pub(crate) use windows::TunHelperLauncher;
+
+#[cfg(windows)]
+pub(crate) fn reconcile_stale_tun_sessions(
+    root: &std::path::Path,
+) -> Result<(), crate::engine_runtime::RuntimeError> {
+    windows::reconcile_stale_tun_sessions(root)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn reconcile_stale_tun_sessions(
+    _root: &std::path::Path,
+) -> Result<(), crate::engine_runtime::RuntimeError> {
+    Ok(())
+}
 
 #[cfg(windows)]
 pub fn helper_main() -> Result<(), String> {
