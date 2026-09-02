@@ -186,6 +186,7 @@ fn parse_vless_url(
             "flow",
             "type",
             "sni",
+            "insecure",
             "alpn",
             "fp",
             "pbk",
@@ -1625,6 +1626,33 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn imports_vless_uri_insecure_flag_and_standard_xray_fingerprints() {
+        for fingerprint in ["360", "qq"] {
+            let link = format!(
+                "vless://{UUID}@example.test:443?encryption=none&security=tls&type=tcp&sni=cover.test&insecure=1&fp={fingerprint}#TLS"
+            );
+            let report = import_subscription(link.as_bytes()).unwrap();
+            assert_eq!(report.nodes.len(), 1);
+            assert!(report.nodes[0].requires_insecure_approval());
+            let NodeProtocol::Vless(vless) = report.nodes[0].protocol() else {
+                panic!("expected VLESS node");
+            };
+            assert!(vless.tls.insecure);
+            assert_eq!(vless.tls.utls_fingerprint.as_deref(), Some(fingerprint));
+        }
+
+        let reality = format!(
+            "vless://{UUID}@example.test:443?encryption=none&security=reality&type=tcp&sni=cover.test&insecure=0&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2#Reality"
+        );
+        let report = import_subscription(reality.as_bytes()).unwrap();
+        let NodeProtocol::Vless(vless) = report.nodes[0].protocol() else {
+            panic!("expected VLESS node");
+        };
+        assert!(!vless.tls.insecure);
+        assert!(vless.tls.reality.is_some());
     }
 
     #[test]

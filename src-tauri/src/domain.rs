@@ -507,6 +507,8 @@ impl TlsOptions {
                 "safari",
                 "ios",
                 "android",
+                "360",
+                "qq",
                 "random",
                 "randomized",
             ];

@@ -310,6 +310,19 @@ mod tests {
             listen_port: 19191,
         })
         .is_err());
+
+        for fingerprint in ["360", "qq"] {
+            let link = format!(
+                "vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&type=tcp&sni=cover.test&fp={fingerprint}&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2"
+            );
+            let value: Value = serde_json::from_str(generate(&node(&link)).as_str()).unwrap();
+            assert_eq!(
+                value
+                    .pointer("/outbounds/0/streamSettings/realitySettings/fingerprint")
+                    .and_then(Value::as_str),
+                Some(fingerprint)
+            );
+        }
     }
 
     #[test]
