@@ -130,7 +130,10 @@ pub fn generate_xray_bridge_config(
     );
     match &vless.transport {
         VlessTransport::Tcp => {
-            stream.insert("network".into(), json!("tcp"));
+            // Xray renamed the plain TCP transport to `raw`; `tcp` remains a legacy alias,
+            // but the pinned 26.3.27 sidecar and current v2rayN profiles use the canonical
+            // name. Emit `raw` so REALITY/Vision follows the same transport path.
+            stream.insert("network".into(), json!("raw"));
         }
         VlessTransport::WebSocket { path, host } => {
             stream.insert("network".into(), json!("ws"));
@@ -240,7 +243,7 @@ mod tests {
                     },
                     "streamSettings": {
                         "security": "reality",
-                        "network": "tcp",
+                        "network": "raw",
                         "realitySettings": {
                             "serverName": "cover.test",
                             "fingerprint": "chrome",
