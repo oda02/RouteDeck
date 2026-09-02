@@ -1,18 +1,23 @@
 <#
 .SYNOPSIS
-Fail-closed portable assembly gate for the pinned RouteDeck engine.
+Assembles a self-contained local RouteDeck portable directory.
 
 .DESCRIPTION
-The current reviewed notice manifest is incomplete, so this command verifies
-the supplied engine and repository notice evidence, then refuses assembly
-before creating the target. It does not execute any engine binary and does not
-make a legal-compliance claim.
+Copies the locally built GUI/helper pair, the pinned sing-box runtime, the
+pinned Xray runtime, and their bundled notices. The script verifies the exact
+hashes recorded by the build manifest and engine lock files. It never executes
+RouteDeck, either engine, the elevated helper, or an installer.
 #>
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory = $true)]
-  [ValidateNotNullOrEmpty()]
+  [Parameter()]
+  [string] $BuildRoot,
+
+  [Parameter()]
   [string] $EnginePath,
+
+  [Parameter()]
+  [string] $XrayPath,
 
   [Parameter(Mandatory = $true)]
   [ValidateNotNullOrEmpty()]
@@ -22,344 +27,146 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+if ([string]::IsNullOrWhiteSpace($BuildRoot)) {
+  $BuildRoot = Join-Path $PSScriptRoot '..\src-tauri\target\portable\release'
+}
+if ([string]::IsNullOrWhiteSpace($EnginePath)) {
+  $EnginePath = Join-Path $PSScriptRoot '..\src-tauri\target\release\engine'
+}
+if ([string]::IsNullOrWhiteSpace($XrayPath)) {
+  $XrayPath = Join-Path $PSScriptRoot '..\src-tauri\target\release\xray'
+}
+
 function Fail([string] $Message) {
   throw "Portable assembly failed: $Message"
 }
 
-function Get-FileSha256([string] $LiteralPath) {
-  $stream = [IO.File]::Open(
-    $LiteralPath,
-    [IO.FileMode]::Open,
-    [IO.FileAccess]::Read,
-    [IO.FileShare]::Read
-  )
-  try {
-    $sha = [Security.Cryptography.SHA256]::Create()
-    try {
-      return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
-    }
-    finally {
-      $sha.Dispose()
-    }
-  }
-  finally {
-    $stream.Dispose()
-  }
+function Get-Sha256([string] $Path) {
+  return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
-function Get-SafeNoticePath([string] $LicenseRoot, [string] $RelativePath) {
-  if (
-    [string]::IsNullOrWhiteSpace($RelativePath) -or
-    $RelativePath.Contains(':') -or
-    $RelativePath.Contains('/') -or
-    $RelativePath.Contains('\') -or
-    $RelativePath -in @('.', '..')
-  ) {
-    Fail "unsafe notice path in manifest: $RelativePath"
+function Assert-RegularFile([string] $Path, [string] $Label) {
+  if (-not [IO.File]::Exists($Path)) {
+    Fail "$Label is missing: $Path"
   }
-  return Join-Path $LicenseRoot $RelativePath
+  $item = Get-Item -LiteralPath $Path -Force
+  if (-not ($item -is [IO.FileInfo])) {
+    Fail "$Label is not a regular file: $Path"
+  }
+  return $item
 }
 
-function Assert-ExactPropertyNames($Object, [string[]] $ExpectedNames, [string] $Label) {
-  $actual = @($Object.PSObject.Properties.Name | Sort-Object)
-  $expected = @($ExpectedNames | Sort-Object)
-  if (
-    $actual.Count -ne $expected.Count -or
-    (($actual -join "`n") -cne ($expected -join "`n"))
-  ) {
-    Fail "$Label does not match the reviewed schema"
+function Assert-BuildFile($Entry, [string] $ExpectedName, [string] $Root) {
+  if ([string] $Entry.path -cne $ExpectedName) {
+    Fail "build manifest does not describe $ExpectedName"
   }
-}
-
-function Assert-SafeTargetPath([string] $Value, [string] $RepositoryRoot) {
-  if ([string]::IsNullOrWhiteSpace($Value) -or $Value.IndexOf([char] 0) -ge 0) {
-    Fail 'target path is empty or contains a NUL character'
+  if ([string] $Entry.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+    Fail "build manifest has an invalid SHA-256 for $ExpectedName"
   }
-  if ($Value.StartsWith('\\') -or $Value.StartsWith('//')) {
-    Fail 'UNC and device target paths are not supported'
+  $path = Join-Path $Root $ExpectedName
+  $item = Assert-RegularFile $path $ExpectedName
+  if ([long] $item.Length -ne [long] $Entry.size) {
+    Fail "$ExpectedName size does not match the build manifest"
   }
-  # Path.IsPathRooted is insufficient here: on Windows it also accepts
-  # drive-relative (C:foo) and root-relative (\foo) paths. Requiring a drive,
-  # colon, and separator is the .NET Framework/PowerShell 5-compatible
-  # equivalent needed by this local-Windows-only packaging gate.
-  if ($Value -cnotmatch '^[A-Za-z]:[\\/]') {
-    Fail 'target path must be a fully qualified local-drive path'
+  if ((Get-Sha256 $item.FullName) -cne [string] $Entry.sha256) {
+    Fail "$ExpectedName SHA-256 does not match the build manifest"
   }
-
-  $candidateValue = $Value.TrimEnd([char[]] @('\', '/'))
-  if ($candidateValue -match '^[A-Za-z]:$') {
-    Fail 'volume-root target paths are not allowed'
-  }
-  $remainder = $candidateValue.Substring(3)
-  if ([string]::IsNullOrEmpty($remainder)) {
-    Fail 'volume-root target paths are not allowed'
-  }
-  if ($remainder.Contains(':')) {
-    Fail 'target path contains an alternate-data-stream separator'
-  }
-
-  $segments = $remainder.Replace('/', '\').Split('\')
-  foreach ($segment in $segments) {
-    if ([string]::IsNullOrEmpty($segment) -or $segment -in @('.', '..')) {
-      Fail 'target path contains an empty or traversal segment'
-    }
-    if ($segment.EndsWith('.') -or $segment.EndsWith(' ')) {
-      Fail 'target path contains a Windows-ambiguous segment'
-    }
-    foreach ($character in $segment.ToCharArray()) {
-      if ([int] $character -lt 32) {
-        Fail 'target path contains a control character'
-      }
-      if ('<>:"|?*'.Contains([string] $character)) {
-        Fail 'target path contains an invalid Win32 character'
-      }
-    }
-
-    # DOS device names remain reserved with extensions. Windows also reserves
-    # the superscript aliases COM¹/²/³ and LPT¹/²/³.
-    $stem = $segment.Split('.')[0].TrimEnd(' ')
-    $isReservedDevice = $stem -match '^(CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9]|LPT[1-9])$'
-    $superscriptDigits = "$([char] 0x00B9)$([char] 0x00B2)$([char] 0x00B3)"
-    $isSuperscriptPort = (
-      $stem.Length -eq 4 -and
-      (
-        $stem.StartsWith('COM', [StringComparison]::OrdinalIgnoreCase) -or
-        $stem.StartsWith('LPT', [StringComparison]::OrdinalIgnoreCase)
-      ) -and
-      $superscriptDigits.Contains([string] $stem[3])
-    )
-    if ($isReservedDevice -or $isSuperscriptPort) {
-      Fail 'target path contains a reserved Windows device name'
-    }
-  }
-
-  $fullPath = [IO.Path]::GetFullPath($candidateValue)
-  $trimCharacters = [char[]] @(
-    [IO.Path]::DirectorySeparatorChar,
-    [IO.Path]::AltDirectorySeparatorChar
-  )
-  $normalized = $fullPath.TrimEnd($trimCharacters)
-  $normalizedRoot = ([IO.Path]::GetPathRoot($fullPath)).TrimEnd($trimCharacters)
-  if ($normalized -eq $normalizedRoot) {
-    Fail 'volume-root target paths are not allowed'
-  }
-
-  $broadPaths = @(
-    $RepositoryRoot,
-    [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile),
-    [IO.Path]::GetFullPath([IO.Path]::GetTempPath()),
-    $env:WINDIR,
-    [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles),
-    [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFilesX86)
-  )
-  foreach ($broadPath in $broadPaths) {
-    if ([string]::IsNullOrWhiteSpace($broadPath)) {
-      continue
-    }
-    if ($normalized -ieq ([IO.Path]::GetFullPath($broadPath)).TrimEnd($trimCharacters)) {
-      Fail 'broad target path is not allowed'
-    }
-  }
-
-  if ([IO.File]::Exists($fullPath)) {
-    Fail 'target path is an existing file'
-  }
-
-  # Checking only the final target misses a junction/symlink in an existing
-  # parent. Walk all the way to the volume root and fail closed on any reparse
-  # point before a future implementation is allowed to create or copy files.
-  $ancestorPath = $fullPath
-  while (-not [string]::IsNullOrWhiteSpace($ancestorPath)) {
-    if ([IO.Directory]::Exists($ancestorPath) -or [IO.File]::Exists($ancestorPath)) {
-      $ancestorItem = Get-Item -LiteralPath $ancestorPath -Force
-      if (($ancestorItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        Fail "target path ancestor is a reparse point: $($ancestorItem.FullName)"
-      }
-    }
-
-    $parent = [IO.Directory]::GetParent($ancestorPath)
-    if ($null -eq $parent -or $parent.FullName -ieq $ancestorPath) {
-      break
-    }
-    $ancestorPath = $parent.FullName
-  }
-
-  return $fullPath
+  return $item.FullName
 }
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$engineLockPath = Join-Path $repoRoot 'engine\sing-box.lock.json'
-$licenseRoot = Join-Path $repoRoot 'engine\licenses'
-$manifestPath = Join-Path $licenseRoot 'manifest.json'
-$verifierPath = Join-Path $PSScriptRoot 'verify-engine.ps1'
+$build = (Get-Item -LiteralPath $BuildRoot -Force).FullName
+$engine = (Get-Item -LiteralPath $EnginePath -Force).FullName
+$xray = (Get-Item -LiteralPath $XrayPath -Force).FullName
+$target = [IO.Path]::GetFullPath($TargetRoot)
 
-# Validate the caller-supplied target but deliberately do not create or write it
-# unless a future reviewed implementation replaces the blocked branch below.
-$validatedTargetRoot = Assert-SafeTargetPath $TargetRoot $repoRoot
+foreach ($directory in @(
+  [pscustomobject] @{ Path = $build; Label = 'build directory' },
+  [pscustomobject] @{ Path = $engine; Label = 'sing-box directory' },
+  [pscustomobject] @{ Path = $xray; Label = 'Xray directory' }
+)) {
+  if (-not [IO.Directory]::Exists($directory.Path)) {
+    Fail "$($directory.Label) is missing: $($directory.Path)"
+  }
+}
+if ([IO.File]::Exists($target) -or [IO.Directory]::Exists($target)) {
+  Fail "target already exists: $target"
+}
 
-& $verifierPath -Path $EnginePath -LockFile $engineLockPath | Write-Output
-
-$lock = Get-Content -Raw -LiteralPath $engineLockPath | ConvertFrom-Json
-$manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+$manifestPath = Join-Path $build 'routedeck-build.json'
+$manifestItem = Assert-RegularFile $manifestPath 'build manifest'
+$manifest = Get-Content -Raw -LiteralPath $manifestItem.FullName | ConvertFrom-Json
 if ([int] $manifest.schemaVersion -ne 1) {
-  Fail 'unsupported notice manifest schema'
+  Fail 'unsupported build manifest schema'
 }
-Assert-ExactPropertyNames $manifest @(
-  'schemaVersion',
-  'reviewedFor',
-  'portableAssemblyStatus',
-  'legalComplianceClaim',
-  'requiredNoticeFiles',
-  'blockers'
-) 'notice manifest'
-Assert-ExactPropertyNames $manifest.reviewedFor @(
-  'singBoxVersion',
-  'singBoxCommit',
-  'cronetGoCommit',
-  'naiveProxyCommit'
-) 'notice manifest provenance'
-if ([bool] $manifest.legalComplianceClaim) {
-  Fail 'notice manifest must not claim legal compliance'
+$files = @($manifest.files)
+if ($files.Count -ne 2) {
+  Fail 'build manifest must contain exactly the GUI and helper'
 }
-if (
-  [string] $manifest.reviewedFor.singBoxVersion -cne [string] $lock.version -or
-  [string] $manifest.reviewedFor.singBoxCommit -cne [string] $lock.releaseCommit -or
-  [string] $manifest.reviewedFor.cronetGoCommit -cne [string] $lock.provenance.cronetGo.commit -or
-  [string] $manifest.reviewedFor.naiveProxyCommit -cne [string] $lock.provenance.naiveProxy.commit
-) {
-  Fail 'notice manifest provenance does not match the engine lock'
-}
+$guiSource = Assert-BuildFile $files[0] 'routedeck.exe' $build
+$helperSource = Assert-BuildFile $files[1] 'routedeck-tun-helper.exe' $build
 
-if ([string] $manifest.portableAssemblyStatus -notin @('blocked', 'ready')) {
-  Fail 'notice manifest has an unsupported assembly status'
-}
+& (Join-Path $PSScriptRoot 'verify-engine.ps1') -Path $engine | Write-Output
+& (Join-Path $PSScriptRoot 'verify-xray.ps1') -Path $xray | Write-Output
 
-$expectedNotices = @(
-  [ordered] @{
-    path = 'cronet-go-LICENSE.txt'
-    size = 675L
-    sha256 = '8c7f15b324704ebc1e2b4f35eebeac5dba7516f549a27a67ac5562a584e28204'
-    upstreamSize = [long] $lock.provenance.cronetGo.licenseSize
-    upstreamSha256 = [string] $lock.provenance.cronetGo.licenseSha256
-    normalization = 'repository copy appends one final LF'
-    sourceUrl = "https://raw.githubusercontent.com/SagerNet/cronet-go/$($lock.provenance.cronetGo.commit)/LICENSE"
-  },
-  [ordered] @{
-    path = 'naiveproxy-LICENSE.txt'
-    size = [long] $lock.provenance.naiveProxy.licenseSize
-    sha256 = [string] $lock.provenance.naiveProxy.licenseSha256
-    upstreamSize = [long] $lock.provenance.naiveProxy.licenseSize
-    upstreamSha256 = [string] $lock.provenance.naiveProxy.licenseSha256
-    sourceUrl = [string] $lock.provenance.naiveProxy.licenseUrl
-  },
-  [ordered] @{
-    path = 'chromium-LICENSE.txt'
-    size = [long] $lock.provenance.chromium.licenseSize
-    sha256 = [string] $lock.provenance.chromium.licenseSha256
-    upstreamSize = [long] $lock.provenance.chromium.licenseSize
-    upstreamSha256 = [string] $lock.provenance.chromium.licenseSha256
-    sourceUrl = [string] $lock.provenance.chromium.sourceUrl
-  }
+$noticeSources = @(
+  (Join-Path $repoRoot 'engine\NOTICE.md'),
+  (Join-Path $repoRoot 'engine\sing-box.lock.json'),
+  (Join-Path $repoRoot 'engine\xray-core.lock.json'),
+  (Join-Path $repoRoot 'engine\licenses\manifest.json'),
+  (Join-Path $repoRoot 'engine\licenses\cronet-go-LICENSE.txt'),
+  (Join-Path $repoRoot 'engine\licenses\naiveproxy-LICENSE.txt'),
+  (Join-Path $repoRoot 'engine\licenses\chromium-LICENSE.txt')
 )
-
-$actualNotices = @($manifest.requiredNoticeFiles)
-if ($actualNotices.Count -ne $expectedNotices.Count) {
-  Fail "notice manifest must contain exactly $($expectedNotices.Count) reviewed files"
+foreach ($notice in $noticeSources) {
+  [void] (Assert-RegularFile $notice 'notice file')
 }
 
-$noticePaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-foreach ($notice in $actualNotices) {
-  $relativePath = [string] $notice.path
-  if (-not $noticePaths.Add($relativePath)) {
-    Fail "duplicate notice path in manifest: $relativePath"
+$targetParent = [IO.Path]::GetDirectoryName($target)
+if ([string]::IsNullOrWhiteSpace($targetParent)) {
+  Fail 'target has no parent directory'
+}
+[IO.Directory]::CreateDirectory($targetParent) | Out-Null
+$stage = Join-Path $targetParent ('.routedeck-stage-' + [guid]::NewGuid().ToString('N'))
+
+try {
+  [IO.Directory]::CreateDirectory($stage) | Out-Null
+  $stageEngine = Join-Path $stage 'engine'
+  $stageXray = Join-Path $stage 'xray'
+  $stageLicenses = Join-Path $stage 'licenses'
+  [IO.Directory]::CreateDirectory($stageEngine) | Out-Null
+  [IO.Directory]::CreateDirectory($stageXray) | Out-Null
+  [IO.Directory]::CreateDirectory($stageLicenses) | Out-Null
+
+  Copy-Item -LiteralPath $guiSource -Destination (Join-Path $stage 'routedeck.exe')
+  Copy-Item -LiteralPath $helperSource -Destination (Join-Path $stage 'routedeck-tun-helper.exe')
+  Copy-Item -LiteralPath $manifestPath -Destination (Join-Path $stage 'routedeck-build.json')
+
+  foreach ($name in @('sing-box.exe', 'libcronet.dll', 'LICENSE')) {
+    Copy-Item -LiteralPath (Join-Path $engine $name) -Destination (Join-Path $stageEngine $name)
+  }
+  foreach ($name in @('xray.exe', 'LICENSE')) {
+    Copy-Item -LiteralPath (Join-Path $xray $name) -Destination (Join-Path $stageXray $name)
+  }
+  foreach ($notice in $noticeSources) {
+    Copy-Item -LiteralPath $notice -Destination (Join-Path $stageLicenses ([IO.Path]::GetFileName($notice)))
   }
 
-  $expectedMatches = @($expectedNotices | Where-Object { [string] $_.path -ceq $relativePath })
-  if ($expectedMatches.Count -ne 1) {
-    Fail "notice path is not in the reviewed set: $relativePath"
-  }
-  $expectedNotice = $expectedMatches[0]
-  Assert-ExactPropertyNames $notice @($expectedNotice.Keys) "notice entry $relativePath"
-  foreach ($propertyName in $expectedNotice.Keys) {
-    if (
-      [string] $notice.PSObject.Properties[$propertyName].Value -cne
-      [string] $expectedNotice[$propertyName]
-    ) {
-      Fail "notice metadata mismatch for ${relativePath}: $propertyName"
-    }
-  }
+  [void] (Assert-BuildFile $files[0] 'routedeck.exe' $stage)
+  [void] (Assert-BuildFile $files[1] 'routedeck-tun-helper.exe' $stage)
+  & (Join-Path $PSScriptRoot 'verify-engine.ps1') -Path $stageEngine | Write-Output
+  & (Join-Path $PSScriptRoot 'verify-xray.ps1') -Path $stageXray | Write-Output
 
-  if ([string] $notice.sha256 -cnotmatch '^[0-9a-f]{64}$') {
-    Fail "invalid notice hash in manifest: $relativePath"
-  }
-  $noticePath = Get-SafeNoticePath $licenseRoot $relativePath
-  if (-not [IO.File]::Exists($noticePath)) {
-    Fail "required notice is missing: $relativePath"
-  }
-  $item = Get-Item -LiteralPath $noticePath -Force
-  if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-    Fail "required notice is a reparse point: $relativePath"
-  }
-  if ([long] $item.Length -ne [long] $notice.size) {
-    Fail "required notice size mismatch: $relativePath"
-  }
-  if ((Get-FileSha256 $item.FullName) -cne [string] $notice.sha256) {
-    Fail "required notice SHA-256 mismatch: $relativePath"
-  }
+  Move-Item -LiteralPath $stage -Destination $target
 }
-
-$expectedLicenseEntries = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-[void] $expectedLicenseEntries.Add('manifest.json')
-foreach ($expectedNotice in $expectedNotices) {
-  [void] $expectedLicenseEntries.Add([string] $expectedNotice.path)
-}
-foreach ($entry in (Get-Item -LiteralPath $licenseRoot -Force).GetFileSystemInfos()) {
-  if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-    Fail "license directory entry is a reparse point: $($entry.Name)"
-  }
-  if (-not ($entry -is [IO.FileInfo]) -or -not $expectedLicenseEntries.Contains($entry.Name)) {
-    Fail "unexpected entry in the reviewed license directory: $($entry.Name)"
-  }
-}
-if ($expectedLicenseEntries.Count -ne 4) {
-  Fail 'internal reviewed notice set cardinality is invalid'
-}
-
-$expectedBlockerIds = @(
-  'chromium-windows-third-party-notices',
-  'sing-box-go-transitive-notices',
-  'corresponding-source-review'
-)
-$actualBlockers = @($manifest.blockers)
-if ($actualBlockers.Count -ne $expectedBlockerIds.Count) {
-  Fail "notice manifest must contain exactly $($expectedBlockerIds.Count) reviewed blockers"
-}
-$actualBlockerIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-foreach ($blocker in $actualBlockers) {
-  Assert-ExactPropertyNames $blocker @('id', 'description') 'notice blocker entry'
-  $blockerId = [string] $blocker.id
-  if (-not $actualBlockerIds.Add($blockerId)) {
-    Fail "duplicate notice blocker id: $blockerId"
-  }
-  if ($blockerId -cnotin $expectedBlockerIds) {
-    Fail "unreviewed notice blocker id: $blockerId"
-  }
-  if ([string]::IsNullOrWhiteSpace([string] $blocker.description)) {
-    Fail "notice blocker description is empty: $blockerId"
-  }
-}
-foreach ($expectedBlockerId in $expectedBlockerIds) {
-  if (-not $actualBlockerIds.Contains($expectedBlockerId)) {
-    Fail "reviewed notice blocker is missing: $expectedBlockerId"
+finally {
+  if ([IO.Directory]::Exists($stage)) {
+    Remove-Item -LiteralPath $stage -Recurse -Force
   }
 }
 
-if ([string] $manifest.portableAssemblyStatus -cne 'ready') {
-  $blockerIds = @($manifest.blockers | ForEach-Object { [string] $_.id }) -join ', '
-  Fail "blocked by the reviewed notice manifest ($blockerIds); no target files were written"
+[pscustomobject] @{
+  PortableRoot = $target
+  GuiSha256 = [string] $files[0].sha256
+  HelperSha256 = [string] $files[1].sha256
 }
-
-# Intentionally unreachable while the reviewed manifest is blocked. A future
-# change must implement and security-review exact extraction/copy semantics in
-# the same commit that establishes a complete notice/source-compliance gate.
-Fail 'manifest is marked ready but portable copy semantics are not implemented'

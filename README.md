@@ -1,6 +1,6 @@
 # RouteDeck
 
-RouteDeck is a portable-first Windows desktop client planned around `sing-box`. The initial repository is deliberately only a safe Tauri shell: it does not download a core, change Windows proxy settings, request elevation, or create routes.
+RouteDeck is a portable-first Windows desktop client built around pinned `sing-box` and Xray runtimes. The application supports current-user System Proxy and keeps TUN elevation in a separate on-demand helper; it does not install a service.
 
 ## Product goals
 
@@ -50,10 +50,17 @@ npm run build
 cargo check --locked --manifest-path src-tauri/Cargo.toml
 ```
 
-Use `npm run tauri dev` only after dependencies have been reviewed and installed. The current shell has no privileged command and does not require `sing-box`.
+Use `npm run tauri dev` only after dependencies have been reviewed and installed.
 
 ## Portable packaging
 
-The first deliverable is a directory containing the RouteDeck executable, the reviewed `sing-box.exe`, its required companion files (including `libcronet.dll` when Naive is enabled), licenses, and configuration templates. `tauri build --no-bundle` produces the application executable without an installer. Distribution assembly and binary verification will be separate, explicit steps; the frontend build never downloads binaries.
+`scripts/build-local-portable.ps1` builds the GUI and on-demand TUN helper into an isolated target directory and records their exact hashes in `routedeck-build.json`. It does not download engines. With the pinned engine directories already staged, assemble the self-contained local folder without an installer or service:
 
-See [ADR-0001](docs/adr/0001-portable-system-proxy-and-uac-tun.md) for the privilege model. Public portable assembly is deliberately fail-closed; the [portable compliance evidence plan](docs/portable-compliance-plan.md) records the unresolved notice/source blockers and the reproducible gate required before distribution.
+```powershell
+pwsh -NoProfile -File scripts\build-local-portable.ps1
+pwsh -NoProfile -File scripts\assemble-portable.ps1 -TargetRoot src-tauri\target\portable\RouteDeck
+```
+
+The output contains `routedeck.exe`, its fixed sibling helper, exact `engine` and `xray` runtime directories, and a separate `licenses` directory. The assembler verifies the GUI/helper build manifest and both engine lockfiles before and after copying, and never runs any packaged executable.
+
+See [ADR-0001](docs/adr/0001-portable-system-proxy-and-uac-tun.md) for the privilege model. This local portable workflow is separate from a public redistribution decision; the [portable compliance evidence plan](docs/portable-compliance-plan.md) records the remaining public-release notice/source work.

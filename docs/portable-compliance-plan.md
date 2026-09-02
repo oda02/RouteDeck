@@ -1,6 +1,7 @@
 # Portable engine compliance evidence plan
 
-Status: **public portable assembly remains blocked**.
+Status: **public redistribution review remains blocked**. This does not block
+the hash-verified local portable folder used for development and testing.
 
 This document is an engineering evidence plan, not legal advice and not a
 claim that redistributing the pinned engine is compliant. It records what is
@@ -331,17 +332,17 @@ All conditions below are mandatory:
    source artifacts are durable and hash-pinned.
 6. A qualified reviewer records an explicit redistribution decision. The
    machine manifest must not synthesize this decision from scanner success.
-7. `scripts/assemble-portable.ps1` is updated in the same reviewed change to
-   validate the complete manifest and implement safe, exact copy semantics.
+7. The public release workflow is updated in the same reviewed change to
+   validate the complete approved manifest and exact redistributed file set.
 8. Negative tests prove that a status-only flip, missing/extra/tampered text,
    changed source pin, unreviewed component, toolchain mismatch, incomplete
    source set, or stale generated bundle fails before writing a target.
 9. The gate passes under Windows PowerShell 5.1 and PowerShell 7 with identical
    semantic results.
 
-Until every condition is met, `portableAssemblyStatus` must remain `blocked`,
-`legalComplianceClaim` must remain `false`, and the assembly script must fail
-before target creation or copy.
+Until every condition is met, `portableAssemblyStatus` must remain `blocked`
+and `legalComplianceClaim` must remain `false`; a locally assembled test folder
+must not be presented as an approved public redistribution.
 
 ## Primary upstream evidence
 

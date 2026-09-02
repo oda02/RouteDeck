@@ -2,7 +2,8 @@
 
 - Review date: 2026-09-01
 - Artifact: official sing-box 1.13.19 Windows amd64 no-suffix release
-- Portable assembly status: **blocked**
+- Local portable assembly status: **available**
+- Public redistribution review: **incomplete**
 - Legal conclusion: **none** — this is engineering evidence, not legal advice or a compliance claim
 
 ## Pinned binary chain
@@ -26,11 +27,11 @@ The pinned chain is:
 
 Counts above are reproducible observations from the non-truncated GitHub trees at the pinned commits; they do not establish which third-party units are linked into either binary and are not legal conclusions.
 
-## Why assembly remains blocked
+## Public redistribution work still open
 
 The three texts under `engine/licenses/` are authentic and hash-pinned, but they are not demonstrated to be a complete notice set for the Windows Cronet DLL or the Go dependencies in `sing-box.exe`. The exact source repositories are identified below, but this review does not determine whether pointing to them satisfies any corresponding-source or written-offer requirement.
 
-`scripts/assemble-portable.ps1` therefore verifies the engine and the notice files, reads this manifest, and fails before creating or copying to its target. A later reviewed change must provide a dependency-filtered Windows Cronet notice bundle, a complete sing-box dependency notice inventory, and a reviewed source-compliance plan before changing `portableAssemblyStatus` and implementing the copy step.
+`scripts/assemble-portable.ps1` supports local self-contained test builds: it verifies the exact pinned engine/Xray files and copies the available licenses and this notice without making a legal-compliance claim. Before publishing a public redistribution, a later review still needs a dependency-filtered Windows Cronet notice bundle, a complete sing-box dependency notice inventory, and a source-compliance decision. The detailed evidence manifest remains marked `blocked` for that public-release purpose.
 
 ## Point-in-time malware scan
 

@@ -25,8 +25,8 @@ Checked through 2026-09-02 in the local Windows workspace.
 - `cargo check` must run through `VsDevCmd.bat` (or another shell where MSVC tools including `link.exe` are already on `PATH`).
 - Deterministic Rust tests cover the local-only controller and the native sealed-engine preflight, but isolated Windows integration and privileged tests remain intentionally out of scope.
 - The PowerShell verifier is not the runtime integrity-and-launch gate. The native controller now copies only verified held engine files into a protected per-session LocalAppData directory and revalidates exact contents, file IDs, owner/DACL, reparse state, and late-create denial immediately before suspended launch. Independent review and hostile multi-user/concurrency tests in a disposable Windows VM remain release gates.
-- The upstream ZIP includes the sing-box GPL-3.0-or-later license but not a complete Cronet/Chromium or sing-box dependency notice inventory. Authentic top-level Cronet/NaiveProxy/Chromium license texts and the unresolved evidence are pinned under `engine/licenses/` and `engine/NOTICE.md`. `scripts/assemble-portable.ps1` enforces the exact reviewed notice schema, provenance, hashes, set cardinality, and current `blocked` status before any target action. `scripts/test-assemble-portable.ps1` exercises tamper and no-write cases. This is not a legal-compliance claim; release packaging remains blocked pending the documented Windows Cronet notices, sing-box transitive notices, and source-compliance review.
-- Xray is staged only as a reviewed local sidecar input by this change; application selection/launch and public packaging are separate work. The lock establishes artifact and MPL-2.0 source/license provenance, not a broader legal-compliance claim.
+- `scripts/build-local-portable.ps1` produces the exact GUI/helper pair plus a hash manifest. `scripts/assemble-portable.ps1` verifies that manifest and both pinned engine directories, then creates a self-contained local folder with the runtime-required layout and the available license/notice material. It never launches an executable. `scripts/test-assemble-portable.ps1` covers successful layout, hash tampering, missing Xray files, existing-target preservation, and staging cleanup.
+- The upstream sing-box ZIP does not include a complete Cronet/Chromium or Go dependency notice inventory. The current local portable folder includes all available pinned top-level texts and provenance, but this is not a legal-compliance claim or approval for public redistribution. The remaining public-release evidence work stays documented in `docs/portable-compliance-plan.md`.
 
 ## Reproduce the checks
 
@@ -38,7 +38,9 @@ npm run build
 cmd /d /s /c 'call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 && cargo check --locked --offline --manifest-path src-tauri\Cargo.toml'
 pwsh -NoProfile -File scripts\verify-engine.ps1 -Path <release-zip-or-extracted-engine-directory>
 pwsh -NoProfile -File scripts\test-verify-engine.ps1 -ArchivePath <reviewed-release-zip>
-pwsh -NoProfile -File scripts\test-assemble-portable.ps1 -ArchivePath <reviewed-release-zip>
+pwsh -NoProfile -File scripts\build-local-portable.ps1
+pwsh -NoProfile -File scripts\test-assemble-portable.ps1
+pwsh -NoProfile -File scripts\assemble-portable.ps1 -TargetRoot src-tauri\target\portable\RouteDeck
 pwsh -NoProfile -File scripts\verify-xray.ps1 -Path <Xray-windows-64.zip> -DigestPath <Xray-windows-64.zip.dgst>
 pwsh -NoProfile -File scripts\test-xray-artifact.ps1 -ArchivePath <Xray-windows-64.zip> -DigestPath <Xray-windows-64.zip.dgst>
 pwsh -NoProfile -File scripts\stage-xray.ps1 -ArchivePath <Xray-windows-64.zip> -DigestPath <Xray-windows-64.zip.dgst> -Destination <empty-sidecar-directory>

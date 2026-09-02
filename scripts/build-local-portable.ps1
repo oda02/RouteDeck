@@ -10,6 +10,7 @@ $portableTargetRoot = Join-Path $tauriRoot 'target\portable'
 $releaseRoot = Join-Path $portableTargetRoot 'release'
 $helperPath = Join-Path $releaseRoot 'routedeck-tun-helper.exe'
 $guiPath = Join-Path $releaseRoot 'routedeck.exe'
+$manifestPath = Join-Path $releaseRoot 'routedeck-build.json'
 $hashVariable = 'ROUTEDECK_TUN_HELPER_SHA256'
 $targetVariable = 'CARGO_TARGET_DIR'
 
@@ -81,11 +82,32 @@ $postBuildHash = (Get-FileHash -LiteralPath $helperPath -Algorithm SHA256).Hash.
 if ($postBuildHash -cne $helperHash) {
   throw 'TUN helper changed after its SHA-256 was embedded in the GUI build'
 }
+$guiItem = Get-Item -LiteralPath $guiPath -Force
+$helperItem = Get-Item -LiteralPath $helperPath -Force
+$guiHash = (Get-FileHash -LiteralPath $guiPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$manifest = [ordered] @{
+  schemaVersion = 1
+  files = @(
+    [ordered] @{
+      path = 'routedeck.exe'
+      size = [long] $guiItem.Length
+      sha256 = $guiHash
+    },
+    [ordered] @{
+      path = 'routedeck-tun-helper.exe'
+      size = [long] $helperItem.Length
+      sha256 = $helperHash
+    }
+  )
+}
+$manifestJson = $manifest | ConvertTo-Json -Depth 4
+[IO.File]::WriteAllText($manifestPath, $manifestJson + "`n", [Text.UTF8Encoding]::new($false))
 
 $result = [pscustomobject]@{
   Gui = $guiPath
   Helper = $helperPath
   HelperSha256 = $helperHash
+  Manifest = $manifestPath
 }
 }
 finally {

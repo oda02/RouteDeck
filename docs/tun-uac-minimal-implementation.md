@@ -213,7 +213,9 @@ builds the production frontend and only the GUI Rust target with that exact dige
 second pass deliberately names `--bin routedeck`, so it cannot rewrite the pinned helper; the
 script then verifies that the helper did not change between passes. Authenticode is optional
 additional provenance, not a launch
-requirement. On the normal development PC, run only unit tests and build checks. The first real
+requirement. The script also writes `routedeck-build.json`; pass a new `TargetRoot` to
+`scripts/assemble-portable.ps1` to create the complete sibling layout with pinned sing-box,
+Xray, and license files. On the normal development PC, run only unit tests and build checks. The first real
 UAC/TUN test still belongs in the disposable Windows snapshot required by `AGENTS.md`; after the
 exact-hash pair passes those tests, the ordinary live test is simply Connect, approve the
 standard UAC prompt, verify traffic, then Disconnect and inspect exact cleanup.
