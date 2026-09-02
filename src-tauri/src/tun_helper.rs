@@ -25,10 +25,17 @@ mod windows {
             GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         NetworkManagement::IpHelper::{
-            GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
-            GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST, IP_ADAPTER_ADDRESSES_LH,
+            FreeMibTable, GetAdaptersAddresses, GetBestRoute2, GetIfEntry2, GetIpForwardTable2,
+            GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+            GAA_FLAG_SKIP_UNICAST, IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211, IF_TYPE_PPP,
+            IF_TYPE_TUNNEL, IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2, MIB_IPFORWARD_ROW2,
+            MIB_IPFORWARD_TABLE2,
         },
-        Networking::WinSock::AF_UNSPEC,
+        NetworkManagement::Ndis::TUNNEL_TYPE_NONE,
+        Networking::WinSock::{
+            AF_INET, AF_INET6, AF_UNSPEC, IN6_ADDR, IN_ADDR, SOCKADDR_IN, SOCKADDR_IN6,
+            SOCKADDR_INET,
+        },
         Security::{
             Authorization::{
                 ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -62,13 +69,13 @@ mod windows {
     use crate::{
         engine_runtime::{
             random_hex, DiagnosticBuffer, EngineLauncher, ManagedChild, RuntimeError,
-            SessionConfig, VerifiedEngineLauncher,
+            SessionConfig, TunCaptureSnapshot, VerifiedEngineLauncher,
         },
         redaction::Redactor,
         tun_helper_protocol::{
             pipe_suffix, read_frame, session_id, write_frame, CleanupState, Frame,
-            HelperFailureCode, HelperPhase, ServerState, UpstreamChoice, MAX_CONFIG_BYTES,
-            PROTOCOL_VERSION,
+            HelperFailureCode, HelperPhase, ServerState, TunInterfaceState, UpstreamChoice,
+            MAX_CONFIG_BYTES, PROTOCOL_VERSION,
         },
     };
 
@@ -185,6 +192,7 @@ mod windows {
         prepared: PreparedTransfer,
         expected_helper_sha256: Option<&str>,
     ) -> Result<TunHelperChild, RuntimeError> {
+        let route_context = preflight_route_context()?;
         let helper_path = fixed_helper_path()?;
         let _helper_guard = verify_helper_for_launch(&helper_path, expected_helper_sha256)?;
         let session = random_hex(16)?;
@@ -234,7 +242,7 @@ mod windows {
             },
         )
         .map_err(protocol_runtime_error)?;
-        let preflight_sha256 = preflight_digest(&prepared.config_sha256);
+        let preflight_sha256 = preflight_digest(&prepared.config_sha256, &route_context);
         write_frame(
             &mut pipe,
             &Frame::StartTun {
@@ -269,10 +277,14 @@ mod windows {
             }),
             Frame::Failure {
                 request_id: 2,
-                code: _,
+                code,
                 safe_detail,
             } => Err(RuntimeError::new(
-                "start_engine",
+                match code {
+                    HelperFailureCode::PreflightConflict => "tun_preflight",
+                    HelperFailureCode::CaptureInvalid => "tun_capture",
+                    _ => "start_engine",
+                },
                 safe_detail.unwrap_or_else(|| "elevated TUN helper rejected startup".into()),
             )),
             _ => Err(RuntimeError::new(
@@ -282,10 +294,11 @@ mod windows {
         }
     }
 
-    fn preflight_digest(config_sha256: &str) -> String {
+    fn preflight_digest(config_sha256: &str, route_context: &str) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(b"RouteDeck TUN current-path launch context v1\0");
+        hasher.update(b"RouteDeck TUN current-path launch context v2\0");
         hasher.update(config_sha256.as_bytes());
+        hasher.update(route_context.as_bytes());
         format!("{:x}", hasher.finalize())
     }
 
@@ -334,16 +347,10 @@ mod windows {
                 )),
             }
         }
-    }
 
-    impl ManagedChild for TunHelperChild {
-        fn pid(&self) -> u32 {
-            self.engine_pid
-        }
-
-        fn is_alive(&mut self) -> Result<bool, RuntimeError> {
+        fn query_running_state(&mut self) -> Result<Option<TunCaptureSnapshot>, RuntimeError> {
             if self.stopped || !self.helper_running()? {
-                return Ok(false);
+                return Ok(None);
             }
             let request_id = self.next_request()?;
             let pipe = self.pipe.as_mut().ok_or_else(|| {
@@ -364,6 +371,7 @@ mod windows {
                     phase: HelperPhase::Running,
                     engine_pid: Some(pid),
                     cleanup: CleanupState::NotRequired,
+                    capture: Some(capture),
                 } if response_id == request_id && pid == self.engine_pid => {
                     let engine = unsafe {
                         OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, self.engine_pid)
@@ -373,18 +381,48 @@ mod windows {
                         "engine_process",
                         "could not reopen the helper-owned sing-box process",
                     )?;
-                    Ok(process_creation_time(engine.raw())? == self.engine_created)
+                    if process_creation_time(engine.raw())? != self.engine_created {
+                        return Ok(None);
+                    }
+                    Ok(Some(TunCaptureSnapshot {
+                        interface_luid: capture.interface_luid,
+                        in_octets: capture.in_octets,
+                        out_octets: capture.out_octets,
+                    }))
                 }
                 Frame::State {
                     request_id: response_id,
                     phase: HelperPhase::Stopped | HelperPhase::Failed,
                     ..
-                } if response_id == request_id => Ok(false),
+                } if response_id == request_id => Ok(None),
+                Frame::Failure {
+                    request_id: response_id,
+                    safe_detail,
+                    code,
+                } if response_id == request_id => Err(RuntimeError::new(
+                    match code {
+                        HelperFailureCode::PreflightConflict => "tun_preflight",
+                        _ => "tun_capture",
+                    },
+                    safe_detail.unwrap_or_else(|| {
+                        "owned TUN adapter or capture routes changed unexpectedly".into()
+                    }),
+                )),
                 _ => Err(RuntimeError::new(
                     "tun_helper_protocol",
                     "TUN helper returned an unexpected status response",
                 )),
             }
+        }
+    }
+
+    impl ManagedChild for TunHelperChild {
+        fn pid(&self) -> u32 {
+            self.engine_pid
+        }
+
+        fn is_alive(&mut self) -> Result<bool, RuntimeError> {
+            self.query_running_state().map(|state| state.is_some())
         }
 
         fn stop(&mut self) -> Result<(), RuntimeError> {
@@ -438,6 +476,12 @@ mod windows {
             }
             self.helper_process.take();
             Ok(())
+        }
+
+        fn tun_capture_snapshot(&mut self) -> Result<TunCaptureSnapshot, RuntimeError> {
+            self.query_running_state()?.ok_or_else(|| {
+                RuntimeError::new("tun_capture", "the helper-owned TUN engine is not running")
+            })
         }
     }
 
@@ -522,14 +566,14 @@ mod windows {
                 ..
             } if session == invocation.session
                 && received_challenge == challenge
-                && received_nonce == hello_nonce
-                && preflight_sha256 == preflight_digest(&config_sha256) =>
+                && received_nonce == hello_nonce =>
             {
                 StartRequest {
                     request_id,
                     config_handle_id,
                     config_len,
                     config_sha256,
+                    preflight_sha256,
                 }
             }
             _ => {
@@ -570,7 +614,7 @@ mod windows {
                     &mut pipe,
                     &Frame::Failure {
                         request_id: start.request_id,
-                        code: HelperFailureCode::StartFailed,
+                        code: helper_failure_code(error.stage()),
                         safe_detail: Some(safe_helper_detail(error.stage()).into()),
                     },
                 );
@@ -584,6 +628,7 @@ mod windows {
         config_handle_id: u64,
         config_len: u64,
         config_sha256: String,
+        preflight_sha256: String,
     }
 
     struct RunningSession {
@@ -597,6 +642,13 @@ mod windows {
         invocation: &HelperInvocation,
         request: &StartRequest,
     ) -> Result<RunningSession, RuntimeError> {
+        let route_context = preflight_route_context()?;
+        if request.preflight_sha256 != preflight_digest(&request.config_sha256, &route_context) {
+            return Err(RuntimeError::new(
+                "tun_preflight",
+                "network routes changed while TUN permission was being granted; retry the connection",
+            ));
+        }
         if !find_tun_adapter_luids()?.is_empty() {
             return Err(RuntimeError::new(
                 "tun_preflight",
@@ -619,16 +671,21 @@ mod windows {
             &invocation.session,
             &request.config_sha256,
         )?;
-        let child = launcher.start(&session, redactor, diagnostics)?;
+        let mut child = launcher.start(&session, redactor, diagnostics)?;
         let engine_created = process_creation_time_for_pid(child.pid())?;
         journal.mark_running(child.pid(), engine_created)?;
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let owned_luid = loop {
-            let found = find_tun_adapter_luids()?;
+            let found = match find_tun_adapter_luids() {
+                Ok(found) => found,
+                Err(error) => {
+                    rollback_failed_start(child.as_mut(), &mut journal, None)?;
+                    return Err(error);
+                }
+            };
             if found.len() > 1 {
-                let mut child = child;
-                let _ = child.stop();
+                rollback_failed_start(child.as_mut(), &mut journal, None)?;
                 return Err(RuntimeError::new(
                     "tun_preflight",
                     "multiple RouteDeck TUN adapters appeared",
@@ -638,8 +695,7 @@ mod windows {
                 break luid;
             }
             if Instant::now() >= deadline {
-                let mut child = child;
-                let _ = child.stop();
+                rollback_failed_start(child.as_mut(), &mut journal, None)?;
                 return Err(RuntimeError::new(
                     "tun_preflight",
                     "the owned RouteDeck TUN adapter did not appear",
@@ -647,6 +703,28 @@ mod windows {
             }
             thread::sleep(Duration::from_millis(50));
         };
+        let route_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if inspect_owned_capture(owned_luid).is_ok() {
+                break;
+            }
+            if Instant::now() >= route_deadline {
+                rollback_failed_start(child.as_mut(), &mut journal, Some(owned_luid))?;
+                return Err(RuntimeError::new(
+                    "tun_capture",
+                    "RouteDeck TUN adapter appeared, but its IPv4/IPv6 capture routes did not become effective",
+                ));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if let Err(error) = journal.mark_capture(child.pid(), engine_created, owned_luid) {
+            rollback_failed_start(child.as_mut(), &mut journal, Some(owned_luid))?;
+            return Err(error);
+        }
+        if let Err(error) = inspect_owned_capture(owned_luid) {
+            rollback_failed_start(child.as_mut(), &mut journal, Some(owned_luid))?;
+            return Err(error);
+        }
         Ok(RunningSession {
             child: Box::new(HelperEngineChild {
                 child,
@@ -656,6 +734,24 @@ mod windows {
             engine_created,
             owned_luid: Some(owned_luid),
         })
+    }
+
+    fn rollback_failed_start(
+        child: &mut dyn ManagedChild,
+        journal: &mut TunJournal,
+        owned_luid: Option<u64>,
+    ) -> Result<(), RuntimeError> {
+        let stopped = child.stop();
+        let cleanup = wait_for_cleanup(owned_luid, Duration::from_secs(3));
+        if stopped.is_ok() && cleanup == CleanupState::Complete {
+            journal.complete()
+        } else {
+            journal.mark_conflict()?;
+            Err(RuntimeError::new(
+                "session_recovery",
+                "failed TUN startup could not be rolled back safely",
+            ))
+        }
     }
 
     struct HelperEngineChild {
@@ -690,7 +786,7 @@ mod windows {
                 Ok(frame) => frame,
                 Err(_) => {
                     let stop = child.stop();
-                    let cleanup = verify_cleanup(owned_luid);
+                    let cleanup = wait_for_cleanup(owned_luid, Duration::from_secs(3));
                     if stop.is_ok() && cleanup == CleanupState::Complete {
                         journal.complete()?;
                         return Ok(());
@@ -712,24 +808,49 @@ mod windows {
             match frame {
                 Frame::Status { request_id, .. } => {
                     let alive = child.is_alive()?;
-                    write_frame(
-                        pipe,
-                        &Frame::State {
-                            request_id,
-                            phase: if alive {
-                                HelperPhase::Running
-                            } else {
-                                HelperPhase::Failed
+                    if alive {
+                        match owned_luid.and_then(|luid| inspect_owned_capture(luid).ok()) {
+                            Some(capture) => write_frame(
+                                pipe,
+                                &Frame::State {
+                                    request_id,
+                                    phase: HelperPhase::Running,
+                                    engine_pid: Some(child.pid()),
+                                    cleanup: CleanupState::NotRequired,
+                                    capture: Some(capture),
+                                },
+                            )
+                            .map_err(protocol_runtime_error)?,
+                            None => write_frame(
+                                pipe,
+                                &Frame::Failure {
+                                    request_id,
+                                    code: HelperFailureCode::CaptureInvalid,
+                                    safe_detail: Some(
+                                        "RouteDeck TUN capture routes are missing or no longer own the system path"
+                                            .into(),
+                                    ),
+                                },
+                            )
+                            .map_err(protocol_runtime_error)?,
+                        }
+                    } else {
+                        write_frame(
+                            pipe,
+                            &Frame::State {
+                                request_id,
+                                phase: HelperPhase::Failed,
+                                engine_pid: None,
+                                cleanup: CleanupState::NotRequired,
+                                capture: None,
                             },
-                            engine_pid: alive.then(|| child.pid()),
-                            cleanup: CleanupState::NotRequired,
-                        },
-                    )
-                    .map_err(protocol_runtime_error)?;
+                        )
+                        .map_err(protocol_runtime_error)?;
+                    }
                 }
                 Frame::StopTun { request_id, .. } => {
                     let stop = child.stop();
-                    let cleanup = verify_cleanup(owned_luid);
+                    let cleanup = wait_for_cleanup(owned_luid, Duration::from_secs(3));
                     if stop.is_ok() && cleanup == CleanupState::Complete {
                         journal.complete()?;
                     } else {
@@ -1415,7 +1536,26 @@ mod windows {
         Ok(PathBuf::from(OsString::from_wide(&buffer)))
     }
 
-    fn find_tun_adapter_luids() -> Result<Vec<u64>, RuntimeError> {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AdapterState {
+        luid: u64,
+        friendly_name: String,
+        description: String,
+        if_type: u32,
+        tunnel_type: i32,
+        physical_address_length: u32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct RouteState {
+        luid: u64,
+        family: u16,
+        prefix: [u8; 16],
+        prefix_len: u8,
+        metric: u32,
+    }
+
+    fn adapter_states() -> Result<Vec<AdapterState>, RuntimeError> {
         let flags = GAA_FLAG_SKIP_ANYCAST
             | GAA_FLAG_SKIP_MULTICAST
             | GAA_FLAG_SKIP_DNS_SERVER
@@ -1440,19 +1580,274 @@ mod windows {
             let mut current = first;
             while !current.is_null() {
                 let adapter = unsafe { &*current };
-                if wide_ptr_string(adapter.FriendlyName).as_deref() == Some(TUN_INTERFACE_NAME) {
-                    output.push(unsafe { adapter.Luid.Value });
-                }
+                output.push(AdapterState {
+                    luid: unsafe { adapter.Luid.Value },
+                    friendly_name: wide_ptr_string(adapter.FriendlyName).unwrap_or_default(),
+                    description: wide_ptr_string(adapter.Description).unwrap_or_default(),
+                    if_type: adapter.IfType,
+                    tunnel_type: adapter.TunnelType,
+                    physical_address_length: adapter.PhysicalAddressLength,
+                });
                 current = adapter.Next;
             }
-            output.sort_unstable();
-            output.dedup();
+            output.sort_by_key(|adapter| adapter.luid);
+            output.dedup_by_key(|adapter| adapter.luid);
             return Ok(output);
         }
         Err(RuntimeError::new(
             "tun_preflight",
             "adapter enumeration changed repeatedly",
         ))
+    }
+
+    fn find_tun_adapter_luids() -> Result<Vec<u64>, RuntimeError> {
+        Ok(adapter_states()?
+            .into_iter()
+            .filter(|adapter| adapter.friendly_name == TUN_INTERFACE_NAME)
+            .map(|adapter| adapter.luid)
+            .collect())
+    }
+
+    fn route_states() -> Result<Vec<RouteState>, RuntimeError> {
+        let mut table = ptr::null_mut::<MIB_IPFORWARD_TABLE2>();
+        let status = unsafe { GetIpForwardTable2(AF_UNSPEC, &mut table) };
+        if status != 0 || table.is_null() {
+            return Err(RuntimeError::new(
+                "tun_preflight",
+                "Windows routing table could not be inspected",
+            ));
+        }
+        let count = unsafe { (*table).NumEntries as usize };
+        if count > 1_000_000 {
+            unsafe { FreeMibTable(table.cast()) };
+            return Err(RuntimeError::new(
+                "tun_preflight",
+                "Windows routing table returned an invalid size",
+            ));
+        }
+        let first = unsafe { ptr::addr_of!((*table).Table).cast::<MIB_IPFORWARD_ROW2>() };
+        let rows = unsafe { std::slice::from_raw_parts(first, count) };
+        let mut output = Vec::with_capacity(count);
+        for row in rows {
+            let family = unsafe { row.DestinationPrefix.Prefix.si_family };
+            let mut prefix = [0_u8; 16];
+            if family == AF_INET {
+                prefix[..4].copy_from_slice(
+                    &unsafe { row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr }
+                        .to_ne_bytes(),
+                );
+            } else if family == AF_INET6 {
+                prefix = unsafe { row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte };
+            } else {
+                continue;
+            }
+            output.push(RouteState {
+                luid: unsafe { row.InterfaceLuid.Value },
+                family,
+                prefix,
+                prefix_len: row.DestinationPrefix.PrefixLength,
+                metric: row.Metric,
+            });
+        }
+        unsafe { FreeMibTable(table.cast()) };
+        Ok(output)
+    }
+
+    fn looks_like_foreign_tunnel(adapter: &AdapterState) -> bool {
+        let signal = format!("{} {}", adapter.friendly_name, adapter.description).to_lowercase();
+        adapter.tunnel_type != TUNNEL_TYPE_NONE
+            || matches!(adapter.if_type, IF_TYPE_TUNNEL | IF_TYPE_PPP)
+            || (adapter.physical_address_length == 0
+                && !matches!(adapter.if_type, IF_TYPE_ETHERNET_CSMACD | IF_TYPE_IEEE80211))
+            || [
+                "vpn",
+                "tun",
+                "wintun",
+                "wireguard",
+                "tailscale",
+                "zerotier",
+                "xray",
+                "kwik",
+            ]
+            .iter()
+            .any(|marker| signal.contains(marker))
+    }
+
+    fn foreign_full_tunnel<'a>(
+        adapters: &'a [AdapterState],
+        routes: &[RouteState],
+    ) -> Option<&'a AdapterState> {
+        let v4_left = [1_u8, 1, 1, 1];
+        let v4_right = [200_u8, 1, 1, 1];
+        let v6_left = [0x20_u8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let v6_right = [0xa0_u8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        adapters.iter().find(|adapter| {
+            if adapter.friendly_name == TUN_INTERFACE_NAME || !looks_like_foreign_tunnel(adapter) {
+                return false;
+            }
+            let covers = |family, address: &[u8]| {
+                routes.iter().any(|route| {
+                    route.luid == adapter.luid && address_is_covered(route, family, address)
+                })
+            };
+            (covers(AF_INET, &v4_left) && covers(AF_INET, &v4_right))
+                || (covers(AF_INET6, &v6_left) && covers(AF_INET6, &v6_right))
+        })
+    }
+
+    fn preflight_route_context() -> Result<String, RuntimeError> {
+        let adapters = adapter_states()?;
+        let mut routes = route_states()?;
+        if foreign_full_tunnel(&adapters, &routes).is_some() {
+            return Err(RuntimeError::new(
+                "tun_preflight",
+                "another full-tunnel VPN is active; turn it off before starting RouteDeck TUN",
+            ));
+        }
+        routes.retain(|route| route.prefix_len <= 1);
+        routes.sort_by_key(|route| {
+            (
+                route.family,
+                route.luid,
+                route.prefix_len,
+                route.prefix,
+                route.metric,
+            )
+        });
+        let mut hasher = Sha256::new();
+        hasher.update(b"RouteDeck Windows route preflight v1\0");
+        for route in routes {
+            hasher.update(route.family.to_le_bytes());
+            hasher.update(route.luid.to_le_bytes());
+            hasher.update([route.prefix_len]);
+            hasher.update(route.prefix);
+            hasher.update(route.metric.to_le_bytes());
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    fn address_is_covered(route: &RouteState, family: u16, address: &[u8]) -> bool {
+        if route.family != family || route.prefix_len as usize > address.len() * 8 {
+            return false;
+        }
+        let whole = route.prefix_len as usize / 8;
+        let remaining = route.prefix_len as usize % 8;
+        if route.prefix[..whole] != address[..whole] {
+            return false;
+        }
+        remaining == 0
+            || (route.prefix[whole] & (0xff << (8 - remaining)))
+                == (address[whole] & (0xff << (8 - remaining)))
+    }
+
+    fn best_route_luid_v4(address: [u8; 4]) -> Result<u64, RuntimeError> {
+        let destination = SOCKADDR_INET {
+            Ipv4: SOCKADDR_IN {
+                sin_family: AF_INET,
+                sin_port: 0,
+                sin_addr: IN_ADDR {
+                    S_un: windows_sys::Win32::Networking::WinSock::IN_ADDR_0 {
+                        S_addr: u32::from_ne_bytes(address),
+                    },
+                },
+                sin_zero: [0; 8],
+            },
+        };
+        best_route_luid(&destination)
+    }
+
+    fn best_route_luid_v6(address: [u8; 16]) -> Result<u64, RuntimeError> {
+        let destination = SOCKADDR_INET {
+            Ipv6: SOCKADDR_IN6 {
+                sin6_family: AF_INET6,
+                sin6_port: 0,
+                sin6_flowinfo: 0,
+                sin6_addr: IN6_ADDR {
+                    u: windows_sys::Win32::Networking::WinSock::IN6_ADDR_0 { Byte: address },
+                },
+                Anonymous: Default::default(),
+            },
+        };
+        best_route_luid(&destination)
+    }
+
+    fn best_route_luid(destination: &SOCKADDR_INET) -> Result<u64, RuntimeError> {
+        let mut route = MIB_IPFORWARD_ROW2::default();
+        let mut source = SOCKADDR_INET::default();
+        let status = unsafe {
+            GetBestRoute2(
+                ptr::null(),
+                0,
+                ptr::null(),
+                destination,
+                0,
+                &mut route,
+                &mut source,
+            )
+        };
+        if status != 0 {
+            return Err(RuntimeError::new(
+                "tun_capture",
+                "Windows could not resolve the effective TUN capture route",
+            ));
+        }
+        Ok(unsafe { route.InterfaceLuid.Value })
+    }
+
+    fn inspect_owned_capture(luid: u64) -> Result<TunInterfaceState, RuntimeError> {
+        let adapters = adapter_states()?;
+        if adapters
+            .iter()
+            .filter(|adapter| adapter.friendly_name == TUN_INTERFACE_NAME)
+            .map(|adapter| adapter.luid)
+            .collect::<Vec<_>>()
+            != [luid]
+        {
+            return Err(RuntimeError::new(
+                "tun_capture",
+                "the exact helper-owned RouteDeck TUN adapter is missing or ambiguous",
+            ));
+        }
+        let routes = route_states()?;
+        if foreign_full_tunnel(&adapters, &routes).is_some() {
+            return Err(RuntimeError::new(
+                "tun_capture",
+                "another full-tunnel VPN became active during the RouteDeck TUN session",
+            ));
+        }
+        let v4 = [1_u8, 1, 1, 1];
+        let v6 = [
+            0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11,
+        ];
+        let owns_v4 = routes
+            .iter()
+            .any(|route| route.luid == luid && address_is_covered(route, AF_INET, &v4));
+        let owns_v6 = routes
+            .iter()
+            .any(|route| route.luid == luid && address_is_covered(route, AF_INET6, &v6));
+        if !owns_v4
+            || !owns_v6
+            || best_route_luid_v4(v4)? != luid
+            || best_route_luid_v6(v6)? != luid
+        {
+            return Err(RuntimeError::new(
+                "tun_capture",
+                "RouteDeck does not own the effective IPv4 and IPv6 capture routes",
+            ));
+        }
+        let mut row = MIB_IF_ROW2::default();
+        row.InterfaceLuid.Value = luid;
+        if unsafe { GetIfEntry2(&mut row) } != 0 {
+            return Err(RuntimeError::new(
+                "tun_capture",
+                "RouteDeck TUN adapter counters could not be inspected",
+            ));
+        }
+        Ok(TunInterfaceState {
+            interface_luid: luid,
+            in_octets: row.InOctets,
+            out_octets: row.OutOctets,
+        })
     }
 
     fn wide_ptr_string(pointer: *const u16) -> Option<String> {
@@ -1476,6 +1871,17 @@ mod windows {
                 _ => CleanupState::Conflict,
             },
             Err(_) => CleanupState::Conflict,
+        }
+    }
+
+    fn wait_for_cleanup(owned_luid: Option<u64>, timeout: Duration) -> CleanupState {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let cleanup = verify_cleanup(owned_luid);
+            if cleanup == CleanupState::Complete || Instant::now() >= deadline {
+                return cleanup;
+            }
+            thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -1540,6 +1946,36 @@ mod windows {
                 "session": self.session,
                 "phase": "conflict",
                 "configSha256": self.config_sha256,
+            }))
+        }
+
+        fn mark_capture(
+            &mut self,
+            engine_pid: u32,
+            engine_created: u64,
+            owned_luid: u64,
+        ) -> Result<(), RuntimeError> {
+            let routes = route_states()?
+                .into_iter()
+                .filter(|route| route.luid == owned_luid)
+                .map(|route| {
+                    serde_json::json!({
+                        "family": route.family,
+                        "prefix": route.prefix.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                        "prefixLength": route.prefix_len,
+                        "metric": route.metric,
+                    })
+                })
+                .collect::<Vec<_>>();
+            self.write(serde_json::json!({
+                "schemaVersion": 2,
+                "session": self.session,
+                "phase": "capture_verified",
+                "configSha256": self.config_sha256,
+                "enginePid": engine_pid,
+                "engineCreated": engine_created,
+                "ownedInterfaceLuid": owned_luid,
+                "ownedRoutes": routes,
             }))
         }
 
@@ -1648,12 +2084,23 @@ mod windows {
     fn safe_helper_detail(stage: &str) -> &'static str {
         match stage {
             "tun_preflight" => "TUN could not start because the adapter state is not ready",
+            "tun_capture" => {
+                "TUN started but did not obtain effective IPv4 and IPv6 capture routes"
+            }
             "tun_helper_config" | "config_check" => "The generated TUN configuration was rejected",
             "engine_integrity" | "engine_layout" => {
                 "The reviewed sing-box component could not be verified"
             }
             "session_recovery" => "Previous TUN cleanup requires review",
             _ => "The elevated TUN helper could not start sing-box",
+        }
+    }
+
+    fn helper_failure_code(stage: &str) -> HelperFailureCode {
+        match stage {
+            "tun_preflight" => HelperFailureCode::PreflightConflict,
+            "tun_capture" => HelperFailureCode::CaptureInvalid,
+            _ => HelperFailureCode::StartFailed,
         }
     }
 
@@ -1838,6 +2285,71 @@ mod windows {
             let error = shell_launch_error(ERROR_CANCELLED);
             assert_eq!(error.stage(), "tun_uac_cancelled");
             assert_eq!(shell_launch_error(5).stage(), "tun_helper_launch");
+        }
+
+        fn adapter(luid: u64, name: &str, if_type: u32, physical: u32) -> AdapterState {
+            AdapterState {
+                luid,
+                friendly_name: name.into(),
+                description: name.into(),
+                if_type,
+                tunnel_type: TUNNEL_TYPE_NONE,
+                physical_address_length: physical,
+            }
+        }
+
+        fn default_route(luid: u64, family: u16, metric: u32) -> RouteState {
+            RouteState {
+                luid,
+                family,
+                prefix: [0; 16],
+                prefix_len: 0,
+                metric,
+            }
+        }
+
+        #[test]
+        fn foreign_metric_zero_tunnel_blocks_preflight_but_physical_default_does_not() {
+            let physical = adapter(1, "Ethernet", IF_TYPE_ETHERNET_CSMACD, 6);
+            let xray = adapter(2, "xray_tun", 53, 0);
+            let routes = [default_route(1, AF_INET, 25), default_route(2, AF_INET, 0)];
+            let adapters = [physical.clone(), xray];
+            assert_eq!(foreign_full_tunnel(&adapters, &routes).unwrap().luid, 2);
+            assert!(foreign_full_tunnel(&[physical], &routes[..1]).is_none());
+
+            let mut lower_half = default_route(2, AF_INET, 0);
+            lower_half.prefix_len = 1;
+            let mut upper_half = lower_half;
+            upper_half.prefix[0] = 128;
+            assert_eq!(
+                foreign_full_tunnel(&adapters, &[lower_half, upper_half])
+                    .unwrap()
+                    .luid,
+                2
+            );
+
+            let mut host_only = default_route(2, AF_INET, 0);
+            host_only.prefix = [172, 30, 205, 53, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            host_only.prefix_len = 32;
+            assert!(foreign_full_tunnel(&adapters, &[host_only]).is_none());
+        }
+
+        #[test]
+        fn capture_route_matching_is_family_and_prefix_exact() {
+            let mut route = default_route(7, AF_INET, 0);
+            assert!(address_is_covered(&route, AF_INET, &[1, 1, 1, 1]));
+            route.prefix = [128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            route.prefix_len = 1;
+            assert!(!address_is_covered(&route, AF_INET, &[1, 1, 1, 1]));
+            assert!(address_is_covered(&route, AF_INET, &[200, 1, 1, 1]));
+            assert!(!address_is_covered(&route, AF_INET6, &[0; 16]));
+        }
+
+        #[test]
+        fn preflight_digest_binds_config_and_route_snapshot() {
+            let base = preflight_digest(&"01".repeat(32), &"02".repeat(32));
+            assert_ne!(base, preflight_digest(&"03".repeat(32), &"02".repeat(32)));
+            assert_ne!(base, preflight_digest(&"01".repeat(32), &"04".repeat(32)));
         }
     }
 }

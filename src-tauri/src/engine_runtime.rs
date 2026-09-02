@@ -67,7 +67,7 @@ impl EngineDescriptor {
                 executable_name: SING_BOX_EXE,
                 lock_json: EMBEDDED_SING_BOX_LOCK,
                 lock_engine: "sing-box",
-                version: "1.13.19",
+                version: "1.13.21",
                 execution_files: SING_BOX_EXECUTION_FILES,
                 check_command: EngineCommand::SingBoxCheck,
                 run_command: EngineCommand::SingBoxRun,
@@ -1811,10 +1811,31 @@ impl DiagnosticBuffer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TunCaptureSnapshot {
+    pub interface_luid: u64,
+    pub in_octets: u64,
+    pub out_octets: u64,
+}
+
+impl TunCaptureSnapshot {
+    pub(crate) fn proves_traffic_since(self, before: Self) -> bool {
+        self.interface_luid == before.interface_luid
+            && (self.in_octets > before.in_octets || self.out_octets > before.out_octets)
+    }
+}
+
 pub(crate) trait ManagedChild: Send {
     fn pid(&self) -> u32;
     fn is_alive(&mut self) -> Result<bool, RuntimeError>;
     fn stop(&mut self) -> Result<(), RuntimeError>;
+
+    fn tun_capture_snapshot(&mut self) -> Result<TunCaptureSnapshot, RuntimeError> {
+        Err(RuntimeError::new(
+            "tun_capture",
+            "this engine is not controlled by the RouteDeck TUN helper",
+        ))
+    }
 }
 
 pub(crate) trait EngineLauncher: Send + Sync {
@@ -2224,7 +2245,7 @@ mod tests {
         let sing_box_lock = embedded_engine_lock(sing_box).unwrap();
         let xray_lock = embedded_engine_lock(xray).unwrap();
         assert_eq!(sing_box_lock.engine, "sing-box");
-        assert_eq!(sing_box_lock.version, "1.13.19");
+        assert_eq!(sing_box_lock.version, "1.13.21");
         assert_eq!(xray_lock.engine, "xray-core");
         assert_eq!(xray_lock.version, "26.3.27");
 

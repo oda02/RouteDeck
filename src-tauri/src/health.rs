@@ -85,6 +85,13 @@ pub(crate) trait TrafficProber: Send + Sync {
     fn prove_ordinary(&self, http_port: u16) -> Result<ProofResult, RuntimeError> {
         self.prove(&HealthRoute::new(http_port, String::new()))
     }
+
+    fn prove_tun_capture(&self) -> Result<ProofResult, RuntimeError> {
+        Err(RuntimeError::new(
+            "tun_capture",
+            "an unproxied TUN traffic proof is unavailable",
+        ))
+    }
 }
 
 pub(crate) struct HttpsTrafficProber;
@@ -97,6 +104,49 @@ impl TrafficProber for HttpsTrafficProber {
     fn prove_ordinary(&self, http_port: u16) -> Result<ProofResult, RuntimeError> {
         prove_via_http_proxy(http_port, None)
     }
+
+    fn prove_tun_capture(&self) -> Result<ProofResult, RuntimeError> {
+        prove_without_proxy()
+    }
+}
+
+fn prove_without_proxy() -> Result<ProofResult, RuntimeError> {
+    let client = Client::builder()
+        .no_proxy()
+        .redirect(Policy::none())
+        .timeout(STARTUP_PROOF_TIMEOUT)
+        .build()
+        .map_err(|error| RuntimeError::new("tun_capture", error.to_string()))?;
+    let started = Instant::now();
+    let response = client
+        .get(PROOF_URL)
+        .header("accept", "*/*")
+        .header("cache-control", "no-store")
+        .send()
+        .map_err(|error| RuntimeError::new("tun_capture", error.to_string()))?;
+    if response.status() != StatusCode::NO_CONTENT {
+        return Err(RuntimeError::new(
+            "tun_capture",
+            format!(
+                "unproxied TUN proof endpoint returned HTTP {}",
+                response.status()
+            ),
+        ));
+    }
+    let mut body = Vec::new();
+    response
+        .take((MAX_PROOF_BODY + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|_| RuntimeError::new("tun_capture", "unproxied TUN proof body failed"))?;
+    if body.len() > MAX_PROOF_BODY {
+        return Err(RuntimeError::new(
+            "tun_capture",
+            "unproxied TUN proof response exceeded the body limit",
+        ));
+    }
+    Ok(ProofResult {
+        latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+    })
 }
 
 fn prove_via_http_proxy(

@@ -21,7 +21,7 @@ use crate::{
     engine_runtime::{
         random_hex, reconcile_stale_sessions, DiagnosticBuffer, EngineKind, EngineLauncher,
         LoopbackPortReservation, ManagedChild, PortReservations, RuntimeError, SessionConfig,
-        VerifiedEngineLauncher,
+        TunCaptureSnapshot, VerifiedEngineLauncher,
     },
     health::{
         HealthRoute, HttpsTrafficProber, ListenerVerifier, TcpListenerVerifier, TrafficProber,
@@ -428,6 +428,10 @@ impl ManagedChild for RealityProcessPair {
         let front_result = self.front.stop();
         let sidecar_result = self.sidecar.stop();
         front_result.and(sidecar_result)
+    }
+
+    fn tun_capture_snapshot(&mut self) -> Result<TunCaptureSnapshot, RuntimeError> {
+        self.front.tun_capture_snapshot()
     }
 }
 
@@ -1515,16 +1519,28 @@ impl ApplicationController {
                     "Stop the active connection before changing TUN routing",
                 ));
             }
-            let route = {
+            let verification = {
                 let active = state.active.as_mut().expect("active session disappeared");
-                active
-                    .child
-                    .is_alive()
-                    .unwrap_or(false)
-                    .then(|| active.health_route.clone())
+                if active.child.is_alive().unwrap_or(false) {
+                    active
+                        .child
+                        .tun_capture_snapshot()
+                        .ok()
+                        .map(|before| (active.health_route.clone(), before))
+                } else {
+                    None
+                }
             };
             drop(state);
-            let proof = route.and_then(|route| self.services.prober.prove(&route).ok());
+            let proof = verification.and_then(|(route, before)| {
+                self.services.prober.prove(&route).ok().and_then(|proof| {
+                    self.services
+                        .prober
+                        .prove_tun_capture()
+                        .ok()
+                        .map(|_| (proof, before))
+                })
+            });
             state = self.lock_state();
             let still_exact = state.active.as_ref().is_some_and(|active| {
                 active.mode == RuntimeMode::Tun
@@ -1538,15 +1554,21 @@ impl ApplicationController {
                     "Active session changed while TUN traffic was being verified",
                 ));
             }
-            let listeners_owned = state.active.as_mut().is_some_and(|active| {
+            let ownership_and_capture = state.active.as_mut().is_some_and(|active| {
                 active.child.is_alive().unwrap_or(false)
                     && self
                         .services
                         .listener
                         .verify_owned_now(active.ports, active.child.as_mut())
                         .is_ok()
+                    && proof.as_ref().is_some_and(|(_, before)| {
+                        active
+                            .child
+                            .tun_capture_snapshot()
+                            .is_ok_and(|after| after.proves_traffic_since(*before))
+                    })
             });
-            if let Some(proof) = proof.filter(|_| listeners_owned) {
+            if let Some((proof, _)) = proof.filter(|_| ownership_and_capture) {
                 state.status.route_check_ms = Some(proof.latency_ms);
                 Self::set_proof(
                     &mut state,
@@ -1877,11 +1899,18 @@ impl ApplicationController {
             None,
         );
         // The private health route establishes that the selected outbound works. Local Proxy
-        // and System Proxy must additionally prove the ordinary HTTP ingress because that is
-        // the path actually exposed to applications. TUN has no ordinary proxy semantics.
+        // and System Proxy additionally prove the ordinary HTTP ingress. TUN instead makes an
+        // unproxied HTTPS request and requires the exact owned adapter counters to advance; a
+        // loopback health-proxy success alone is never sufficient to publish TUN readiness.
         let selected_proof = self.services.prober.prove(&health_route)?;
         if matches!(mode, RuntimeMode::LocalOnly | RuntimeMode::SystemProxy) {
             self.services.prober.prove_ordinary(ports.http)?;
+        } else if mode == RuntimeMode::Tun {
+            let active = state
+                .active
+                .as_mut()
+                .expect("provisional TUN session disappeared");
+            prove_tun_capture(self.services.prober.as_ref(), active.child.as_mut())?;
         }
         Self::set_proof(
             state,
@@ -2224,6 +2253,7 @@ impl ApplicationController {
             http_port: u16,
             redactor: Redactor,
             node_id: String,
+            tun_before: Option<TunCaptureSnapshot>,
         }
 
         let mut state = self.lock_state();
@@ -2338,6 +2368,9 @@ impl ApplicationController {
             http_port: active.ports.http,
             redactor: active.redactor.clone(),
             node_id: active.node_id.clone(),
+            tun_before: (active.mode == RuntimeMode::Tun)
+                .then(|| active.child.tun_capture_snapshot().ok())
+                .flatten(),
         };
         drop(state);
 
@@ -2354,6 +2387,8 @@ impl ApplicationController {
                         .prober
                         .prove_ordinary(snapshot.http_port)
                         .map(|_| proof)
+                } else if snapshot.mode == RuntimeMode::Tun {
+                    self.services.prober.prove_tun_capture().map(|_| proof)
                 } else {
                     Ok(proof)
                 }
@@ -2368,9 +2403,31 @@ impl ApplicationController {
             return;
         };
         let ownership = if active.child.is_alive().unwrap_or(false) {
-            self.services
+            let listeners = self
+                .services
                 .listener
-                .verify_owned_now(active.ports, active.child.as_mut())
+                .verify_owned_now(active.ports, active.child.as_mut());
+            if snapshot.mode == RuntimeMode::Tun {
+                listeners.and_then(|_| {
+                    let before = snapshot.tun_before.ok_or_else(|| {
+                        RuntimeError::new(
+                            "tun_capture",
+                            "the owned TUN capture snapshot was unavailable",
+                        )
+                    })?;
+                    let after = active.child.tun_capture_snapshot()?;
+                    if after.proves_traffic_since(before) {
+                        Ok(())
+                    } else {
+                        Err(RuntimeError::new(
+                            "tun_capture",
+                            "periodic unproxied traffic did not traverse the owned TUN adapter",
+                        ))
+                    }
+                })
+            } else {
+                listeners
+            }
         } else {
             Err(RuntimeError::new(
                 "engine_process",
@@ -2734,6 +2791,22 @@ impl PublicError {
     }
 }
 
+fn prove_tun_capture(
+    prober: &dyn TrafficProber,
+    child: &mut dyn ManagedChild,
+) -> Result<crate::health::ProofResult, RuntimeError> {
+    let before = child.tun_capture_snapshot()?;
+    let proof = prober.prove_tun_capture()?;
+    let after = child.tun_capture_snapshot()?;
+    if !after.proves_traffic_since(before) {
+        return Err(RuntimeError::new(
+            "tun_capture",
+            "the unproxied proof did not traverse the owned RouteDeck TUN adapter",
+        ));
+    }
+    Ok(proof)
+}
+
 fn public_runtime_error(error: RuntimeError, redactor: &Redactor) -> PublicError {
     let stage = public_stage(error.stage());
     let detail = matches!(
@@ -2760,14 +2833,14 @@ fn public_runtime_error(error: RuntimeError, redactor: &Redactor) -> PublicError
 fn public_stage(stage: &str) -> PublicErrorStage {
     match stage {
         "session_recovery" => PublicErrorStage::SessionRecovery,
-        "tun_uac_cancelled" => PublicErrorStage::Start,
+        "tun_uac_cancelled" | "tun_preflight" => PublicErrorStage::Start,
         "generate_config" => PublicErrorStage::GenerateConfig,
         "engine_layout" => PublicErrorStage::EngineLayout,
         "engine_integrity" => PublicErrorStage::EngineIntegrity,
         "config_check" => PublicErrorStage::ConfigCheck,
         "start_engine" => PublicErrorStage::StartEngine,
         "verify_listeners" => PublicErrorStage::VerifyListeners,
-        "prove_traffic" => PublicErrorStage::ProveTraffic,
+        "prove_traffic" | "tun_capture" => PublicErrorStage::ProveTraffic,
         "engine_process" => PublicErrorStage::EngineProcess,
         "stop_engine" => PublicErrorStage::StopEngine,
         "system_proxy_publish" => PublicErrorStage::SystemProxyPublish,
@@ -2901,6 +2974,17 @@ mod tests {
                 stop_fails: self.stop_fails,
                 alive: self.alive.clone(),
                 stops: self.stops.clone(),
+                tun: false,
+            }))
+        }
+
+        fn create_tun(&self) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
+            Ok(Box::new(FakeLauncher {
+                check_fails: self.check_fails,
+                stop_fails: self.stop_fails,
+                alive: self.alive.clone(),
+                stops: self.stops.clone(),
+                tun: true,
             }))
         }
     }
@@ -2910,6 +2994,7 @@ mod tests {
         stop_fails: bool,
         alive: Arc<AtomicBool>,
         stops: Arc<AtomicUsize>,
+        tun: bool,
     }
 
     struct RecoveryFailProvider;
@@ -2973,6 +3058,8 @@ mod tests {
                 alive: self.alive.clone(),
                 stops: self.stops.clone(),
                 stop_fails: self.stop_fails,
+                tun: self.tun,
+                capture_calls: 0,
             }))
         }
     }
@@ -2981,6 +3068,8 @@ mod tests {
         alive: Arc<AtomicBool>,
         stops: Arc<AtomicUsize>,
         stop_fails: bool,
+        tun: bool,
+        capture_calls: u64,
     }
 
     impl ManagedChild for FakeChild {
@@ -3003,6 +3092,21 @@ mod tests {
                 self.stops.fetch_add(1, Ordering::SeqCst);
             }
             Ok(())
+        }
+
+        fn tun_capture_snapshot(&mut self) -> Result<TunCaptureSnapshot, RuntimeError> {
+            if !self.tun {
+                return Err(RuntimeError::new(
+                    "tun_capture",
+                    "fixture is not a TUN child",
+                ));
+            }
+            self.capture_calls = self.capture_calls.saturating_add(1);
+            Ok(TunCaptureSnapshot {
+                interface_luid: 7,
+                in_octets: self.capture_calls * 1024,
+                out_octets: self.capture_calls * 2048,
+            })
         }
     }
 
@@ -3102,7 +3206,7 @@ mod tests {
                 ))
             } else {
                 Ok(match self.kind {
-                    EngineKind::SingBox => "1.13.19",
+                    EngineKind::SingBox => "1.13.21",
                     EngineKind::Xray => "26.3.27",
                 }
                 .into())
@@ -3293,6 +3397,10 @@ mod tests {
                     "fixture selected outbound failed",
                 ))
             }
+        }
+
+        fn prove_tun_capture(&self) -> Result<ProofResult, RuntimeError> {
+            self.prove(&HealthRoute::new(1, String::new()))
         }
     }
 
@@ -3787,7 +3895,7 @@ mod tests {
         assert_eq!(status.phase, RuntimePhase::LocalProxyReady);
         assert_eq!(
             status.engine_version.as_deref(),
-            Some("sing-box 1.13.19 + Xray 26.3.27")
+            Some("sing-box 1.13.21 + Xray 26.3.27")
         );
         let observation = provider.observation.lock().unwrap();
         assert_eq!(observation.sing_box, observation.xray);
@@ -3928,11 +4036,15 @@ mod tests {
                 alive: Arc::clone(&front_alive),
                 stops: front_stops,
                 stop_fails: true,
+                tun: false,
+                capture_calls: 0,
             }),
             sidecar: Box::new(FakeChild {
                 alive: Arc::clone(&sidecar_alive),
                 stops: Arc::clone(&sidecar_stops),
                 stop_fails: false,
+                tun: false,
+                capture_calls: 0,
             }),
             sidecar_port: 1,
             listener: Arc::new(FakeListener(true)),
@@ -4818,6 +4930,37 @@ mod tests {
             controller.diagnostics().lines,
             vec!["prove_traffic: fixture selected outbound failed"]
         );
+    }
+
+    #[test]
+    fn local_health_success_cannot_substitute_for_owned_tun_counter_progress() {
+        struct StaticTunChild;
+
+        impl ManagedChild for StaticTunChild {
+            fn pid(&self) -> u32 {
+                std::process::id()
+            }
+
+            fn is_alive(&mut self) -> Result<bool, RuntimeError> {
+                Ok(true)
+            }
+
+            fn stop(&mut self) -> Result<(), RuntimeError> {
+                Ok(())
+            }
+
+            fn tun_capture_snapshot(&mut self) -> Result<TunCaptureSnapshot, RuntimeError> {
+                Ok(TunCaptureSnapshot {
+                    interface_luid: 7,
+                    in_octets: 1024,
+                    out_octets: 2048,
+                })
+            }
+        }
+
+        let error = prove_tun_capture(&FakeProber(true), &mut StaticTunChild).unwrap_err();
+        assert_eq!(error.stage(), "tun_capture");
+        assert!(error.message().contains("did not traverse"));
     }
 
     #[test]

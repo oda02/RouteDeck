@@ -5,7 +5,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 1;
+pub(crate) const PROTOCOL_VERSION: u16 = 2;
 pub(crate) const MAX_FRAME_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
@@ -62,12 +62,21 @@ pub(crate) enum Frame {
         phase: HelperPhase,
         engine_pid: Option<u32>,
         cleanup: CleanupState,
+        capture: Option<TunInterfaceState>,
     },
     Failure {
         request_id: u64,
         code: HelperFailureCode,
         safe_detail: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TunInterfaceState {
+    pub interface_luid: u64,
+    pub in_octets: u64,
+    pub out_octets: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +110,8 @@ pub(crate) enum HelperFailureCode {
     ParentRejected,
     ConfigRejected,
     EngineRejected,
+    PreflightConflict,
+    CaptureInvalid,
     StartFailed,
     StopFailed,
     CleanupConflict,
@@ -235,9 +246,32 @@ pub(crate) fn validate_frame(frame: &Frame) -> Result<(), ProtocolError> {
             session_id(session)?;
             nonzero(*request_id)?;
         }
-        Frame::Stopped { request_id, .. }
-        | Frame::State { request_id, .. }
-        | Frame::Failure { request_id, .. } => nonzero(*request_id)?,
+        Frame::Stopped { request_id, .. } | Frame::Failure { request_id, .. } => {
+            nonzero(*request_id)?
+        }
+        Frame::State {
+            request_id,
+            phase,
+            engine_pid,
+            capture,
+            ..
+        } => {
+            nonzero(*request_id)?;
+            let running = *phase == HelperPhase::Running;
+            if running != engine_pid.is_some() || running != capture.is_some() {
+                return Err(ProtocolError::new(
+                    "helper running state proof is incomplete",
+                ));
+            }
+            if capture
+                .as_ref()
+                .is_some_and(|state| state.interface_luid == 0)
+            {
+                return Err(ProtocolError::new(
+                    "helper TUN interface identity is invalid",
+                ));
+            }
+        }
     }
     if let Frame::Failure { safe_detail, .. } = frame {
         if safe_detail.as_ref().is_some_and(|detail| {
@@ -381,6 +415,21 @@ mod tests {
         write_frame(&mut bytes, &frame).unwrap();
         assert!(bytes.len() < MAX_FRAME_BYTES);
         assert_eq!(read_frame(&mut Cursor::new(bytes)).unwrap(), frame);
+
+        let state = Frame::State {
+            request_id: 3,
+            phase: HelperPhase::Running,
+            engine_pid: Some(42),
+            cleanup: CleanupState::NotRequired,
+            capture: Some(TunInterfaceState {
+                interface_luid: 7,
+                in_octets: 1024,
+                out_octets: 2048,
+            }),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &state).unwrap();
+        assert_eq!(read_frame(&mut Cursor::new(bytes)).unwrap(), state);
     }
 
     #[test]
@@ -425,6 +474,19 @@ mod tests {
         }
         assert!(validate_frame(&frame).is_err());
         assert!(pipe_suffix("../helper").is_err());
+
+        assert!(validate_frame(&Frame::State {
+            request_id: 1,
+            phase: HelperPhase::Running,
+            engine_pid: Some(42),
+            cleanup: CleanupState::NotRequired,
+            capture: Some(TunInterfaceState {
+                interface_luid: 0,
+                in_octets: 0,
+                out_octets: 0,
+            }),
+        })
+        .is_err());
     }
 
     #[test]
