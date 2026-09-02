@@ -443,7 +443,7 @@ mod windows {
     }
 
     pub fn helper_main() -> Result<(), String> {
-        helper_main_inner().map_err(|error| format!("{}", error.stage()))
+        helper_main_inner().map_err(|error| error.stage().to_string())
     }
 
     fn helper_main_inner() -> Result<(), RuntimeError> {
@@ -532,7 +532,11 @@ mod windows {
         };
 
         match start_engine_session(&invocation, &start) {
-            Ok((mut child, mut journal, engine_created, owned_luid)) => {
+            Ok(mut running) => {
+                let child = &mut running.child;
+                let journal = &mut running.journal;
+                let engine_created = running.engine_created;
+                let owned_luid = running.owned_luid;
                 let engine_pid = child.pid();
                 write_frame(
                     &mut pipe,
@@ -548,7 +552,7 @@ mod windows {
                     &invocation,
                     &mut state,
                     child.as_mut(),
-                    &mut journal,
+                    journal,
                     owned_luid,
                 )
             }
@@ -573,11 +577,18 @@ mod windows {
         config_sha256: String,
     }
 
+    struct RunningSession {
+        child: Box<dyn ManagedChild>,
+        journal: TunJournal,
+        engine_created: u64,
+        owned_luid: Option<u64>,
+    }
+
     fn start_engine_session(
         invocation: &HelperInvocation,
         request: &StartRequest,
-    ) -> Result<(Box<dyn ManagedChild>, TunJournal, u64, Option<u64>), RuntimeError> {
-        if find_tun_adapter_luids()?.iter().next().is_some() {
+    ) -> Result<RunningSession, RuntimeError> {
+        if !find_tun_adapter_luids()?.is_empty() {
             return Err(RuntimeError::new(
                 "tun_preflight",
                 "a RouteDeck TUN adapter already exists",
@@ -619,15 +630,15 @@ mod windows {
             }
             thread::sleep(Duration::from_millis(50));
         };
-        Ok((
-            Box::new(HelperEngineChild {
+        Ok(RunningSession {
+            child: Box::new(HelperEngineChild {
                 child,
                 _config: session,
             }),
             journal,
             engine_created,
             owned_luid,
-        ))
+        })
     }
 
     struct HelperEngineChild {
@@ -1034,7 +1045,7 @@ mod windows {
 
     fn connect_parent_pipe(suffix: &str) -> Result<File, RuntimeError> {
         pipe_suffix(suffix).map_err(protocol_runtime_error)?;
-        let wide = wide(&pipe_name(suffix))?;
+        let wide = wide(pipe_name(suffix))?;
         let deadline = Instant::now() + HELPER_CONNECT_TIMEOUT;
         loop {
             let handle = unsafe {
@@ -1172,7 +1183,62 @@ mod windows {
                 "release TUN helper hash was rejected",
             ));
         }
+        verify_authenticode(path, &guard)?;
         Ok(guard)
+    }
+
+    fn verify_authenticode(path: &Path, guard: &File) -> Result<(), RuntimeError> {
+        use windows_sys::Win32::Security::WinTrust::{
+            WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
+            WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE,
+            WTD_REVOKE_WHOLECHAIN, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+        };
+
+        let path = wide(path.as_os_str())?;
+        let mut file = WINTRUST_FILE_INFO {
+            cbStruct: size_of::<WINTRUST_FILE_INFO>() as u32,
+            pcwszFilePath: path.as_ptr(),
+            hFile: guard.as_raw_handle(),
+            pgKnownSubject: ptr::null_mut(),
+        };
+        let mut data = WINTRUST_DATA {
+            cbStruct: size_of::<WINTRUST_DATA>() as u32,
+            pPolicyCallbackData: ptr::null_mut(),
+            pSIPClientData: ptr::null_mut(),
+            dwUIChoice: WTD_UI_NONE,
+            fdwRevocationChecks: WTD_REVOKE_WHOLECHAIN,
+            dwUnionChoice: WTD_CHOICE_FILE,
+            Anonymous: WINTRUST_DATA_0 { pFile: &mut file },
+            dwStateAction: WTD_STATEACTION_VERIFY,
+            hWVTStateData: ptr::null_mut(),
+            pwszURLReference: ptr::null_mut(),
+            dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL,
+            dwUIContext: 0,
+            pSignatureSettings: ptr::null_mut(),
+        };
+        let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+        let status = unsafe {
+            WinVerifyTrust(
+                ptr::null_mut(),
+                &mut action,
+                (&mut data as *mut WINTRUST_DATA).cast(),
+            )
+        };
+        data.dwStateAction = WTD_STATEACTION_CLOSE;
+        unsafe {
+            WinVerifyTrust(
+                ptr::null_mut(),
+                &mut action,
+                (&mut data as *mut WINTRUST_DATA).cast(),
+            )
+        };
+        if status != 0 {
+            return Err(RuntimeError::new(
+                "tun_helper_identity",
+                "release TUN helper Authenticode signature was rejected",
+            ));
+        }
+        Ok(())
     }
 
     fn open_and_hash_helper(path: &Path) -> Result<(File, String), RuntimeError> {
@@ -1223,23 +1289,24 @@ mod windows {
             hProcess: ptr::null_mut(),
         };
         if unsafe { ShellExecuteExW(&mut information) } == 0 {
-            return if unsafe { GetLastError() } == ERROR_CANCELLED {
-                Err(RuntimeError::new(
-                    "tun_uac_cancelled",
-                    "TUN permission request was cancelled",
-                ))
-            } else {
-                Err(last_error(
-                    "tun_helper_launch",
-                    "could not start the elevated TUN helper",
-                ))
-            };
+            return Err(shell_launch_error(unsafe { GetLastError() }));
         }
         OwnedHandle::new(
             information.hProcess,
             "tun_helper_launch",
             "Windows did not return the TUN helper process handle",
         )
+    }
+
+    fn shell_launch_error(code: u32) -> RuntimeError {
+        if code == ERROR_CANCELLED {
+            RuntimeError::new("tun_uac_cancelled", "TUN permission request was cancelled")
+        } else {
+            RuntimeError::new(
+                "tun_helper_launch",
+                format!("could not start the elevated TUN helper (Windows error {code})"),
+            )
+        }
     }
 
     fn process_creation_time_for_pid(pid: u32) -> Result<u64, RuntimeError> {
@@ -1642,12 +1709,9 @@ mod windows {
 
         #[test]
         fn cancellation_is_distinct_and_precedes_any_session_or_journal_creation() {
-            let error = if ERROR_CANCELLED == 1223 {
-                RuntimeError::new("tun_uac_cancelled", "TUN permission request was cancelled")
-            } else {
-                unreachable!()
-            };
+            let error = shell_launch_error(ERROR_CANCELLED);
             assert_eq!(error.stage(), "tun_uac_cancelled");
+            assert_eq!(shell_launch_error(5).stage(), "tun_helper_launch");
             assert!(!helper_session_root().join("session-fixture").exists());
         }
     }
