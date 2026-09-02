@@ -32,6 +32,7 @@ use crate::{
         HttpsSubscriptionFetcher, SubscriptionFetchError, SubscriptionFetchErrorKind,
         SubscriptionFetchStage, SubscriptionFetcher,
     },
+    subscription_store::SubscriptionStore,
     system_proxy::{SystemProxyControl, SystemProxyManager, SystemProxyRestoreOutcome},
     xray_config::{generate_xray_bridge_config, XrayBridgeRequest},
 };
@@ -420,6 +421,7 @@ struct RuntimeServices {
 
 struct PendingImport {
     report: ImportReport,
+    source_content: String,
 }
 
 const MAX_PENDING_IMPORT_PREVIEWS: usize = 4;
@@ -450,7 +452,12 @@ impl PreviewSlot {
         })
     }
 
-    fn commit(mut self, preview_id: String, report: ImportReport) -> Result<(), PublicError> {
+    fn commit(
+        mut self,
+        preview_id: String,
+        report: ImportReport,
+        source_content: String,
+    ) -> Result<(), PublicError> {
         let mut state = self
             .state
             .lock()
@@ -464,7 +471,13 @@ impl PreviewSlot {
                 "Could not allocate a unique import preview token",
             ));
         }
-        state.pending.insert(preview_id, PendingImport { report });
+        state.pending.insert(
+            preview_id,
+            PendingImport {
+                report,
+                source_content,
+            },
+        );
         Ok(())
     }
 }
@@ -509,6 +522,7 @@ struct ActiveSession {
 #[derive(Default)]
 struct State {
     nodes: HashMap<String, StoredNode>,
+    node_order: Vec<String>,
     pending: HashMap<String, PendingImport>,
     preview_inflight: usize,
     active: Option<ActiveSession>,
@@ -524,6 +538,7 @@ pub struct ApplicationController {
     operation: Mutex<()>,
     services: RuntimeServices,
     session_root: PathBuf,
+    subscription_store: Option<SubscriptionStore>,
     diagnostics: Arc<Mutex<DiagnosticBuffer>>,
     event_sink: Mutex<Option<EventSink>>,
 }
@@ -549,7 +564,13 @@ impl ApplicationController {
     ) -> Result<Arc<Self>, RuntimeError> {
         let engine_recovery_error = reconcile_stale_sessions(&session_root).err();
         let proxy_recovery_error = system_proxy.reconcile_stale_journal().err();
-        let controller = Arc::new(Self::with_services_and_controls(
+        let subscription_store = SubscriptionStore::new(
+            session_root
+                .parent()
+                .unwrap_or(&session_root)
+                .join("subscription.json"),
+        );
+        let mut controller = Self::with_services_and_controls(
             session_root,
             event_sink,
             Arc::new(FixedEngineProvider),
@@ -557,7 +578,10 @@ impl ApplicationController {
             Arc::new(HttpsTrafficProber),
             Arc::new(HttpsSubscriptionFetcher),
             system_proxy,
-        ));
+        );
+        controller.subscription_store = Some(subscription_store);
+        controller.restore_persisted_subscription();
+        let controller = Arc::new(controller);
         if engine_recovery_error.is_some() || proxy_recovery_error.is_some() {
             let public = if let Some(error) = engine_recovery_error {
                 public_runtime_error(error, &Redactor::default())
@@ -661,9 +685,80 @@ impl ApplicationController {
                 tun_privilege: Arc::new(PlatformTunPrivilege),
             },
             session_root,
+            subscription_store: None,
             diagnostics: Arc::new(Mutex::new(DiagnosticBuffer::default())),
             event_sink: Mutex::new(Some(event_sink)),
         }
+    }
+
+    fn restore_persisted_subscription(&self) {
+        let Some(store) = &self.subscription_store else {
+            return;
+        };
+        let restored = store
+            .load()
+            .and_then(|content| {
+                content
+                    .map(|content| {
+                        import_subscription(content.as_bytes()).map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "stored subscription content was rejected",
+                            )
+                        })
+                    })
+                    .transpose()
+            })
+            .and_then(|report| {
+                report
+                    .map(|report| {
+                        prepare_stored_nodes(report.nodes).map_err(|_| {
+                            std::io::Error::other("could not restore stored subscription")
+                        })
+                    })
+                    .transpose()
+            });
+
+        match restored {
+            Ok(Some(nodes)) => {
+                let count = nodes.len();
+                let node_order = nodes.iter().map(|(id, _)| id.clone()).collect();
+                let mut state = self.lock_state();
+                state.nodes = nodes.into_iter().collect();
+                state.node_order = node_order;
+                drop(state);
+                self.diagnostics
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(format!("subscription_storage: restored {count} nodes"));
+            }
+            Ok(None) => {}
+            Err(_) => {
+                self.diagnostics
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push("subscription_storage: stored subscription was ignored because it is invalid".into());
+            }
+        }
+    }
+
+    pub fn confirmed_nodes(&self) -> Vec<PreviewNode> {
+        let state = self.lock_state();
+        state
+            .node_order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, id)| state.nodes.get(id).map(|stored| (index, stored)))
+            .map(|(index, stored)| {
+                let protocol = stored.node.protocol_kind();
+                PreviewNode {
+                    id: stored.node.id().to_owned(),
+                    display_name: safe_preview_name(&stored.node, protocol, index),
+                    protocol,
+                    insecure_tls: stored.node.requires_insecure_approval(),
+                }
+            })
+            .collect()
     }
 
     pub fn preview_import_content(&self, content: String) -> Result<ImportPreview, PublicError> {
@@ -684,7 +779,7 @@ impl ApplicationController {
                 Redactor::default().redact(&error.to_string()),
             )
         })?;
-        self.commit_import_preview(slot, report)
+        self.commit_import_preview(slot, report, content)
     }
 
     pub fn preview_import_url(&self, url: String) -> Result<ImportPreview, PublicError> {
@@ -706,7 +801,6 @@ impl ApplicationController {
             .subscription_fetcher
             .fetch(&url)
             .map_err(public_subscription_fetch_error)?;
-        drop(url);
         let report = import_subscription(content.as_bytes()).map_err(|_| {
             PublicError::fixed(
                 PublicErrorCode::ImportRejected,
@@ -714,18 +808,19 @@ impl ApplicationController {
                 "subscription.content.rejected",
             )
         })?;
-        self.commit_import_preview(slot, report)
+        self.commit_import_preview(slot, report, content)
     }
 
     fn commit_import_preview(
         &self,
         slot: PreviewSlot,
         report: ImportReport,
+        source_content: String,
     ) -> Result<ImportPreview, PublicError> {
         let preview_id =
             random_hex(16).map_err(|error| public_runtime_error(error, &Redactor::default()))?;
         let preview = preview_from_report(&preview_id, &report);
-        slot.commit(preview_id, report)?;
+        slot.commit(preview_id, report, source_content)?;
         Ok(preview)
     }
 
@@ -776,28 +871,22 @@ impl ApplicationController {
                 "No import preview is pending",
             )
         })?;
-        let prepared = pending
-            .report
-            .nodes
-            .into_iter()
-            .map(|node| {
-                let node_id = node.id().to_owned();
-                let config_identity = random_hex(16)
-                    .map_err(|error| public_runtime_error(error, &Redactor::default()))?;
-                Ok((
-                    node_id,
-                    StoredNode {
-                        node,
-                        config_identity,
-                    },
-                ))
-            })
-            .collect::<Result<Vec<_>, PublicError>>()?;
+        let prepared = prepare_stored_nodes(pending.report.nodes)?;
         let node_ids = prepared
             .iter()
             .map(|(node_id, _)| node_id.clone())
             .collect::<Vec<_>>();
+        if let Some(store) = &self.subscription_store {
+            store.save(&pending.source_content).map_err(|_| {
+                PublicError::fixed(
+                    PublicErrorCode::RuntimeFailure,
+                    PublicErrorStage::SessionStorage,
+                    "Could not save the imported subscription",
+                )
+            })?;
+        }
         state.nodes = prepared.into_iter().collect();
+        state.node_order = node_ids.clone();
         Ok(ConfirmedImport {
             imported: node_ids.len(),
             node_ids,
@@ -2432,6 +2521,24 @@ fn public_subscription_fetch_error(error: SubscriptionFetchError) -> PublicError
     PublicError::fixed(code, stage, localization_key)
 }
 
+fn prepare_stored_nodes(nodes: Vec<Node>) -> Result<Vec<(String, StoredNode)>, PublicError> {
+    nodes
+        .into_iter()
+        .map(|node| {
+            let node_id = node.id().to_owned();
+            let config_identity = random_hex(16)
+                .map_err(|error| public_runtime_error(error, &Redactor::default()))?;
+            Ok((
+                node_id,
+                StoredNode {
+                    node,
+                    config_identity,
+                },
+            ))
+        })
+        .collect()
+}
+
 fn preview_from_report(preview_id: &str, report: &ImportReport) -> ImportPreview {
     ImportPreview {
         preview_id: preview_id.to_owned(),
@@ -3434,6 +3541,74 @@ mod tests {
         let preview = controller.preview_import_content(link.into()).unwrap();
         let confirmed = controller.confirm_import(&preview.preview_id).unwrap();
         confirmed.node_ids[0].clone()
+    }
+
+    fn controller_at(session_root: PathBuf) -> ApplicationController {
+        let alive = Arc::new(AtomicBool::new(false));
+        let subscription_store =
+            SubscriptionStore::new(session_root.with_extension("subscription.json"));
+        let mut controller = ApplicationController::with_services_and_controls(
+            session_root,
+            Arc::new(|_| {}),
+            Arc::new(FakeProvider {
+                check_fails: false,
+                stop_fails: false,
+                alive: alive.clone(),
+                stops: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(FakeListener(true)),
+            Arc::new(FakeProber(true)),
+            Arc::new(HttpsSubscriptionFetcher),
+            Arc::new(FakeSystemProxy::new(alive)),
+        );
+        controller.subscription_store = Some(subscription_store);
+        controller.restore_persisted_subscription();
+        controller
+    }
+
+    #[test]
+    fn confirmed_subscription_is_restored_after_controller_restart() {
+        let session_root = std::env::temp_dir().join(format!(
+            "routedeck-persistence-test-{}",
+            random_hex(8).expect("test random")
+        ));
+        let persisted_path = session_root.with_extension("subscription.json");
+        let expected_id = {
+            let controller = controller_at(session_root.clone());
+            let id = import_node(&controller);
+            assert_eq!(controller.confirmed_nodes().len(), 1);
+            id
+        };
+
+        let restored = controller_at(session_root).confirmed_nodes();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, expected_id);
+        assert_eq!(restored[0].display_name, "fixture");
+        std::fs::remove_file(persisted_path).unwrap();
+    }
+
+    #[test]
+    fn corrupt_subscription_does_not_block_startup_or_later_replacement() {
+        let session_root = std::env::temp_dir().join(format!(
+            "routedeck-corrupt-persistence-test-{}",
+            random_hex(8).expect("test random")
+        ));
+        let persisted_path = session_root.with_extension("subscription.json");
+        std::fs::write(&persisted_path, b"{broken").unwrap();
+
+        {
+            let controller = controller_at(session_root.clone());
+            assert!(controller.confirmed_nodes().is_empty());
+            assert!(controller
+                .diagnostics()
+                .lines
+                .iter()
+                .any(|line| line.contains("stored subscription was ignored")));
+            import_node(&controller);
+        }
+
+        assert_eq!(controller_at(session_root).confirmed_nodes().len(), 1);
+        std::fs::remove_file(persisted_path).unwrap();
     }
 
     #[test]

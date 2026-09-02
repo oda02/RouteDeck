@@ -9,6 +9,7 @@ pub mod running_applications;
 mod runtime_constants;
 pub mod subscription;
 pub mod subscription_fetch;
+mod subscription_store;
 mod system_proxy;
 #[cfg(windows)]
 mod windows_process;
@@ -42,6 +43,7 @@ pub fn run() {
             commands::start_system_proxy,
             commands::start_tun,
             commands::runtime_status,
+            commands::confirmed_nodes,
             commands::stop_local_proxy,
             commands::stop_system_proxy,
             commands::stop_tun,

@@ -103,6 +103,13 @@ pub fn runtime_status(controller: State<'_, Arc<ApplicationController>>) -> Runt
 }
 
 #[tauri::command]
+pub fn confirmed_nodes(
+    controller: State<'_, Arc<ApplicationController>>,
+) -> Vec<crate::application::PreviewNode> {
+    controller.confirmed_nodes()
+}
+
+#[tauri::command]
 pub async fn stop_local_proxy(
     controller: State<'_, Arc<ApplicationController>>,
 ) -> Result<RuntimeStatus, PublicError> {
