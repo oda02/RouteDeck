@@ -92,6 +92,14 @@ pub(crate) enum EngineCommand {
     XrayRun,
 }
 
+impl EngineCommand {
+    fn captures_stdout(self) -> bool {
+        // Xray writes its useful runtime diagnostics to stdout. Keep checks quiet and avoid
+        // changing sing-box capture semantics; only the long-lived Xray sidecar needs it.
+        matches!(self, Self::XrayRun)
+    }
+}
+
 struct OwnedHandle(HANDLE);
 
 impl OwnedHandle {
@@ -411,7 +419,11 @@ pub(crate) fn create_suspended_engine<T>(
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.StartupInfo.hStdInput = null_input.raw();
-    startup.StartupInfo.hStdOutput = null_output.raw();
+    startup.StartupInfo.hStdOutput = if command.captures_stdout() {
+        pipe_write.raw()
+    } else {
+        null_output.raw()
+    };
     startup.StartupInfo.hStdError = pipe_write.raw();
     startup.lpAttributeList = attributes.pointer();
 
@@ -696,6 +708,14 @@ mod tests {
             let actual = String::from_utf16(&encoded[..encoded.len() - 1]).unwrap();
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn only_running_xray_joins_stdout_to_the_diagnostic_pipe() {
+        assert!(!EngineCommand::SingBoxCheck.captures_stdout());
+        assert!(!EngineCommand::SingBoxRun.captures_stdout());
+        assert!(!EngineCommand::XrayCheck.captures_stdout());
+        assert!(EngineCommand::XrayRun.captures_stdout());
     }
 
     #[test]

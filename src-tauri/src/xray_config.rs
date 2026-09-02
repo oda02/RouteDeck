@@ -151,7 +151,9 @@ pub fn generate_xray_bridge_config(
     }
 
     let root = json!({
-        "log": { "loglevel": "error" },
+        // Xray reports remote REALITY/VLESS handshake failures at Info. The launcher captures
+        // XrayRun stdout into the same bounded, node-redacted diagnostic stream as stderr.
+        "log": { "loglevel": "info" },
         "inbounds": [{
             "listen": "127.0.0.1",
             "port": request.listen_port,
@@ -209,7 +211,7 @@ mod tests {
         assert_eq!(
             value,
             json!({
-                "log": { "loglevel": "error" },
+                "log": { "loglevel": "info" },
                 "inbounds": [{
                     "listen": "127.0.0.1",
                     "port": 19191,
@@ -252,6 +254,10 @@ mod tests {
         );
         assert!(value.pointer("/inbounds/0/settings/accounts").is_none());
         assert!(value.pointer("/inbounds/0/settings/users").is_none());
+        let debug = format!("{generated:?}");
+        assert!(!debug.contains("11111111-2222-3333-4444-555555555555"));
+        assert!(!debug.contains(public_key));
+        assert!(!debug.contains("/private?token=fixture"));
     }
 
     #[test]

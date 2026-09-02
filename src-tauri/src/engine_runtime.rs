@@ -2496,6 +2496,36 @@ mod tests {
     }
 
     #[test]
+    fn xray_info_output_is_redacted_before_diagnostic_storage() {
+        let diagnostics = Arc::new(Mutex::new(DiagnosticBuffer::default()));
+        let server = "fixture-vless-endpoint.test";
+        let credential = "11111111-2222-3333-4444-555555555555";
+        let input = format!(
+            "from tcp:127.0.0.1:40000 accepted tcp:{server}:443 [bridge-in >> selected]\n\
+             [Info] app/proxyman/outbound: remote handshake failed for id={credential}\n"
+        );
+
+        capture_stderr(
+            std::io::Cursor::new(input),
+            &Redactor::default()
+                .with_secret(server)
+                .with_secret(credential),
+            &diagnostics,
+        );
+
+        let lines = diagnostics.lock().unwrap().snapshot();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|line| !line.contains(server)));
+        assert!(lines.iter().all(|line| !line.contains(credential)));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("bridge-in >> selected")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("remote handshake failed")));
+    }
+
+    #[test]
     fn random_values_are_distinct_and_fixed_length() {
         let first = random_hex(16).unwrap();
         let second = random_hex(16).unwrap();
