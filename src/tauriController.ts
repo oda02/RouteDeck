@@ -573,7 +573,9 @@ export class TauriController implements RouteDeckController {
     await this.invokeStatus(this.snapshot.mode === "tun" ? "start_tun" : "start_system_proxy", {
       nodeId: this.snapshot.selectedServerId,
       routing: {
-        defaultRoute: this.snapshot.routing.defaultRoute,
+        // Saved default/app routing is a TUN policy. System Proxy always sends clients
+        // that use the Windows proxy through the selected VPN.
+        defaultRoute: this.snapshot.mode === "tun" ? this.snapshot.routing.defaultRoute : "vpn",
         apps: this.snapshot.mode === "tun"
           ? this.snapshot.routing.apps
             .filter((app) => app.route !== "inherit")

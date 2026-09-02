@@ -189,7 +189,8 @@ test("TUN and application routing use ordinary-client copy without extra ceremon
   assert.match(source, /Добавить приложение/);
   assert.match(source, /controller\.listRunningApplications\(\)/);
   assert.match(source, /route: draft\.defaultRoute === "direct" \? "vpn" : "direct"/);
-  assert.match(source, /Правила отдельных приложений применяются в режиме TUN/);
+  assert.match(source, /Эти правила — для TUN/);
+  assert.match(source, /Системный прокси всегда направляет использующие его приложения через выбранный VPN/);
   assert.doesNotMatch(source, /tun-preflight|nested|Физический адаптер|security mode|режим безопасности/i);
   assert.doesNotMatch(source, /запустите .*администратор/i);
   assert.doesNotMatch(source, /Проверить задержки|controller\.refreshServers/);
@@ -744,7 +745,7 @@ test("cancel during confirm cannot hide the reconciled import result", async () 
   controller.dispose();
 });
 
-test("System Proxy routing is saved for the next connection while unsupported settings still fail", async () => {
+test("TUN routing policy remains saved while System Proxy mode is selected", async () => {
   const transport: TauriTransport = {
     listen: async () => () => undefined,
     invoke: async () => runtimeStatus(1, "disconnected"),
@@ -758,7 +759,7 @@ test("System Proxy routing is saved for the next connection while unsupported se
   controller.dispose();
 });
 
-test("connect and disconnect use the typed System Proxy commands and routing draft", async () => {
+test("System Proxy ignores the saved TUN Direct draft and requests selected VPN routing", async () => {
   const calls: Array<{ command: string; arguments_?: Record<string, unknown> }> = [];
   const transport: TauriTransport = {
     listen: async () => () => undefined,
@@ -793,7 +794,7 @@ test("connect and disconnect use the typed System Proxy commands and routing dra
       arguments_: {
         nodeId: "fixture-node",
         routing: {
-          defaultRoute: "direct",
+          defaultRoute: "vpn",
           apps: [],
         },
       },

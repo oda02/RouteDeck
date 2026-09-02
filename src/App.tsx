@@ -286,7 +286,7 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
     ? snapshot.routing.defaultRoute === "direct"
       ? `TUN: напрямую · ${vpnApps.length} ${vpnApps.length === 1 ? "исключение" : "исключений"} через VPN`
       : `TUN: через VPN · ${directApps.length} исключений напрямую`
-    : `Прокси Windows: ${snapshot.routing.defaultRoute === "direct" ? "напрямую" : "через VPN"}`;
+    : "Прокси Windows: через выбранный VPN";
 
   return (
     <div className="page home-page">
@@ -331,7 +331,7 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
               ? "Диагностическая сессия проверяет локальные HTTP/SOCKS-порты и не меняет настройки Windows."
               : snapshot.mode === "tun"
                 ? "Перехватывает весь IP-трафик через виртуальный адаптер. При каждом подключении Windows покажет стандартный запрос прав."
-                : "Подключает приложения, которые используют прокси Windows. Общий маршрут задаётся в разделе «Правила»."}
+                : "Направляет через выбранный VPN приложения, которые используют прокси Windows."}
           </p>
         </div>
       </section>
@@ -361,7 +361,7 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
         <span className="selection-copy">
           <span className="selection-label">Маршрутизация</span>
           <strong>{routeSummary}</strong>
-          <span>{snapshot.mode === "tun" ? "Общий маршрут и исключения для приложений" : "Для приложений, которые используют прокси Windows"}</span>
+          <span>{snapshot.mode === "tun" ? "Общий маршрут и исключения для приложений" : "Настройки Direct и исключений применяются только в TUN"}</span>
         </span>
         <ChevronRightIcon size={20} />
       </button>
@@ -451,11 +451,9 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
   const deferredPickerSearch = useDeferredValue(pickerSearch);
   const connectionActive = snapshot.phase !== "disconnected" && snapshot.phase !== "failed";
   const dirty = JSON.stringify(draft) !== JSON.stringify(snapshot.routing);
-  const summary = snapshot.mode === "tun"
-    ? draft.defaultRoute === "direct"
-      ? `TUN: по умолчанию напрямую · ${draft.apps.filter((app) => app.route === "vpn").length} исключений через VPN`
-      : `TUN: по умолчанию через VPN · ${draft.apps.filter((app) => app.route === "direct").length} исключений напрямую`
-    : `Прокси Windows: по умолчанию ${draft.defaultRoute === "direct" ? "напрямую" : "через VPN"}`;
+  const summary = draft.defaultRoute === "direct"
+    ? `TUN: по умолчанию напрямую · ${draft.apps.filter((app) => app.route === "vpn").length} исключений через VPN`
+    : `TUN: по умолчанию через VPN · ${draft.apps.filter((app) => app.route === "direct").length} исключений напрямую`;
   const selectedPaths = useMemo(() => new Set(
     draft.apps.map((app) => app.path.replaceAll("/", "\\").toLocaleLowerCase("en-US")),
   ), [draft.apps]);
@@ -517,7 +515,7 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
       </div>
       <ActionFailureNotice failure={actionFailure} page="routing" onClear={onClearFailure} />
       <section className="card">
-        <div className="section-heading compact-heading"><div><p className="overline">Базовое правило</p><h2>Маршрут по умолчанию</h2></div></div>
+        <div className="section-heading compact-heading"><div><p className="overline">Политика TUN</p><h2>Маршрут по умолчанию</h2></div></div>
         <SegmentedControl
           label="Маршрут по умолчанию"
           value={draft.defaultRoute}
@@ -530,7 +528,7 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
 
       <OpaqueNotice notice={snapshot.mode === "tun"
         ? { id: "tun-routing-scope", kind: "info", title: "Правила применятся при следующем подключении", body: "TUN использует общий маршрут для трафика Windows, а выбранные приложения — как исключения." }
-        : { id: "proxy-routing-scope", kind: "info", title: "Системный прокси", body: "Общий маршрут действует для приложений, которые используют прокси Windows. Правила отдельных приложений применяются в режиме TUN." }} />
+        : { id: "proxy-routing-scope", kind: "info", title: "Эти правила — для TUN", body: "Системный прокси всегда направляет использующие его приложения через выбранный VPN. Direct и правила приложений действуют в режиме TUN." }} />
 
       <section className="card app-rules-card">
         <div className="section-heading">

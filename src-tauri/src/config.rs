@@ -340,13 +340,15 @@ fn validate_request(request: &ConfigRequest<'_>) -> Result<(), ConfigError> {
         .policy
         .validate()
         .map_err(|_| ConfigError::new("route policy is invalid"))?;
-    if matches!(request.mode, CaptureMode::LocalProxy)
-        && (request.policy.default != DefaultRoute::Vpn
-            || !request.policy.apps.is_empty()
-            || request.policy.lan != LanPolicy::FollowDefault)
+    if matches!(
+        request.mode,
+        CaptureMode::LocalProxy | CaptureMode::SystemProxy
+    ) && (request.policy.default != DefaultRoute::Vpn
+        || !request.policy.apps.is_empty()
+        || request.policy.lan != LanPolicy::FollowDefault)
     {
         return Err(ConfigError::new(
-            "local proxy runtime must route ordinary traffic through selected outbound",
+            "proxy runtime must route ordinary traffic through selected outbound",
         ));
     }
     if let CaptureMode::Tun(settings) = &request.mode {
@@ -776,6 +778,48 @@ mod tests {
         let mut lan_draft = policy(DefaultRoute::Vpn);
         lan_draft.lan = LanPolicy::Direct;
         assert!(generate_config(request(&node, &lan_draft)).is_err());
+    }
+
+    #[test]
+    fn system_proxy_rejects_direct_or_application_routing_drafts() {
+        let node = node("hysteria2://fixture-password@example.test:443?sni=example.test#fixture");
+        let mut direct = policy(DefaultRoute::Direct);
+        direct.lan = LanPolicy::FollowDefault;
+        let mut direct_request = request(&node, &direct);
+        direct_request.mode = CaptureMode::SystemProxy;
+        assert!(generate_config(direct_request).is_err());
+
+        let mut app_draft = policy(DefaultRoute::Vpn);
+        app_draft.apps.push(crate::domain::AppRoute {
+            process_path: r"C:\Apps\Browser.exe".into(),
+            process_name: Some("Browser.exe".into()),
+            action: AppRouteAction::Direct,
+        });
+        let mut app_request = request(&node, &app_draft);
+        app_request.mode = CaptureMode::SystemProxy;
+        assert!(generate_config(app_request).is_err());
+    }
+
+    #[test]
+    fn system_proxy_ordinary_ingress_has_selected_as_its_final_route() {
+        let node = node("hysteria2://fixture-password@example.test:443?sni=example.test#fixture");
+        let mut selected = policy(DefaultRoute::Vpn);
+        selected.lan = LanPolicy::FollowDefault;
+        let mut selected_request = request(&node, &selected);
+        selected_request.mode = CaptureMode::SystemProxy;
+        let generated = generate_config(selected_request).unwrap();
+        let value: Value = serde_json::from_str(generated.as_str()).unwrap();
+
+        assert_eq!(
+            value.pointer("/route/final").and_then(Value::as_str),
+            Some("selected")
+        );
+        assert!(value
+            .pointer("/route/rules")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .all(|rule| rule.get("process_path").is_none()));
     }
 
     #[test]

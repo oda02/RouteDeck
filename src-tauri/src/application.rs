@@ -284,18 +284,14 @@ impl fmt::Debug for SystemProxyAppRoute {
 
 impl SystemProxyRouting {
     fn into_policy(self) -> RoutePolicy {
+        // System Proxy has conventional client semantics: every application that opts in to
+        // the Windows proxy uses the selected VPN. The renderer's saved routing draft belongs
+        // to TUN and must never turn a successful System Proxy connection into a direct no-op.
+        let _ = self;
         RoutePolicy {
-            default: self.default_route,
-            apps: self
-                .apps
-                .into_iter()
-                .map(|app| AppRoute {
-                    process_path: app.process_path,
-                    process_name: app.process_name,
-                    action: app.route,
-                })
-                .collect(),
-            lan: LanPolicy::Direct,
+            default: DefaultRoute::Vpn,
+            apps: Vec::new(),
+            lan: LanPolicy::FollowDefault,
             ipv6: Ipv6Policy::Enabled,
             dns: DnsPolicy::CurrentNetwork,
         }
@@ -1265,10 +1261,16 @@ impl ApplicationController {
                     .child
                     .is_alive()
                     .unwrap_or(false)
-                    .then(|| active.health_route.clone())
+                    .then(|| (active.health_route.clone(), active.ports.http))
             };
             drop(state);
-            let proof = route.and_then(|route| self.services.prober.prove(&route).ok());
+            let proof = route.and_then(|(route, http_port)| {
+                self.services
+                    .prober
+                    .prove(&route)
+                    .and_then(|_| self.services.prober.prove_ordinary(http_port))
+                    .ok()
+            });
             state = self.lock_state();
             let still_exact = state.active.as_ref().is_some_and(|active| {
                 active.mode == RuntimeMode::SystemProxy
@@ -1859,11 +1861,11 @@ impl ApplicationController {
             Some(node.id().to_owned()),
             None,
         );
-        // The authenticated health inbound is always forced through `selected`. In local-only
-        // mode the ordinary listener is also forced through it; System Proxy may intentionally
-        // default ordinary traffic to Direct, so its selected proof must remain private.
+        // The private health route establishes that the selected outbound works. Local Proxy
+        // and System Proxy must additionally prove the ordinary HTTP ingress because that is
+        // the path actually exposed to applications. TUN has no ordinary proxy semantics.
         let health_proof = self.services.prober.prove(&health_route)?;
-        let proof = if mode == RuntimeMode::LocalOnly {
+        let proof = if matches!(mode, RuntimeMode::LocalOnly | RuntimeMode::SystemProxy) {
             self.services.prober.prove_ordinary(ports.http)?
         } else {
             health_proof
@@ -2331,7 +2333,10 @@ impl ApplicationController {
             .prober
             .prove(&snapshot.route)
             .and_then(|proof| {
-                if snapshot.mode == RuntimeMode::LocalOnly {
+                if matches!(
+                    snapshot.mode,
+                    RuntimeMode::LocalOnly | RuntimeMode::SystemProxy
+                ) {
                     self.services.prober.prove_ordinary(snapshot.http_port)
                 } else {
                     Ok(proof)
@@ -4830,9 +4835,28 @@ mod tests {
     }
 
     #[test]
-    fn system_proxy_publishes_only_after_selected_health_and_restores_before_core_stop() {
+    fn system_proxy_refuses_to_publish_when_ordinary_proxy_route_fails() {
         let (controller, proxy, stops, alive) =
             controller_with_system_proxy(Arc::new(OrdinaryFailProber));
+        let node = import_node(&controller);
+
+        let error = controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Direct))
+            .unwrap_err();
+        assert_eq!(error.stage, PublicErrorStage::ProveTraffic);
+        assert_eq!(proxy.publishes.load(Ordering::SeqCst), 0);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert!(!alive.load(Ordering::SeqCst));
+        assert_eq!(
+            controller.status().phase,
+            RuntimePhase::DisconnectedWithError
+        );
+    }
+
+    #[test]
+    fn system_proxy_saved_direct_policy_still_routes_ordinary_traffic_through_selected() {
+        let (controller, proxy, stops, alive) =
+            controller_with_system_proxy(Arc::new(FakeProber(true)));
         let node = import_node(&controller);
 
         let status = controller
@@ -4841,7 +4865,7 @@ mod tests {
         assert_eq!(status.scope, RuntimeScope::SystemProxy);
         assert_eq!(status.mode, RuntimeMode::SystemProxy);
         assert_eq!(status.phase, RuntimePhase::SystemProxyReady);
-        assert_eq!(status.route_check_ms, Some(21));
+        assert_eq!(status.route_check_ms, Some(42));
         assert!(status.proofs.iter().any(|proof| {
             proof.kind == ProofKind::SelectedOutboundHttps
                 && proof.state == ProofState::Passed
@@ -4851,6 +4875,12 @@ mod tests {
         assert!(status.proofs.iter().any(|proof| {
             proof.kind == ProofKind::SystemProxyOwnership && proof.state == ProofState::Passed
         }));
+        let state = controller.lock_state();
+        let active = state.active.as_ref().unwrap();
+        assert_eq!(active.routing.default, DefaultRoute::Vpn);
+        assert!(active.routing.apps.is_empty());
+        assert_eq!(active.routing.lan, LanPolicy::FollowDefault);
+        drop(state);
 
         controller.stop().unwrap();
         assert!(proxy.restore_saw_live_core.load(Ordering::SeqCst));
