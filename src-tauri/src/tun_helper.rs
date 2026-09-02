@@ -1662,6 +1662,8 @@ mod windows {
             || [
                 "vpn",
                 "tun",
+                "tap",
+                "openvpn",
                 "wintun",
                 "wireguard",
                 "tailscale",
@@ -2332,6 +2334,14 @@ mod windows {
             host_only.prefix = [172, 30, 205, 53, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
             host_only.prefix_len = 32;
             assert!(foreign_full_tunnel(&adapters, &[host_only]).is_none());
+
+            let tap = adapter(3, "TAP-Windows Adapter", IF_TYPE_ETHERNET_CSMACD, 6);
+            assert_eq!(
+                foreign_full_tunnel(&[tap], &[default_route(3, AF_INET, 25)])
+                    .unwrap()
+                    .luid,
+                3
+            );
         }
 
         #[test]
