@@ -3,9 +3,9 @@ use std::{collections::BTreeSet, fmt, net::IpAddr};
 use serde_json::{json, Map, Value};
 
 use crate::domain::{
-    canonical_process_path, AppRouteAction, DefaultRoute, DnsPolicy, HysteriaObfsKind,
-    InsecureApproval, Ipv6Policy, LanPolicy, Node, NodeProtocol, PacketEncoding, PortSelection,
-    RoutePolicy, Secret, TlsOptions, VlessFlow, VlessTransport,
+    AppRouteAction, DefaultRoute, DnsPolicy, HysteriaObfsKind, InsecureApproval, Ipv6Policy,
+    LanPolicy, Node, NodeProtocol, PacketEncoding, PortSelection, RoutePolicy, Secret, TlsOptions,
+    VlessFlow, VlessTransport,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,7 +207,10 @@ fn generate_config_with_selected(
     }
     for app in &request.policy.apps {
         rules.push(json!({
-            "process_path": [canonical_process_path(&app.process_path)],
+            // sing-box 1.13.19 compares Windows process paths case-sensitively. Preserve the
+            // QueryFullProcessImageNameW casing supplied by the application picker; only the
+            // identity/duplicate checks in the domain model may use a lower-cased key.
+            "process_path": [app.process_path.trim().replace('/', "\\")],
             "action": "route",
             "outbound": action_outbound(app.action)
         }));
@@ -340,12 +343,10 @@ fn validate_request(request: &ConfigRequest<'_>) -> Result<(), ConfigError> {
         .policy
         .validate()
         .map_err(|_| ConfigError::new("route policy is invalid"))?;
-    if matches!(
-        request.mode,
-        CaptureMode::LocalProxy | CaptureMode::SystemProxy
-    ) && (request.policy.default != DefaultRoute::Vpn
-        || !request.policy.apps.is_empty()
-        || request.policy.lan != LanPolicy::FollowDefault)
+    if matches!(request.mode, CaptureMode::LocalProxy)
+        && (request.policy.default != DefaultRoute::Vpn
+            || !request.policy.apps.is_empty()
+            || request.policy.lan != LanPolicy::FollowDefault)
     {
         return Err(ConfigError::new(
             "proxy runtime must route ordinary traffic through selected outbound",
@@ -781,23 +782,51 @@ mod tests {
     }
 
     #[test]
-    fn system_proxy_rejects_direct_or_application_routing_drafts() {
+    fn system_proxy_applies_direct_default_and_case_preserving_application_routes() {
         let node = node("hysteria2://fixture-password@example.test:443?sni=example.test#fixture");
         let mut direct = policy(DefaultRoute::Direct);
-        direct.lan = LanPolicy::FollowDefault;
-        let mut direct_request = request(&node, &direct);
-        direct_request.mode = CaptureMode::SystemProxy;
-        assert!(generate_config(direct_request).is_err());
-
-        let mut app_draft = policy(DefaultRoute::Vpn);
-        app_draft.apps.push(crate::domain::AppRoute {
-            process_path: r"C:\Apps\Browser.exe".into(),
+        direct.lan = LanPolicy::Direct;
+        direct.apps.push(crate::domain::AppRoute {
+            process_path: r"C:/Program Files/Browser/Browser.EXE".into(),
             process_name: Some("Browser.exe".into()),
-            action: AppRouteAction::Direct,
+            action: AppRouteAction::Vpn,
         });
-        let mut app_request = request(&node, &app_draft);
-        app_request.mode = CaptureMode::SystemProxy;
-        assert!(generate_config(app_request).is_err());
+        let mut system_request = request(&node, &direct);
+        system_request.mode = CaptureMode::SystemProxy;
+        let generated = generate_config(system_request).unwrap();
+        let value: Value = serde_json::from_str(generated.as_str()).unwrap();
+        let rules = value
+            .pointer("/route/rules")
+            .and_then(Value::as_array)
+            .unwrap();
+
+        assert_eq!(
+            rules[0].get("inbound").and_then(Value::as_array).unwrap(),
+            &[json!("health-in")]
+        );
+        assert_eq!(
+            rules[0].get("outbound").and_then(Value::as_str),
+            Some("selected")
+        );
+        assert_eq!(
+            rules[1]
+                .get("process_path")
+                .and_then(Value::as_array)
+                .unwrap(),
+            &[json!(r"C:\Program Files\Browser\Browser.EXE")]
+        );
+        assert_eq!(
+            rules[1].get("outbound").and_then(Value::as_str),
+            Some("selected")
+        );
+        assert_eq!(
+            rules[2].get("ip_is_private").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            value.pointer("/route/final").and_then(Value::as_str),
+            Some("direct")
+        );
     }
 
     #[test]
@@ -820,6 +849,43 @@ mod tests {
             .unwrap()
             .iter()
             .all(|rule| rule.get("process_path").is_none()));
+    }
+
+    #[test]
+    fn system_proxy_vpn_default_keeps_direct_application_exception_before_final() {
+        let node = node("hysteria2://fixture-password@example.test:443?sni=example.test#fixture");
+        let mut selected = policy(DefaultRoute::Vpn);
+        selected.lan = LanPolicy::Direct;
+        selected.apps.push(crate::domain::AppRoute {
+            process_path: r"C:\Apps\Browser.exe".into(),
+            process_name: Some("Browser.exe".into()),
+            action: AppRouteAction::Direct,
+        });
+        let mut system_request = request(&node, &selected);
+        system_request.mode = CaptureMode::SystemProxy;
+        let generated = generate_config(system_request).unwrap();
+        let value: Value = serde_json::from_str(generated.as_str()).unwrap();
+        let rules = value
+            .pointer("/route/rules")
+            .and_then(Value::as_array)
+            .unwrap();
+
+        assert_eq!(
+            rules[0].get("outbound").and_then(Value::as_str),
+            Some("selected")
+        );
+        assert_eq!(
+            rules[1].get("process_path").and_then(Value::as_array),
+            Some(&vec![json!(r"C:\Apps\Browser.exe")])
+        );
+        assert_eq!(
+            rules[1].get("outbound").and_then(Value::as_str),
+            Some("direct")
+        );
+        assert_eq!(
+            value.pointer("/route/final").and_then(Value::as_str),
+            Some("selected")
+        );
     }
 
     #[test]

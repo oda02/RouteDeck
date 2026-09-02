@@ -179,7 +179,7 @@ test("home stays focused on connection controls while detailed checks remain in 
   assert.doesNotMatch(source, /Добавить · скоро|Этот вариант появится позже|advanced-settings/);
 });
 
-test("TUN and application routing use ordinary-client copy without extra ceremonies", () => {
+test("TUN and System Proxy application routing state their capture boundaries", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
   assert.match(source, /value: "tun", label: "TUN"/);
@@ -189,8 +189,13 @@ test("TUN and application routing use ordinary-client copy without extra ceremon
   assert.match(source, /Добавить приложение/);
   assert.match(source, /controller\.listRunningApplications\(\)/);
   assert.match(source, /route: draft\.defaultRoute === "direct" \? "vpn" : "direct"/);
-  assert.match(source, /Эти правила — для TUN/);
-  assert.match(source, /Системный прокси всегда направляет использующие его приложения через выбранный VPN/);
+  assert.match(source, /System Proxy: только приложения с поддержкой прокси/);
+  assert.match(source, /UDP, QUIC и системный DNS не перехватываются/);
+  assert.match(source, /TCP-трафик приложения через прокси Windows/);
+  assert.match(source, /const routeMode = snapshot\.mode === "tun" \? "TUN" : "Прокси Windows"/);
+  assert.match(source, /Маршрут и исключения для proxy-aware TCP; UDP и QUIC не перехватываются/);
+  assert.match(source, /Добавьте приложение, использующее прокси Windows/);
+  assert.doesNotMatch(source, /Настройки Direct и исключений применяются только в TUN|Правила приложений используются в режиме TUN|Прокси Windows: через выбранный VPN/);
   assert.doesNotMatch(source, /tun-preflight|nested|Физический адаптер|security mode|режим безопасности/i);
   assert.doesNotMatch(source, /запустите .*администратор/i);
   assert.doesNotMatch(source, /Проверить задержки|controller\.refreshServers/);
@@ -745,7 +750,7 @@ test("cancel during confirm cannot hide the reconciled import result", async () 
   controller.dispose();
 });
 
-test("TUN routing policy remains saved while System Proxy mode is selected", async () => {
+test("routing policy remains saved while System Proxy mode is selected", async () => {
   const transport: TauriTransport = {
     listen: async () => () => undefined,
     invoke: async () => runtimeStatus(1, "disconnected"),
@@ -759,7 +764,7 @@ test("TUN routing policy remains saved while System Proxy mode is selected", asy
   controller.dispose();
 });
 
-test("System Proxy ignores the saved TUN Direct draft and requests selected VPN routing", async () => {
+test("System Proxy sends the saved Direct default and application VPN exception", async () => {
   const calls: Array<{ command: string; arguments_?: Record<string, unknown> }> = [];
   const transport: TauriTransport = {
     listen: async () => () => undefined,
@@ -794,8 +799,8 @@ test("System Proxy ignores the saved TUN Direct draft and requests selected VPN 
       arguments_: {
         nodeId: "fixture-node",
         routing: {
-          defaultRoute: "vpn",
-          apps: [],
+          defaultRoute: "direct",
+          apps: [{ processPath: "C:\\Apps\\browser.exe", processName: "browser.exe", route: "vpn" }],
         },
       },
     },

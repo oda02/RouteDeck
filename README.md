@@ -7,7 +7,7 @@ RouteDeck is a portable-first Windows desktop client built around pinned `sing-b
 - Import reviewed subscription formats into a normalized local model.
 - Support VLESS/REALITY, Hysteria2, and Naive through a pinned `sing-box` distribution.
 - Offer two explicit operating modes: System Proxy and TUN.
-- Route System Proxy traffic through the selected VPN; expose `Direct`/`VPN` defaults and per-application overrides as TUN policy.
+- Apply `Direct`/`VPN` defaults and per-application overrides to TUN traffic and to proxy-aware TCP traffic in System Proxy mode.
 - Report “Connected” only after a real request succeeds through the selected outbound.
 - Coexist safely with other VPN clients without overwriting state RouteDeck does not own.
 
@@ -37,6 +37,8 @@ The planned modules are intentionally separated:
 - `ui`: rendering only; it does not infer success from process state.
 
 System Proxy can coexist with another locally listening proxy because listeners use different ports, but Windows has only one effective per-user proxy configuration. RouteDeck therefore must detect and explain ownership conflicts. Two TUN/VPN route managers can also conflict; simultaneous use is not assumed safe.
+
+System Proxy routing is intentionally described as best-effort application proxy routing, not full-device tunnelling. Applications that ignore the Windows proxy, UDP/QUIC traffic, and operating-system DNS requests are outside its capture scope; use TUN when those flows must be covered.
 
 ## Development
 

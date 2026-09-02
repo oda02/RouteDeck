@@ -284,14 +284,19 @@ impl fmt::Debug for SystemProxyAppRoute {
 
 impl SystemProxyRouting {
     fn into_policy(self) -> RoutePolicy {
-        // System Proxy has conventional client semantics: every application that opts in to
-        // the Windows proxy uses the selected VPN. The renderer's saved routing draft belongs
-        // to TUN and must never turn a successful System Proxy connection into a direct no-op.
-        let _ = self;
         RoutePolicy {
-            default: DefaultRoute::Vpn,
-            apps: Vec::new(),
-            lan: LanPolicy::FollowDefault,
+            default: self.default_route,
+            apps: self
+                .apps
+                .into_iter()
+                .map(|app| AppRoute {
+                    process_path: app.process_path,
+                    process_name: app.process_name,
+                    action: app.route,
+                })
+                .collect(),
+            // Private destinations stay direct in both user-facing routing modes.
+            lan: LanPolicy::Direct,
             ipv6: Ipv6Policy::Enabled,
             dns: DnsPolicy::CurrentNetwork,
         }
@@ -1013,7 +1018,12 @@ impl ApplicationController {
                 self.services
                     .prober
                     .prove(&route)
-                    .and_then(|_| self.services.prober.prove_ordinary(http_port))
+                    .and_then(|selected_proof| {
+                        self.services
+                            .prober
+                            .prove_ordinary(http_port)
+                            .map(|_| selected_proof)
+                    })
             });
             state = self.lock_state();
             if let Some(Ok(proof)) = validation {
@@ -1268,7 +1278,12 @@ impl ApplicationController {
                 self.services
                     .prober
                     .prove(&route)
-                    .and_then(|_| self.services.prober.prove_ordinary(http_port))
+                    .and_then(|selected_proof| {
+                        self.services
+                            .prober
+                            .prove_ordinary(http_port)
+                            .map(|_| selected_proof)
+                    })
                     .ok()
             });
             state = self.lock_state();
@@ -1864,17 +1879,15 @@ impl ApplicationController {
         // The private health route establishes that the selected outbound works. Local Proxy
         // and System Proxy must additionally prove the ordinary HTTP ingress because that is
         // the path actually exposed to applications. TUN has no ordinary proxy semantics.
-        let health_proof = self.services.prober.prove(&health_route)?;
-        let proof = if matches!(mode, RuntimeMode::LocalOnly | RuntimeMode::SystemProxy) {
-            self.services.prober.prove_ordinary(ports.http)?
-        } else {
-            health_proof
-        };
+        let selected_proof = self.services.prober.prove(&health_route)?;
+        if matches!(mode, RuntimeMode::LocalOnly | RuntimeMode::SystemProxy) {
+            self.services.prober.prove_ordinary(ports.http)?;
+        }
         Self::set_proof(
             state,
             ProofKind::SelectedOutboundHttps,
             ProofState::Passed,
-            Some(proof.latency_ms),
+            Some(selected_proof.latency_ms),
         );
         let active = state
             .active
@@ -1900,7 +1913,7 @@ impl ApplicationController {
             socks: ports.socks,
             health: ports.health,
         });
-        state.status.route_check_ms = Some(proof.latency_ms);
+        state.status.route_check_ms = Some(selected_proof.latency_ms);
         state.status.engine_version = Some(engine_version);
         self.update_status(
             state,
@@ -1950,7 +1963,7 @@ impl ApplicationController {
             // ApplyingSystemProxy intentionally clears the summary while WinINet
             // is being changed. Restore the already verified measurement before
             // publishing the final ready status so the IPC proof stays coherent.
-            state.status.route_check_ms = Some(proof.latency_ms);
+            state.status.route_check_ms = Some(selected_proof.latency_ms);
             self.update_status(
                 state,
                 RuntimePhase::SystemProxyReady,
@@ -2337,7 +2350,10 @@ impl ApplicationController {
                     snapshot.mode,
                     RuntimeMode::LocalOnly | RuntimeMode::SystemProxy
                 ) {
-                    self.services.prober.prove_ordinary(snapshot.http_port)
+                    self.services
+                        .prober
+                        .prove_ordinary(snapshot.http_port)
+                        .map(|_| proof)
                 } else {
                     Ok(proof)
                 }
@@ -3318,6 +3334,18 @@ mod tests {
                 "prove_traffic",
                 "fixture ordinary proxy route failed",
             ))
+        }
+    }
+
+    struct DistinctLatencyProber;
+
+    impl TrafficProber for DistinctLatencyProber {
+        fn prove(&self, _route: &HealthRoute) -> Result<ProofResult, RuntimeError> {
+            Ok(ProofResult { latency_ms: 17 })
+        }
+
+        fn prove_ordinary(&self, _http_port: u16) -> Result<ProofResult, RuntimeError> {
+            Ok(ProofResult { latency_ms: 91 })
         }
     }
 
@@ -4854,7 +4882,7 @@ mod tests {
     }
 
     #[test]
-    fn system_proxy_saved_direct_policy_still_routes_ordinary_traffic_through_selected() {
+    fn system_proxy_applies_saved_direct_default_and_application_exception() {
         let (controller, proxy, stops, alive) =
             controller_with_system_proxy(Arc::new(FakeProber(true)));
         let node = import_node(&controller);
@@ -4877,9 +4905,14 @@ mod tests {
         }));
         let state = controller.lock_state();
         let active = state.active.as_ref().unwrap();
-        assert_eq!(active.routing.default, DefaultRoute::Vpn);
-        assert!(active.routing.apps.is_empty());
-        assert_eq!(active.routing.lan, LanPolicy::FollowDefault);
+        assert_eq!(active.routing.default, DefaultRoute::Direct);
+        assert_eq!(active.routing.apps.len(), 1);
+        assert_eq!(
+            active.routing.apps[0].process_path,
+            r"C:\Program Files\Browser\browser.exe"
+        );
+        assert_eq!(active.routing.apps[0].action, AppRouteAction::Vpn);
+        assert_eq!(active.routing.lan, LanPolicy::Direct);
         drop(state);
 
         controller.stop().unwrap();
@@ -4887,6 +4920,24 @@ mod tests {
         assert_eq!(proxy.restores.load(Ordering::SeqCst), 1);
         assert_eq!(stops.load(Ordering::SeqCst), 1);
         assert!(!alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn system_proxy_reports_selected_health_latency_not_direct_ingress_latency() {
+        let (controller, _proxy, _stops, _alive) =
+            controller_with_system_proxy(Arc::new(DistinctLatencyProber));
+        let node = import_node(&controller);
+
+        let status = controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Direct))
+            .unwrap();
+
+        assert_eq!(status.route_check_ms, Some(17));
+        assert!(status.proofs.iter().any(|proof| {
+            proof.kind == ProofKind::SelectedOutboundHttps
+                && proof.state == ProofState::Passed
+                && proof.latency_ms == Some(17)
+        }));
     }
 
     #[test]

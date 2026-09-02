@@ -282,11 +282,10 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
   const boundaryNotice = snapshot.notice?.id === "backend-unavailable" || snapshot.notice?.id === "backend-response-invalid";
   const vpnApps = snapshot.routing.apps.filter((app) => app.route === "vpn");
   const directApps = snapshot.routing.apps.filter((app) => app.route === "direct");
-  const routeSummary = snapshot.mode === "tun"
-    ? snapshot.routing.defaultRoute === "direct"
-      ? `TUN: напрямую · ${vpnApps.length} ${vpnApps.length === 1 ? "исключение" : "исключений"} через VPN`
-      : `TUN: через VPN · ${directApps.length} исключений напрямую`
-    : "Прокси Windows: через выбранный VPN";
+  const routeMode = snapshot.mode === "tun" ? "TUN" : "Прокси Windows";
+  const routeSummary = snapshot.routing.defaultRoute === "direct"
+    ? `${routeMode}: напрямую · ${vpnApps.length} ${vpnApps.length === 1 ? "исключение" : "исключений"} через VPN`
+    : `${routeMode}: через VPN · ${directApps.length} исключений напрямую`;
 
   return (
     <div className="page home-page">
@@ -331,7 +330,7 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
               ? "Диагностическая сессия проверяет локальные HTTP/SOCKS-порты и не меняет настройки Windows."
               : snapshot.mode === "tun"
                 ? "Перехватывает весь IP-трафик через виртуальный адаптер. При каждом подключении Windows покажет стандартный запрос прав."
-                : "Направляет через выбранный VPN приложения, которые используют прокси Windows."}
+                : "Применяет общий маршрут и исключения к TCP-трафику приложений, которые используют прокси Windows."}
           </p>
         </div>
       </section>
@@ -361,7 +360,7 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
         <span className="selection-copy">
           <span className="selection-label">Маршрутизация</span>
           <strong>{routeSummary}</strong>
-          <span>{snapshot.mode === "tun" ? "Общий маршрут и исключения для приложений" : "Настройки Direct и исключений применяются только в TUN"}</span>
+          <span>{snapshot.mode === "tun" ? "Общий маршрут и исключения для приложений" : "Маршрут и исключения для proxy-aware TCP; UDP и QUIC не перехватываются"}</span>
         </span>
         <ChevronRightIcon size={20} />
       </button>
@@ -452,8 +451,8 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
   const connectionActive = snapshot.phase !== "disconnected" && snapshot.phase !== "failed";
   const dirty = JSON.stringify(draft) !== JSON.stringify(snapshot.routing);
   const summary = draft.defaultRoute === "direct"
-    ? `TUN: по умолчанию напрямую · ${draft.apps.filter((app) => app.route === "vpn").length} исключений через VPN`
-    : `TUN: по умолчанию через VPN · ${draft.apps.filter((app) => app.route === "direct").length} исключений напрямую`;
+    ? `По умолчанию напрямую · ${draft.apps.filter((app) => app.route === "vpn").length} исключений через VPN`
+    : `По умолчанию через VPN · ${draft.apps.filter((app) => app.route === "direct").length} исключений напрямую`;
   const selectedPaths = useMemo(() => new Set(
     draft.apps.map((app) => app.path.replaceAll("/", "\\").toLocaleLowerCase("en-US")),
   ), [draft.apps]);
@@ -515,7 +514,7 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
       </div>
       <ActionFailureNotice failure={actionFailure} page="routing" onClear={onClearFailure} />
       <section className="card">
-        <div className="section-heading compact-heading"><div><p className="overline">Политика TUN</p><h2>Маршрут по умолчанию</h2></div></div>
+        <div className="section-heading compact-heading"><div><p className="overline">Общая политика</p><h2>Маршрут по умолчанию</h2></div></div>
         <SegmentedControl
           label="Маршрут по умолчанию"
           value={draft.defaultRoute}
@@ -528,7 +527,7 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
 
       <OpaqueNotice notice={snapshot.mode === "tun"
         ? { id: "tun-routing-scope", kind: "info", title: "Правила применятся при следующем подключении", body: "TUN использует общий маршрут для трафика Windows, а выбранные приложения — как исключения." }
-        : { id: "proxy-routing-scope", kind: "info", title: "Эти правила — для TUN", body: "Системный прокси всегда направляет использующие его приложения через выбранный VPN. Direct и правила приложений действуют в режиме TUN." }} />
+        : { id: "proxy-routing-scope", kind: "info", title: "System Proxy: только приложения с поддержкой прокси", body: "Правила действуют для TCP-трафика приложений, которые используют прокси Windows. Программы, обходящие системный прокси, а также UDP, QUIC и системный DNS не перехватываются; для полного охвата используйте TUN." }} />
 
       <section className="card app-rules-card">
         <div className="section-heading">
@@ -555,14 +554,14 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
               <p className="rule-effective">
                 {snapshot.mode === "tun"
                   ? `В TUN: трафик приложения ${app.route === "direct" ? "напрямую" : "через VPN"}`
-                  : "Это правило применяется в режиме TUN"}
+                  : `В System Proxy: TCP-трафик приложения через прокси Windows ${app.route === "direct" ? "напрямую" : "через VPN"}`}
               </p>
             </div>
           )) : (
             <div className="empty-state">
               <RoutingIcon size={24} />
               <strong>Исключений пока нет</strong>
-              <span>{snapshot.mode === "tun" ? "Добавьте запущенное приложение, чтобы задать ему другой маршрут." : "Правила приложений используются в режиме TUN."}</span>
+              <span>{snapshot.mode === "tun" ? "Добавьте запущенное приложение, чтобы задать ему другой маршрут." : "Добавьте приложение, использующее прокси Windows, чтобы задать его TCP-трафику другой маршрут."}</span>
             </div>
           )}
         </div>
