@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::{
         generate_config, generate_socks_bridge_config, CaptureMode, ConfigRequest, SocksBridge,
+        TunSettings,
     },
     domain::{
         AppRoute, AppRouteAction, DefaultRoute, DnsPolicy, Ipv6Policy, LanPolicy, Node,
@@ -48,6 +49,7 @@ pub enum RuntimePhase {
     ApplyingSystemProxy,
     LocalProxyReady,
     SystemProxyReady,
+    TunReady,
     RestoringSystemProxy,
     BlockedByConflict,
     Degraded,
@@ -62,6 +64,7 @@ pub enum RuntimePhase {
 pub enum RuntimeScope {
     LocalOnly,
     SystemProxy,
+    Tun,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -69,6 +72,7 @@ pub enum RuntimeScope {
 pub enum RuntimeMode {
     LocalOnly,
     SystemProxy,
+    Tun,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -247,6 +251,14 @@ pub struct SystemProxyRouting {
     pub apps: Vec<SystemProxyAppRoute>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TunRouting {
+    pub default_route: DefaultRoute,
+    #[serde(default)]
+    pub apps: Vec<SystemProxyAppRoute>,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SystemProxyAppRoute {
@@ -282,6 +294,45 @@ impl SystemProxyRouting {
             lan: LanPolicy::Direct,
             ipv6: Ipv6Policy::Enabled,
             dns: DnsPolicy::CurrentNetwork,
+        }
+    }
+}
+
+impl TunRouting {
+    fn into_policy(self) -> RoutePolicy {
+        RoutePolicy {
+            default: self.default_route,
+            apps: self
+                .apps
+                .into_iter()
+                .map(|app| AppRoute {
+                    process_path: app.process_path,
+                    process_name: app.process_name,
+                    action: app.route,
+                })
+                .collect(),
+            lan: LanPolicy::Direct,
+            ipv6: Ipv6Policy::Enabled,
+            dns: DnsPolicy::CurrentNetwork,
+        }
+    }
+}
+
+trait TunPrivilegeControl: Send + Sync {
+    fn is_elevated(&self) -> Result<bool, RuntimeError>;
+}
+
+struct PlatformTunPrivilege;
+
+impl TunPrivilegeControl for PlatformTunPrivilege {
+    fn is_elevated(&self) -> Result<bool, RuntimeError> {
+        #[cfg(windows)]
+        {
+            crate::windows_process::current_process_is_elevated()
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(false)
         }
     }
 }
@@ -363,6 +414,7 @@ struct RuntimeServices {
     prober: Arc<dyn TrafficProber>,
     subscription_fetcher: Arc<dyn SubscriptionFetcher>,
     system_proxy: Arc<dyn SystemProxyControl>,
+    tun_privilege: Arc<dyn TunPrivilegeControl>,
 }
 
 struct PendingImport {
@@ -605,6 +657,7 @@ impl ApplicationController {
                 prober,
                 subscription_fetcher,
                 system_proxy,
+                tun_privilege: Arc::new(PlatformTunPrivilege),
             },
             session_root,
             diagnostics: Arc::new(Mutex::new(DiagnosticBuffer::default())),
@@ -1227,6 +1280,202 @@ impl ApplicationController {
         Err(public)
     }
 
+    pub fn start_tun(
+        &self,
+        node_id: &str,
+        routing: TunRouting,
+    ) -> Result<RuntimeStatus, PublicError> {
+        let policy = routing.into_policy();
+        policy.validate().map_err(|_| {
+            PublicError::fixed(
+                PublicErrorCode::RuntimeFailure,
+                PublicErrorStage::Start,
+                "Application routing rules are invalid",
+            )
+        })?;
+        let _operation = self
+            .operation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let elevated = self.services.tun_privilege.is_elevated().map_err(|error| {
+            PublicError::with_detail(
+                PublicErrorCode::RuntimeFailure,
+                PublicErrorStage::Start,
+                "TUN availability could not be checked",
+                Redactor::default().redact(error.message()),
+            )
+        })?;
+        if !elevated {
+            return Err(PublicError::fixed(
+                PublicErrorCode::RuntimeFailure,
+                PublicErrorStage::Start,
+                "TUN requires RouteDeck to be run as administrator",
+            ));
+        }
+        let mut state = self.lock_state();
+        if state.shutting_down {
+            return Err(PublicError::fixed(
+                PublicErrorCode::RuntimeFailure,
+                PublicErrorStage::Start,
+                "Application shutdown is in progress",
+            ));
+        }
+        if state.recovery_required {
+            return Err(PublicError::fixed(
+                PublicErrorCode::RecoveryRequired,
+                PublicErrorStage::SessionRecovery,
+                "Review preserved recovery data before reconnecting",
+            ));
+        }
+        if state.active.is_some() {
+            let exact = state.active.as_ref().is_some_and(|active| {
+                active.mode == RuntimeMode::Tun
+                    && active.node_id == node_id
+                    && active.routing == policy
+                    && state
+                        .nodes
+                        .get(node_id)
+                        .is_some_and(|stored| active.config_identity == stored.config_identity)
+            });
+            if !exact {
+                return Err(PublicError::fixed(
+                    PublicErrorCode::ActiveSessionConflict,
+                    PublicErrorStage::Start,
+                    "Stop the active connection before changing TUN routing",
+                ));
+            }
+            let route = {
+                let active = state.active.as_mut().expect("active session disappeared");
+                active
+                    .child
+                    .is_alive()
+                    .unwrap_or(false)
+                    .then(|| active.health_route.clone())
+            };
+            drop(state);
+            let proof = route.and_then(|route| self.services.prober.prove(&route).ok());
+            state = self.lock_state();
+            let still_exact = state.active.as_ref().is_some_and(|active| {
+                active.mode == RuntimeMode::Tun
+                    && active.node_id == node_id
+                    && active.routing == policy
+            });
+            if !still_exact {
+                return Err(PublicError::fixed(
+                    PublicErrorCode::SessionChanged,
+                    PublicErrorStage::Start,
+                    "Active session changed while TUN traffic was being verified",
+                ));
+            }
+            let listeners_owned = state.active.as_mut().is_some_and(|active| {
+                active.child.is_alive().unwrap_or(false)
+                    && self
+                        .services
+                        .listener
+                        .verify_owned_now(active.ports, active.child.as_mut())
+                        .is_ok()
+            });
+            if let Some(proof) = proof.filter(|_| listeners_owned) {
+                state.status.route_check_ms = Some(proof.latency_ms);
+                Self::set_proof(
+                    &mut state,
+                    ProofKind::SelectedOutboundHttps,
+                    ProofState::Passed,
+                    Some(proof.latency_ms),
+                );
+                Self::set_proof(
+                    &mut state,
+                    ProofKind::LocalScopeOwnership,
+                    ProofState::Passed,
+                    None,
+                );
+                self.update_status(
+                    &mut state,
+                    RuntimePhase::TunReady,
+                    Some(node_id.to_owned()),
+                    None,
+                );
+                return Ok(state.status.clone());
+            }
+            let public = PublicError::fixed(
+                PublicErrorCode::RuntimeFailure,
+                PublicErrorStage::ProveTraffic,
+                "The active TUN connection could not be verified",
+            );
+            self.update_status(
+                &mut state,
+                RuntimePhase::Degraded,
+                Some(node_id.to_owned()),
+                Some(public.clone()),
+            );
+            return Err(public);
+        }
+        let stored = state.nodes.get(node_id).cloned().ok_or_else(|| {
+            PublicError::fixed(
+                PublicErrorCode::NodeNotFound,
+                PublicErrorStage::Start,
+                "Selected node does not exist in the confirmed import",
+            )
+        })?;
+        let node = stored.node;
+        let redactor = Redactor::from_nodes(std::slice::from_ref(&node)).with_secret(node.server());
+        let result = self.start_locked(
+            &mut state,
+            &node,
+            stored.config_identity,
+            policy,
+            RuntimeMode::Tun,
+            redactor.clone(),
+        );
+        let Err(error) = result else {
+            return Ok(state.status.clone());
+        };
+
+        Self::mark_failed_proof(&mut state, error.stage());
+        self.update_status(
+            &mut state,
+            RuntimePhase::RollingBack,
+            Some(node_id.to_owned()),
+            None,
+        );
+        if let Some(stop_error) = state
+            .active
+            .as_mut()
+            .and_then(|active| active.child.stop().err())
+        {
+            let public = public_runtime_error(stop_error, &redactor);
+            state.recovery_required = true;
+            self.update_status(
+                &mut state,
+                RuntimePhase::RecoveryRequired,
+                Some(node_id.to_owned()),
+                Some(public.clone()),
+            );
+            return Err(public);
+        }
+        let failed = state.active.take();
+        Self::clear_active_metadata(&mut state);
+        drop(failed);
+        let public = public_runtime_error(error, &redactor);
+        if reconcile_stale_sessions(&self.session_root).is_err() {
+            state.recovery_required = true;
+            self.update_status(
+                &mut state,
+                RuntimePhase::RecoveryRequired,
+                Some(node_id.to_owned()),
+                Some(public.clone()),
+            );
+        } else {
+            self.update_status(
+                &mut state,
+                RuntimePhase::DisconnectedWithError,
+                Some(node_id.to_owned()),
+                Some(public.clone()),
+            );
+        }
+        Err(public)
+    }
+
     fn start_locked(
         &self,
         state: &mut State,
@@ -1240,6 +1489,7 @@ impl ApplicationController {
         state.status.scope = match mode {
             RuntimeMode::LocalOnly => RuntimeScope::LocalOnly,
             RuntimeMode::SystemProxy => RuntimeScope::SystemProxy,
+            RuntimeMode::Tun => RuntimeScope::Tun,
         };
         state.status.mode = mode;
         state.status.session_id = Some(session_id.clone());
@@ -1260,6 +1510,7 @@ impl ApplicationController {
         let capture_mode = match mode {
             RuntimeMode::LocalOnly => CaptureMode::LocalProxy,
             RuntimeMode::SystemProxy => CaptureMode::SystemProxy,
+            RuntimeMode::Tun => CaptureMode::Tun(TunSettings::default()),
         };
         let request = || ConfigRequest {
             node,
@@ -1525,6 +1776,13 @@ impl ApplicationController {
             self.update_status(
                 state,
                 RuntimePhase::SystemProxyReady,
+                Some(node.id().to_owned()),
+                None,
+            );
+        } else if mode == RuntimeMode::Tun {
+            self.update_status(
+                state,
+                RuntimePhase::TunReady,
                 Some(node.id().to_owned()),
                 None,
             );
@@ -1992,10 +2250,10 @@ impl ApplicationController {
                 );
                 self.update_status(
                     &mut state,
-                    if snapshot.mode == RuntimeMode::SystemProxy {
-                        RuntimePhase::SystemProxyReady
-                    } else {
-                        RuntimePhase::LocalProxyReady
+                    match snapshot.mode {
+                        RuntimeMode::SystemProxy => RuntimePhase::SystemProxyReady,
+                        RuntimeMode::Tun => RuntimePhase::TunReady,
+                        RuntimeMode::LocalOnly => RuntimePhase::LocalProxyReady,
                     },
                     Some(snapshot.node_id),
                     None,
@@ -2040,6 +2298,7 @@ impl ApplicationController {
             RuntimePhase::OutboundVerified
                 | RuntimePhase::LocalProxyReady
                 | RuntimePhase::SystemProxyReady
+                | RuntimePhase::TunReady
                 | RuntimePhase::Degraded
         ) {
             state.status.route_check_ms = None;
@@ -2344,6 +2603,14 @@ mod tests {
         publishes: AtomicUsize,
         restores: AtomicUsize,
         restore_saw_live_core: AtomicBool,
+    }
+
+    struct FakeTunPrivilege(bool);
+
+    impl TunPrivilegeControl for FakeTunPrivilege {
+        fn is_elevated(&self) -> Result<bool, RuntimeError> {
+            Ok(self.0)
+        }
     }
 
     impl FakeSystemProxy {
@@ -2978,6 +3245,36 @@ mod tests {
             proxy.clone(),
         );
         (controller, proxy, stops, alive)
+    }
+
+    fn controller_with_tun(
+        elevated: bool,
+        proof: bool,
+        stop_fails: bool,
+    ) -> (ApplicationController, Arc<AtomicUsize>, Arc<AtomicBool>) {
+        let alive = Arc::new(AtomicBool::new(false));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let proxy = Arc::new(FakeSystemProxy::new(alive.clone()));
+        let root = std::env::temp_dir().join(format!(
+            "routedeck-tun-test-{}",
+            random_hex(8).expect("test random")
+        ));
+        let mut controller = ApplicationController::with_services_and_controls(
+            root,
+            Arc::new(|_| {}),
+            Arc::new(FakeProvider {
+                check_fails: false,
+                stop_fails,
+                alive: alive.clone(),
+                stops: stops.clone(),
+            }),
+            Arc::new(FakeListener(true)),
+            Arc::new(FakeProber(proof)),
+            Arc::new(HttpsSubscriptionFetcher),
+            proxy,
+        );
+        controller.services.tun_privilege = Arc::new(FakeTunPrivilege(elevated));
+        (controller, stops, alive)
     }
 
     fn controller_with_stop_failure() -> ApplicationController {
@@ -3962,6 +4259,99 @@ mod tests {
                 },
             }],
         }
+    }
+
+    fn tun_routing(default_route: DefaultRoute) -> TunRouting {
+        TunRouting {
+            default_route,
+            apps: vec![SystemProxyAppRoute {
+                process_path: r"C:\Program Files\Browser\browser.exe".into(),
+                process_name: Some("browser.exe".into()),
+                route: if default_route == DefaultRoute::Direct {
+                    AppRouteAction::Vpn
+                } else {
+                    AppRouteAction::Direct
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn tun_start_requires_elevation_before_starting_an_engine() {
+        let (controller, stops, alive) = controller_with_tun(false, true, false);
+        let node = import_node(&controller);
+
+        let error = controller
+            .start_tun(&node, tun_routing(DefaultRoute::Direct))
+            .unwrap_err();
+
+        assert_eq!(error.stage, PublicErrorStage::Start);
+        assert!(error.message.contains("administrator"));
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert!(!alive.load(Ordering::SeqCst));
+        assert_eq!(controller.status().phase, RuntimePhase::Disconnected);
+    }
+
+    #[test]
+    fn tun_start_applies_default_and_app_routes_then_stops_only_the_owned_engine() {
+        let (controller, stops, alive) = controller_with_tun(true, true, false);
+        let node = import_node(&controller);
+
+        let status = controller
+            .start_tun(&node, tun_routing(DefaultRoute::Direct))
+            .unwrap();
+
+        assert_eq!(status.scope, RuntimeScope::Tun);
+        assert_eq!(status.mode, RuntimeMode::Tun);
+        assert_eq!(status.phase, RuntimePhase::TunReady);
+        assert_eq!(status.route_check_ms, Some(42));
+        let state = controller.lock_state();
+        let active = state.active.as_ref().unwrap();
+        assert_eq!(active.routing.default, DefaultRoute::Direct);
+        assert_eq!(active.routing.apps.len(), 1);
+        assert_eq!(active.routing.apps[0].action, AppRouteAction::Vpn);
+        drop(state);
+        assert!(alive.load(Ordering::SeqCst));
+
+        let stopped = controller.stop().unwrap();
+        assert_eq!(stopped.phase, RuntimePhase::Disconnected);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert!(!alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn tun_start_failure_rolls_back_the_owned_engine() {
+        let (controller, stops, alive) = controller_with_tun(true, false, false);
+        let node = import_node(&controller);
+
+        let error = controller
+            .start_tun(&node, tun_routing(DefaultRoute::Vpn))
+            .unwrap_err();
+
+        assert_eq!(error.stage, PublicErrorStage::ProveTraffic);
+        assert_eq!(
+            controller.status().phase,
+            RuntimePhase::DisconnectedWithError
+        );
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert!(!alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn tun_stop_failure_keeps_session_for_an_honest_recovery_state() {
+        let (controller, stops, alive) = controller_with_tun(true, true, true);
+        let node = import_node(&controller);
+        controller
+            .start_tun(&node, tun_routing(DefaultRoute::Vpn))
+            .unwrap();
+
+        let error = controller.stop().unwrap_err();
+
+        assert_eq!(error.stage, PublicErrorStage::StopEngine);
+        assert_eq!(controller.status().phase, RuntimePhase::RecoveryRequired);
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert!(alive.load(Ordering::SeqCst));
+        assert!(controller.lock_state().active.is_some());
     }
 
     #[test]

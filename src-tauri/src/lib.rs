@@ -39,9 +39,11 @@ pub fn run() {
             commands::confirm_import,
             commands::start_local_proxy,
             commands::start_system_proxy,
+            commands::start_tun,
             commands::runtime_status,
             commands::stop_local_proxy,
             commands::stop_system_proxy,
+            commands::stop_tun,
             commands::retry_session_recovery,
             commands::runtime_diagnostics,
         ])

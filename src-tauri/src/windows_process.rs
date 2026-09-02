@@ -41,10 +41,48 @@ use windows_sys::Win32::{
     },
 };
 
+use windows_sys::Win32::Security::{
+    GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
 use crate::engine_runtime::RuntimeError;
 
 const PROCESS_ABORT_CODE: u32 = 0x5254_444b;
 const MAX_COMMAND_LINE_UNITS: usize = 32_767;
+
+pub(crate) fn current_process_is_elevated() -> Result<bool, RuntimeError> {
+    let mut token = ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(win32_error(
+            "tun_privilege",
+            "could not inspect the RouteDeck process token",
+        ));
+    }
+    let token = OwnedHandle::new(
+        token,
+        "tun_privilege",
+        "the RouteDeck process token was invalid",
+    )?;
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned = 0_u32;
+    let read = unsafe {
+        GetTokenInformation(
+            token.raw(),
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    };
+    if read == 0 || returned != size_of::<TOKEN_ELEVATION>() as u32 {
+        return Err(win32_error(
+            "tun_privilege",
+            "could not read the RouteDeck elevation state",
+        ));
+    }
+    Ok(elevation.TokenIsElevated != 0)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EngineCommand {
