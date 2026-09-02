@@ -147,6 +147,7 @@ export type RouteDeckErrorCode =
   | "backend-response-invalid"
   | "capability-unavailable"
   | "tun-admin-required"
+  | "tun-uac-cancelled"
   | "runtime-failure"
   | "node-not-selected"
   | "subscription-import-rejected"

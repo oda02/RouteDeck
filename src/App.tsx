@@ -320,17 +320,17 @@ function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, o
         <SegmentedControl
           label="Режим подключения"
           value={snapshot.mode}
-          options={[{ value: "proxy", label: "Системный прокси" }, { value: "tun", label: "TUN · скоро", disabled: true }]}
+          options={[{ value: "proxy", label: "Системный прокси" }, { value: "tun", label: "TUN" }]}
           onChange={onModeChange}
           disabled={pending || localDiagnostic}
         />
-        <div className="persistent-hint" data-kind={snapshot.mode === "tun" ? "warning" : "info"}>
+        <div className="persistent-hint" data-kind="info">
           {snapshot.mode === "proxy" ? <InfoIcon size={18} /> : <ShieldIcon size={18} />}
           <p>
             {localDiagnostic
               ? "Диагностическая сессия проверяет локальные HTTP/SOCKS-порты и не меняет настройки Windows."
               : snapshot.mode === "tun"
-                ? "Перехватывает трафик через виртуальный адаптер. Обычный запуск станет доступен после добавления запроса прав Windows."
+                ? "Перехватывает весь IP-трафик через виртуальный адаптер. При каждом подключении Windows покажет стандартный запрос прав."
                 : "Подключает приложения, которые используют прокси Windows. Общий маршрут задаётся в разделе «Правила»."}
           </p>
         </div>

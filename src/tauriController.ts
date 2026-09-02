@@ -365,6 +365,10 @@ function projectRuntimeLatency(servers: readonly Server[], status: RuntimeStatus
 
 function routeDeckErrorFromBackend(error: PublicErrorDto): RouteDeckError {
   if (error.code === "runtime_failure" && error.stage === "start"
+    && error.detail === "TUN permission request was cancelled") {
+    return new RouteDeckError("tun-uac-cancelled");
+  }
+  if (error.code === "runtime_failure" && error.stage === "start"
     && error.message === "TUN requires RouteDeck to be run as administrator") {
     return new RouteDeckError("tun-admin-required");
   }

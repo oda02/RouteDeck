@@ -181,7 +181,11 @@ test("home stays focused on connection controls while detailed checks remain in 
 
 test("TUN and application routing use ordinary-client copy without extra ceremonies", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
-  assert.match(source, /value: "tun", label: "TUN · скоро", disabled: true/);
+  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  assert.match(source, /value: "tun", label: "TUN"/);
+  assert.doesNotMatch(source, /value: "tun"[^\n]*disabled|TUN · скоро/);
+  assert.match(source, /При каждом подключении Windows покажет стандартный запрос прав/);
+  assert.match(source, /<div className="persistent-hint" data-kind="info">/);
   assert.match(source, /Добавить приложение/);
   assert.match(source, /controller\.listRunningApplications\(\)/);
   assert.match(source, /route: draft\.defaultRoute === "direct" \? "vpn" : "direct"/);
@@ -189,6 +193,8 @@ test("TUN and application routing use ordinary-client copy without extra ceremon
   assert.doesNotMatch(source, /tun-preflight|nested|Физический адаптер|security mode|режим безопасности/i);
   assert.doesNotMatch(source, /запустите .*администратор/i);
   assert.doesNotMatch(source, /Проверить задержки|controller\.refreshServers/);
+  assert.match(styles, /\.segmented-control \{[\s\S]*width: 100%;[\s\S]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/);
+  assert.match(styles, /\.segmented-control label \{[\s\S]*min-width: 0;[\s\S]*min-height: 44px/);
 });
 
 test("revision gate rejects a stale initial snapshot after a newer event", () => {
@@ -871,7 +877,39 @@ test("ordinary TUN privilege failure maps to plain finite copy", async () => {
   controller.setMode("tun");
   await assert.rejects(controller.connect(), { code: "tun-admin-required" });
   const message = toPublicActionError(new RouteDeckError("tun-admin-required")).message;
-  assert.match(message, /TUN пока недоступен/);
+  assert.match(message, /Не удалось запросить права Windows/);
+  assert.doesNotMatch(message, /administrator|администратор|elevat/i);
+  controller.dispose();
+});
+
+test("cancelled standard Windows UAC has a clear retryable TUN error", async () => {
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command) => {
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "confirmed_nodes") return [{
+        id: "saved-node",
+        displayName: "Saved",
+        protocol: "hysteria2",
+        insecureTls: false,
+      }];
+      if (command === "start_tun") throw {
+        code: "runtime_failure",
+        stage: "start",
+        message: "The RouteDeck connection operation failed",
+        detail: "TUN permission request was cancelled",
+      };
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+  controller.setMode("tun");
+
+  await assert.rejects(controller.connect(), { code: "tun-uac-cancelled" });
+  const message = toPublicActionError(new RouteDeckError("tun-uac-cancelled")).message;
+  assert.match(message, /Запрос прав Windows отменён/);
+  assert.match(message, /Нажмите «Подключить» ещё раз/);
   assert.doesNotMatch(message, /administrator|администратор|elevat/i);
   controller.dispose();
 });

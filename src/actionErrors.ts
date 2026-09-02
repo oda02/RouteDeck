@@ -13,7 +13,9 @@ export function toPublicActionError(error: unknown): PublicActionError {
       case "capability-unavailable":
         return { message: "Эта функция пока недоступна." };
       case "tun-admin-required":
-        return { message: "TUN пока недоступен в обычном режиме запуска." };
+        return { message: "Не удалось запросить права Windows для TUN. Перезапустите RouteDeck и попробуйте снова." };
+      case "tun-uac-cancelled":
+        return { message: "Запрос прав Windows отменён. Нажмите «Подключить» ещё раз и подтвердите стандартное окно Windows." };
       case "runtime-failure":
         return {
           message: "Не удалось выполнить действие. Повторите попытку или откройте диагностику.",
