@@ -310,6 +310,7 @@ function runtimeNotice(status: RuntimeStatusDto): AppNotice | undefined {
       kind: "error",
       title: "Подключение требует внимания",
       body: "RouteDeck не смог завершить операцию. Повторите попытку или откройте диагностику.",
+      redactedDetail: status.error.detail,
     };
   }
   return undefined;
@@ -345,7 +346,7 @@ function routeDeckErrorFromBackend(error: PublicErrorDto): RouteDeckError {
     case "subscription_invalid_encoding":
       return new RouteDeckError("subscription-invalid-encoding");
     default:
-      return new RouteDeckError("runtime-failure");
+      return new RouteDeckError("runtime-failure", error.detail);
   }
 }
 

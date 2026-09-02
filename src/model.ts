@@ -155,11 +155,13 @@ export type RouteDeckErrorCode =
 
 export class RouteDeckError extends Error {
   readonly code: RouteDeckErrorCode;
+  readonly redactedDetail?: string;
 
-  constructor(code: RouteDeckErrorCode) {
+  constructor(code: RouteDeckErrorCode, redactedDetail?: string) {
     super(code);
     this.name = "RouteDeckError";
     this.code = code;
+    this.redactedDetail = redactedDetail;
   }
 }
 

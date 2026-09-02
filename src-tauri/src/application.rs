@@ -983,6 +983,7 @@ impl ApplicationController {
             dns: DnsPolicy::CurrentNetwork,
         };
 
+        self.begin_diagnostic_attempt();
         let result = self.start_locked(
             &mut state,
             &node,
@@ -993,11 +994,7 @@ impl ApplicationController {
         );
         if let Err(error) = result {
             Self::mark_failed_proof(&mut state, error.stage());
-            let safe = redactor.redact(error.message());
-            self.diagnostics
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(format!("{}: {safe}", error.stage()));
+            self.record_runtime_failure(&error, &redactor);
             self.update_status(
                 &mut state,
                 RuntimePhase::RollingBack,
@@ -1197,6 +1194,7 @@ impl ApplicationController {
         })?;
         let node = stored.node;
         let redactor = Redactor::from_nodes(std::slice::from_ref(&node)).with_secret(node.server());
+        self.begin_diagnostic_attempt();
         let result = self.start_locked(
             &mut state,
             &node,
@@ -1211,6 +1209,7 @@ impl ApplicationController {
 
         let proxy_may_be_published = state.status.phase == RuntimePhase::ApplyingSystemProxy;
         Self::mark_failed_proof(&mut state, error.stage());
+        self.record_runtime_failure(&error, &redactor);
         self.update_status(
             &mut state,
             RuntimePhase::RollingBack,
@@ -1419,6 +1418,7 @@ impl ApplicationController {
         })?;
         let node = stored.node;
         let redactor = Redactor::from_nodes(std::slice::from_ref(&node)).with_secret(node.server());
+        self.begin_diagnostic_attempt();
         let result = self.start_locked(
             &mut state,
             &node,
@@ -1432,6 +1432,7 @@ impl ApplicationController {
         };
 
         Self::mark_failed_proof(&mut state, error.stage());
+        self.record_runtime_failure(&error, &redactor);
         self.update_status(
             &mut state,
             RuntimePhase::RollingBack,
@@ -1474,6 +1475,22 @@ impl ApplicationController {
             );
         }
         Err(public)
+    }
+
+    fn begin_diagnostic_attempt(&self) {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    fn record_runtime_failure(&self, error: &RuntimeError, redactor: &Redactor) {
+        let line = format!("{}: {}", error.stage(), error.message());
+        let safe = redactor.redact(&line);
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(safe);
     }
 
     fn start_locked(
@@ -3079,6 +3096,17 @@ mod tests {
         }
     }
 
+    struct SecretFailProber;
+
+    impl TrafficProber for SecretFailProber {
+        fn prove(&self, _route: &HealthRoute) -> Result<ProofResult, RuntimeError> {
+            Err(RuntimeError::new(
+                "prove_traffic",
+                "fixture selected outbound password=fixture-secret failed",
+            ))
+        }
+    }
+
     struct ToggleProber(Arc<AtomicBool>);
 
     impl TrafficProber for ToggleProber {
@@ -4323,6 +4351,11 @@ mod tests {
     fn tun_start_failure_rolls_back_the_owned_engine() {
         let (controller, stops, alive) = controller_with_tun(true, false, false);
         let node = import_node(&controller);
+        controller
+            .diagnostics
+            .lock()
+            .unwrap()
+            .push("stale attempt".into());
 
         let error = controller
             .start_tun(&node, tun_routing(DefaultRoute::Vpn))
@@ -4335,6 +4368,35 @@ mod tests {
         );
         assert_eq!(stops.load(Ordering::SeqCst), 1);
         assert!(!alive.load(Ordering::SeqCst));
+        assert_eq!(
+            controller.diagnostics().lines,
+            vec!["prove_traffic: fixture selected outbound failed"]
+        );
+    }
+
+    #[test]
+    fn system_proxy_start_failure_records_only_the_current_redacted_attempt() {
+        let (controller, _proxy, stops, alive) =
+            controller_with_system_proxy(Arc::new(SecretFailProber));
+        let node = import_node(&controller);
+        controller
+            .diagnostics
+            .lock()
+            .unwrap()
+            .push("stale attempt".into());
+
+        let error = controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Vpn))
+            .unwrap_err();
+
+        assert_eq!(error.stage, PublicErrorStage::ProveTraffic);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert!(!alive.load(Ordering::SeqCst));
+        let lines = controller.diagnostics().lines;
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("prove_traffic: "));
+        assert!(!lines[0].contains("fixture-secret"));
+        assert!(!lines[0].contains("stale attempt"));
     }
 
     #[test]

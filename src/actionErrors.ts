@@ -13,7 +13,10 @@ export function toPublicActionError(error: unknown): PublicActionError {
       case "capability-unavailable":
         return { message: "Эта функция пока недоступна." };
       case "runtime-failure":
-        return { message: "Не удалось выполнить действие. Повторите попытку или откройте диагностику." };
+        return {
+          message: "Не удалось выполнить действие. Повторите попытку или откройте диагностику.",
+          redactedDetail: error.redactedDetail,
+        };
       case "node-not-selected":
         return { message: "Сначала импортируйте и выберите сервер." };
       case "subscription-import-rejected":

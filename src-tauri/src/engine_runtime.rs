@@ -1786,6 +1786,11 @@ pub(crate) struct DiagnosticBuffer {
 }
 
 impl DiagnosticBuffer {
+    pub(crate) fn clear(&mut self) {
+        self.lines.clear();
+        self.bytes = 0;
+    }
+
     pub(crate) fn push(&mut self, line: String) {
         let line = if line.len() > 4 * 1024 {
             "[REDACTED: diagnostic line omitted]".to_owned()
@@ -2439,6 +2444,18 @@ mod tests {
             buffer.push(format!("line-{index}"));
         }
         assert_eq!(buffer.snapshot().len(), MAX_DIAGNOSTIC_LINES);
+    }
+
+    #[test]
+    fn diagnostic_buffer_clear_removes_stale_lines_and_resets_accounting() {
+        let mut buffer = DiagnosticBuffer::default();
+        buffer.push("stale attempt".into());
+
+        buffer.clear();
+        buffer.push("current attempt".into());
+
+        assert_eq!(buffer.snapshot(), vec!["current attempt"]);
+        assert_eq!(buffer.bytes, "current attempt".len());
     }
 
     #[test]

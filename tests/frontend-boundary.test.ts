@@ -675,6 +675,43 @@ test("connect and disconnect use the typed System Proxy commands and routing dra
   controller.dispose();
 });
 
+test("runtime detail is available only as expandable detail while the main error stays plain", async () => {
+  const backendDetail = "prove_traffic: selected outbound handshake failed";
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command) => {
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "preview_import_content") return {
+        previewId: "preview-runtime-detail",
+        nodes: [{ id: "fixture-node", displayName: "Fixture", protocol: "vless", insecureTls: false }],
+        rejected: [],
+        warnings: [],
+      };
+      if (command === "confirm_import") return { imported: 1, nodeIds: ["fixture-node"] };
+      if (command === "start_system_proxy") throw {
+        code: "runtime_failure",
+        stage: "prove_traffic",
+        message: "The RouteDeck connection operation failed",
+        detail: backendDetail,
+      };
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+  const preview = await controller.previewSubscription({ type: "clipboard", value: "fixture" });
+  await controller.commitSubscription(preview);
+
+  await assert.rejects(controller.connect(), (error: unknown) => {
+    assert.ok(error instanceof RouteDeckError);
+    const publicError = toPublicActionError(error);
+    assert.doesNotMatch(publicError.message, /handshake|prove_traffic/);
+    assert.equal(publicError.redactedDetail, backendDetail);
+    return true;
+  });
+  controller.dispose();
+});
+
 test("malformed diagnostics always clears the running flag and fails closed", async () => {
   const transport: TauriTransport = {
     listen: async () => () => undefined,
