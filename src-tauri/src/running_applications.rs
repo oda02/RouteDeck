@@ -66,8 +66,7 @@ fn normalize(
     }
 
     let mut applications: Vec<_> = by_executable.into_values().collect();
-    applications
-        .sort_by(|left, right| application_sort_key(left).cmp(&application_sort_key(right)));
+    applications.sort_by_key(application_sort_key);
     applications.truncate(MAX_RUNNING_APPLICATIONS);
     applications
 }
