@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "reviewedFor": {
-    "singBoxVersion": "1.13.19",
-    "singBoxCommit": "b5ebaa1fc0f2b94256180b95468e73ef53caa27d",
+    "singBoxVersion": "1.13.21",
+    "singBoxCommit": "628cb31ffa79cffffd34c2f9cde6cae044e4fc12",
     "cronetGoCommit": "ec9a39c5ba3b4a8d625ede04deaf3c9020afb916",
     "naiveProxyCommit": "510717a833c95a17218efc550fe6cac02414cad5"
   },

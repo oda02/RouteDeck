@@ -2,7 +2,7 @@
 
 - Status: acceptance baseline
 - Scope: deterministic tests, isolated Windows integration, and explicitly authorized host validation
-- Engine baseline: pinned sing-box 1.13.19 Windows x64 artifact
+- Engine baseline: pinned sing-box 1.13.21 Windows x64 artifact
 
 ## 1. Test tiers and safety boundary
 
@@ -54,7 +54,7 @@ restore, and termination or reconfiguration of another VPN are forbidden in ever
 | SC-05 | C | Extracted `sing-box.exe` and `libcronet.dll` match pins | Packaging continues. |
 | SC-06 | C | DLL missing, renamed, or replaced | Naive-capable package fails closed before engine launch. |
 | SC-07 | U | URL uses `latest`, non-GitHub host, query redirector, prerelease tag, or non-amd64 asset | Policy validation rejects it. |
-| SC-08 | C | Run `sing-box version`; compare to lock | Exact `1.13.19`; mismatch blocks release. |
+| SC-08 | C | Run `sing-box version`; compare to lock | Exact `1.13.21`; mismatch blocks release. |
 | SC-09 | W | Defender scans unpacked engine and assembled portable directory | No detection; scan result recorded without allow-listing. |
 | SC-10 | U | npm/Cargo/frontend build examined for engine download hooks | No build/start hook downloads or executes engine artifacts. |
 | SC-11 | U/W | Seal destination is removable, remote, FAT/exFAT, or lacks persistent ACLs | Fail closed before copying or executing the engine. |
@@ -252,6 +252,7 @@ All W/H proxy tests snapshot the exact WinINet per-connection state before execu
 | TN-23 | U/W | Residual or foreign route shares RouteDeck name, prefix, metric, or index but not complete LUID/GUID/row identity | Rollback leaves it untouched and preserves journal/evidence. |
 | TN-24 | W | Foreign System Proxy remains enabled during RouteDeck TUN | UI labels nested/best-effort; per-app acceptance is not claimed because traffic may be attributed to the foreign proxy core. |
 | TN-25 | W | Helper or OS dies during each TUN journal phase | Job cleanup and startup reconciliation remove only exact owned state; ambiguity becomes RecoveryRequired. |
+| TN-26 | U/C/W | Generated TUN rules for host addresses such as `172.19.0.1/30` and an enabled IPv6 `/126` | Immediately after DNS hijack, an inbound-scoped `reject`/`drop` rule contains the canonical TUN networks and precedes IPv6, app, LAN, and final routing; traffic to either own prefix never reaches `direct`. |
 
 ## 9. Coexistence with v2rayN/another VPN
 

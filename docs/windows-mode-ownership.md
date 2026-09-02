@@ -2,7 +2,7 @@
 
 - Status: normative implementation design
 - Scope: Windows 10/11 x64 System Proxy and TUN ownership
-- Engine baseline: pinned sing-box 1.13.19 Windows x64 artifact
+- Engine baseline: pinned sing-box 1.13.21 Windows x64 artifact
 - Security boundary: ordinary RouteDeck/Tauri process remains `asInvoker`
 
 This document refines the Windows sections of [the core specification](core-spec.md)

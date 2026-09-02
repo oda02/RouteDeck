@@ -2,8 +2,8 @@
 
 - Status: implementation baseline
 - Target: Windows 10/11 x64, portable first release
-- Reviewed against upstream documentation: 2026-09-01
-- Engine baseline: sing-box 1.13.19 stable
+- Reviewed against upstream documentation: 2026-09-03
+- Engine baseline: sing-box 1.13.21 stable
 
 ## 1. Non-negotiable product invariants
 
@@ -25,11 +25,11 @@ These rules implement the repository policy and [ADR-0001](adr/0001-portable-sys
 
 Use the official no-suffix Windows x64 release asset:
 
-`https://github.com/SagerNet/sing-box/releases/download/v1.13.19/sing-box-1.13.19-windows-amd64.zip`
+`https://github.com/SagerNet/sing-box/releases/download/v1.13.21/sing-box-1.13.21-windows-amd64.zip`
 
 The no-suffix Windows `amd64` release is the upstream pure-Go build and includes `libcronet.dll`. Naive outbound support requires this official variant and requires `libcronet.dll` beside `sing-box.exe` (or on `PATH`). Do not use the generic default build tags from a source build: upstream documents that the ordinary non-Windows tag set does not include Naive. See [Naive outbound](https://sing-box.sagernet.org/configuration/outbound/naive/) and [build from source](https://sing-box.sagernet.org/installation/build-from-source/).
 
-Version 1.13.19 is the latest stable release visible on 2026-09-01. The upstream release is immutable and points to signed commit `b5ebaa1`; the GitHub page marks the signature verified. Do not consume 1.14 alpha/beta builds in a production package. See the [official v1.13.19 release](https://github.com/SagerNet/sing-box/releases/tag/v1.13.19).
+Version 1.13.21 is the reviewed patch release in RouteDeck's 1.13 schema line. It contains the upstream [direct-outbound lifecycle fix](https://github.com/SagerNet/sing-box/commit/4f15700db37060db93c03d082d338d76064b3f61) needed for Windows TUN loopback protection. The upstream release is immutable and points to signed commit `628cb31`; GitHub marks the signature verified. RouteDeck does not move to the 1.14 schema without a separate migration review. See the [official v1.13.21 release](https://github.com/SagerNet/sing-box/releases/tag/v1.13.21).
 
 This version supports the required outbound types:
 
@@ -43,11 +43,11 @@ Add a reviewed repository lock (suggested path: `engine/sing-box.lock.json`) bef
 
 ```json
 {
-  "version": "1.13.19",
-  "releaseTag": "v1.13.19",
-  "releaseCommit": "b5ebaa1",
-  "assetName": "sing-box-1.13.19-windows-amd64.zip",
-  "assetUrl": "https://github.com/SagerNet/sing-box/releases/download/v1.13.19/sing-box-1.13.19-windows-amd64.zip",
+  "version": "1.13.21",
+  "releaseTag": "v1.13.21",
+  "releaseCommit": "628cb31",
+  "assetName": "sing-box-1.13.21-windows-amd64.zip",
+  "assetUrl": "https://github.com/SagerNet/sing-box/releases/download/v1.13.21/sing-box-1.13.21-windows-amd64.zip",
   "archiveSha256": "<reviewed exact digest>",
   "files": {
     "sing-box.exe": "<reviewed exact digest>",
@@ -245,7 +245,7 @@ Imported `inbounds`, `route`, `dns`, `services`, `experimental`, logging, API li
 
 ## 7. Generated sing-box configuration
 
-The generator owns every field. It emits JSON for the pinned 1.13 schema and then runs `sing-box check`. Do not emit 1.14-only fields such as TUN `dns_mode` while pinned to 1.13.19.
+The generator owns every field. It emits JSON for the pinned 1.13 schema and then runs `sing-box check`. Do not emit 1.14-only fields such as TUN `dns_mode` while pinned to 1.13.21.
 
 ### 7.1 Local listeners
 
@@ -298,6 +298,8 @@ RouteDeck emits `auto_detect_interface: true` only with its own TUN capture, whe
 selected server connection must avoid looping back into RouteDeck's adapter.
 
 The internal health rule is immutable and first: its only legal outbound is `selected`. No generated path from `health-in` may reach `direct`.
+
+In TUN mode the rule order is also fail-closed: health proof first, TUN DNS hijack second, then a `reject`/`drop` rule for the canonical IPv4 and enabled IPv6 networks assigned to `tun-in`, followed by IPv6 policy, application, LAN, and final routing. The guard CIDRs are derived from the actual configured TUN addresses (for example `172.19.0.1/30` becomes `172.19.0.0/30`), never duplicated constants. This prevents traffic addressed to the TUN adapter's own peer/prefix from reaching the `direct` outbound and recursively returning to the same TUN.
 
 ### 7.3 DNS for the pinned 1.13 schema
 
@@ -590,6 +592,6 @@ acceptance cases are in [windows-mode-ownership.md](windows-mode-ownership.md) a
 
 ## 15. Primary references
 
-- sing-box: [configuration structure/check](https://sing-box.sagernet.org/configuration/), [route](https://sing-box.sagernet.org/configuration/route/), [route rules](https://sing-box.sagernet.org/configuration/route/rule/), [TUN](https://sing-box.sagernet.org/configuration/inbound/tun/), [dial fields](https://sing-box.sagernet.org/configuration/shared/dial/), [VLESS](https://sing-box.sagernet.org/configuration/outbound/vless/), [Hysteria2](https://sing-box.sagernet.org/configuration/outbound/hysteria2/), [Naive](https://sing-box.sagernet.org/configuration/outbound/naive/), [TLS/REALITY](https://sing-box.sagernet.org/configuration/shared/tls/), [build variants](https://sing-box.sagernet.org/installation/build-from-source/), [v1.13.19 release](https://github.com/SagerNet/sing-box/releases/tag/v1.13.19).
+- sing-box: [configuration structure/check](https://sing-box.sagernet.org/configuration/), [route](https://sing-box.sagernet.org/configuration/route/), [route rules](https://sing-box.sagernet.org/configuration/route/rule/), [TUN](https://sing-box.sagernet.org/configuration/inbound/tun/), [dial fields](https://sing-box.sagernet.org/configuration/shared/dial/), [VLESS](https://sing-box.sagernet.org/configuration/outbound/vless/), [Hysteria2](https://sing-box.sagernet.org/configuration/outbound/hysteria2/), [Naive](https://sing-box.sagernet.org/configuration/outbound/naive/), [TLS/REALITY](https://sing-box.sagernet.org/configuration/shared/tls/), [build variants](https://sing-box.sagernet.org/installation/build-from-source/), [v1.13.21 release](https://github.com/SagerNet/sing-box/releases/tag/v1.13.21).
 - Link/provider formats: [Project X VLESS](https://xtls.github.io/en/development/protocols/vless.html), [Hysteria2 URI scheme](https://v2.hysteria.network/docs/developers/URI-Scheme/), [Mihomo provider content](https://wiki.metacubex.one/config/proxy-providers/content/), [Mihomo VLESS](https://wiki.metacubex.one/en/config/proxies/vless/), [Mihomo Hysteria2](https://wiki.metacubex.one/config/proxies/hysteria2/), [NaiveProxy README](https://github.com/klzgrad/naiveproxy/blob/master/README.md).
 - Windows: [WinINet options](https://learn.microsoft.com/en-us/windows/win32/wininet/option-flags), [setting/retrieving options](https://learn.microsoft.com/en-us/windows/win32/wininet/setting-and-retrieving-internet-options), [ShellExecute `runas`](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecutea), [application manifests](https://learn.microsoft.com/en-us/windows/win32/sbscs/application-manifests), [named-pipe security](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights), [Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects), [GetAdaptersAddresses](https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-getadaptersaddresses), and [GetIpForwardTable2](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/getipforwardtable2).

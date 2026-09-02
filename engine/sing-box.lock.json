@@ -1,35 +1,35 @@
 {
   "schemaVersion": 1,
   "engine": "sing-box",
-  "version": "1.13.19",
-  "releaseTag": "v1.13.19",
-  "releaseCommit": "b5ebaa1fc0f2b94256180b95468e73ef53caa27d",
+  "version": "1.13.21",
+  "releaseTag": "v1.13.21",
+  "releaseCommit": "628cb31ffa79cffffd34c2f9cde6cae044e4fc12",
   "releaseCommitVerified": true,
   "releaseAsset": {
-    "name": "sing-box-1.13.19-windows-amd64.zip",
-    "url": "https://github.com/SagerNet/sing-box/releases/download/v1.13.19/sing-box-1.13.19-windows-amd64.zip",
-    "size": 21046252,
-    "sha256": "e011a4def2f5e2b143ed54adb2b1a20a6be407806ab4442f3667f1dd817a2c8d",
-    "archiveRoot": "sing-box-1.13.19-windows-amd64"
+    "name": "sing-box-1.13.21-windows-amd64.zip",
+    "url": "https://github.com/SagerNet/sing-box/releases/download/v1.13.21/sing-box-1.13.21-windows-amd64.zip",
+    "size": 21060459,
+    "sha256": "a03291793d3a3c6e266447a58140657ac099ff278abf3b8ff678932356a62ced",
+    "archiveRoot": "sing-box-1.13.21-windows-amd64"
   },
   "runtimeFiles": [
     {
       "path": "sing-box.exe",
-      "archivePath": "sing-box-1.13.19-windows-amd64/sing-box.exe",
+      "archivePath": "sing-box-1.13.21-windows-amd64/sing-box.exe",
       "kind": "executable",
-      "size": 45492224,
-      "sha256": "a4476dd768168a77e249050066bb32774addefcc37da123978623e7b2819de28"
+      "size": 45555200,
+      "sha256": "ccb2fad603c89efcbc14358ab40b2c7000a5bb4e3bffa170d5c355cda90757ba"
     },
     {
       "path": "libcronet.dll",
-      "archivePath": "sing-box-1.13.19-windows-amd64/libcronet.dll",
+      "archivePath": "sing-box-1.13.21-windows-amd64/libcronet.dll",
       "kind": "library",
       "size": 9528832,
       "sha256": "257f966119ffca91d7a2ce110a4b668b865d88bf2ed5339fd06a5644b0d02823"
     },
     {
       "path": "LICENSE",
-      "archivePath": "sing-box-1.13.19-windows-amd64/LICENSE",
+      "archivePath": "sing-box-1.13.21-windows-amd64/LICENSE",
       "kind": "license",
       "size": 808,
       "sha256": "bb3805862b583aee73ad6f7805ec634747a37257a637a3069857843f05ea589c",
@@ -37,10 +37,10 @@
     }
   ],
   "provenance": {
-    "releaseApiUrl": "https://api.github.com/repos/SagerNet/sing-box/releases/tags/v1.13.19",
-    "releasePageUrl": "https://github.com/SagerNet/sing-box/releases/tag/v1.13.19",
-    "releaseId": 371636056,
-    "publishedAt": "2026-08-17T09:47:06Z",
+    "releaseApiUrl": "https://api.github.com/repos/SagerNet/sing-box/releases/tags/v1.13.21",
+    "releasePageUrl": "https://github.com/SagerNet/sing-box/releases/tag/v1.13.21",
+    "releaseId": 379245416,
+    "publishedAt": "2026-08-30T11:24:04Z",
     "cronetGo": {
       "commit": "ec9a39c5ba3b4a8d625ede04deaf3c9020afb916",
       "url": "https://github.com/SagerNet/cronet-go/commit/ec9a39c5ba3b4a8d625ede04deaf3c9020afb916",

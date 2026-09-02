@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, fmt, net::IpAddr};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
 
 use serde_json::{json, Map, Value};
 
@@ -121,6 +125,18 @@ fn generate_config_with_selected(
     selected_override: Option<Value>,
 ) -> Result<GeneratedConfig, ConfigError> {
     validate_request(&request)?;
+    let tun_own_prefixes = match &request.mode {
+        CaptureMode::Tun(settings) => {
+            let mut prefixes = vec![canonical_tun_prefix(&settings.ipv4_address)?];
+            if request.policy.ipv6 == Ipv6Policy::Enabled {
+                if let Some(address) = &settings.ipv6_address {
+                    prefixes.push(canonical_tun_prefix(address)?);
+                }
+            }
+            Some(prefixes)
+        }
+        CaptureMode::LocalProxy | CaptureMode::SystemProxy => None,
+    };
     let health_password = Secret::new(request.health_password)
         .map_err(|_| ConfigError::new("invalid health-listener credential"))?;
 
@@ -199,15 +215,23 @@ fn generate_config_with_selected(
     rules.push(json!({ "inbound": ["health-in"], "action": "route", "outbound": "selected" }));
     if matches!(request.mode, CaptureMode::Tun(_)) {
         rules.push(json!({ "inbound": ["tun-in"], "protocol": "dns", "action": "hijack-dns" }));
+        rules.push(json!({
+            "inbound": ["tun-in"],
+            "ip_cidr": tun_own_prefixes
+                .as_ref()
+                .expect("validated TUN mode must have canonical own prefixes"),
+            "action": "reject",
+            "method": "drop"
+        }));
     }
     // User traffic must not escape an IPv4-only policy through a more-specific app or LAN rule.
-    // Health remains first and TUN DNS hijacking remains ahead of this reject rule.
+    // Health remains first; TUN DNS hijacking and the own-prefix guard remain ahead of this rule.
     if request.policy.ipv6 == Ipv6Policy::Disabled {
         rules.push(json!({ "ip_version": 6, "action": "reject" }));
     }
     for app in &request.policy.apps {
         rules.push(json!({
-            // sing-box 1.13.19 compares Windows process paths case-sensitively. Preserve the
+            // sing-box 1.13.x compares Windows process paths case-sensitively. Preserve the
             // QueryFullProcessImageNameW casing supplied by the application picker; only the
             // identity/duplicate checks in the domain model may use a lower-cased key.
             "process_path": [app.process_path.trim().replace('/', "\\")],
@@ -245,6 +269,9 @@ fn generate_config_with_selected(
         "route": route
     });
     validate_no_direct_health(&root)?;
+    if let Some(prefixes) = &tun_own_prefixes {
+        validate_tun_own_prefix_guard(&root, prefixes)?;
+    }
     let text = serde_json::to_string_pretty(&root)
         .map_err(|_| ConfigError::new("could not serialize generated configuration"))?;
     Ok(GeneratedConfig(text))
@@ -314,6 +341,80 @@ pub fn validate_no_direct_health(config: &Value) -> Result<(), ConfigError> {
     if rules.iter().skip(1).any(rule_mentions_health) {
         return Err(ConfigError::new(
             "health traffic has an ambiguous later route",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tun_own_prefix_guard(
+    config: &Value,
+    expected_prefixes: &[String],
+) -> Result<(), ConfigError> {
+    let tun_inbound = config
+        .get("inbounds")
+        .and_then(Value::as_array)
+        .and_then(|inbounds| {
+            inbounds
+                .iter()
+                .find(|inbound| inbound.get("tag").and_then(Value::as_str) == Some("tun-in"))
+        })
+        .ok_or_else(|| ConfigError::new("generated configuration has no TUN inbound"))?;
+    let inbound_prefixes = tun_inbound
+        .get("address")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ConfigError::new("generated TUN inbound has no addresses"))?
+        .iter()
+        .map(|address| {
+            address
+                .as_str()
+                .ok_or_else(|| ConfigError::new("generated TUN address is invalid"))
+                .and_then(canonical_tun_prefix)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if inbound_prefixes != expected_prefixes {
+        return Err(ConfigError::new(
+            "TUN own-prefix guard does not match the inbound networks",
+        ));
+    }
+    let rules = config
+        .pointer("/route/rules")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ConfigError::new("generated configuration has no route rules"))?;
+    let dns_rule = rules
+        .get(1)
+        .ok_or_else(|| ConfigError::new("TUN DNS hijack rule is missing"))?;
+    if dns_rule.pointer("/inbound/0").and_then(Value::as_str) != Some("tun-in")
+        || dns_rule.get("protocol").and_then(Value::as_str) != Some("dns")
+        || dns_rule.get("action").and_then(Value::as_str) != Some("hijack-dns")
+    {
+        return Err(ConfigError::new(
+            "TUN DNS hijack must precede the own-prefix guard",
+        ));
+    }
+    let guard = rules
+        .get(2)
+        .ok_or_else(|| ConfigError::new("TUN own-prefix guard is missing"))?;
+    let actual_prefixes = guard
+        .get("ip_cidr")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ConfigError::new("TUN own-prefix guard has no CIDRs"))?;
+    let prefix_match = actual_prefixes.len() == expected_prefixes.len()
+        && actual_prefixes
+            .iter()
+            .zip(expected_prefixes)
+            .all(|(actual, expected)| actual.as_str() == Some(expected.as_str()));
+    if guard.pointer("/inbound/0").and_then(Value::as_str) != Some("tun-in")
+        || guard
+            .get("inbound")
+            .and_then(Value::as_array)
+            .is_none_or(|inbounds| inbounds.len() != 1)
+        || !prefix_match
+        || guard.get("action").and_then(Value::as_str) != Some("reject")
+        || guard.get("method").and_then(Value::as_str) != Some("drop")
+        || guard.get("outbound").is_some()
+    {
+        return Err(ConfigError::new(
+            "TUN own-prefix guard must drop the exact TUN CIDRs before routing",
         ));
     }
     Ok(())
@@ -396,6 +497,38 @@ fn validate_tun_address(value: &str, ipv6: bool) -> Result<(), ConfigError> {
             "TUN address must use a private address family",
         )),
     }
+}
+
+fn canonical_tun_prefix(value: &str) -> Result<String, ConfigError> {
+    let (address, prefix) = value
+        .split_once('/')
+        .ok_or_else(|| ConfigError::new("TUN address must include a prefix length"))?;
+    let address: IpAddr = address
+        .parse()
+        .map_err(|_| ConfigError::new("TUN address is invalid"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| ConfigError::new("TUN prefix is invalid"))?;
+    let network = match address {
+        IpAddr::V4(address) if prefix <= 32 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            IpAddr::V4(Ipv4Addr::from(u32::from(address) & mask))
+        }
+        IpAddr::V6(address) if prefix <= 128 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            IpAddr::V6(Ipv6Addr::from(u128::from(address) & mask))
+        }
+        _ => return Err(ConfigError::new("TUN prefix is invalid")),
+    };
+    Ok(format!("{network}/{prefix}"))
 }
 
 fn selected_outbound(node: &Node) -> Result<Value, ConfigError> {
@@ -965,6 +1098,64 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+        let own_prefix_guard = value.pointer("/route/rules/2").unwrap();
+        assert_eq!(
+            own_prefix_guard.get("ip_cidr").and_then(Value::as_array),
+            Some(&vec![json!("172.19.0.0/30"), json!("fdfe:dcba:9876::/126")])
+        );
+        assert_eq!(
+            own_prefix_guard.get("action").and_then(Value::as_str),
+            Some("reject")
+        );
+        assert_eq!(
+            own_prefix_guard.get("method").and_then(Value::as_str),
+            Some("drop")
+        );
+    }
+
+    #[test]
+    fn tun_own_prefix_guard_is_structurally_required_after_dns_hijack() {
+        let node = node("hysteria2://fixture-password@example.test:443?sni=example.test");
+        let policy = policy(DefaultRoute::Vpn);
+        let mut config_request = request(&node, &policy);
+        config_request.mode = CaptureMode::Tun(TunSettings::default());
+        let generated = generate_config(config_request).unwrap();
+        let mut value: Value = serde_json::from_str(generated.as_str()).unwrap();
+        let expected = vec![
+            "172.19.0.0/30".to_string(),
+            "fdfe:dcba:9876::/126".to_string(),
+        ];
+
+        validate_tun_own_prefix_guard(&value, &expected).unwrap();
+        value["route"]["rules"].as_array_mut().unwrap().swap(1, 2);
+        assert!(validate_tun_own_prefix_guard(&value, &expected).is_err());
+        value["route"]["rules"].as_array_mut().unwrap().swap(1, 2);
+        value["route"]["rules"][2]["ip_cidr"] = json!(["172.19.0.1/30"]);
+        assert!(validate_tun_own_prefix_guard(&value, &expected).is_err());
+        value["route"]["rules"][2]["ip_cidr"] = json!(["172.19.0.0/30", "fdfe:dcba:9876::/126"]);
+        value["inbounds"][3]["address"][0] = json!("10.9.0.1/30");
+        assert!(validate_tun_own_prefix_guard(&value, &expected).is_err());
+    }
+
+    #[test]
+    fn ipv4_only_tun_guard_uses_only_the_actual_ipv4_network() {
+        let node = node("hysteria2://fixture-password@example.test:443?sni=example.test");
+        let mut policy = policy(DefaultRoute::Vpn);
+        policy.ipv6 = Ipv6Policy::Disabled;
+        let mut config_request = request(&node, &policy);
+        config_request.mode = CaptureMode::Tun(TunSettings {
+            ipv4_address: "10.7.5.9/24".into(),
+            ipv6_address: Some("fdfe:dcba:9876::1/126".into()),
+        });
+        let value: Value =
+            serde_json::from_str(generate_config(config_request).unwrap().as_str()).unwrap();
+
+        assert_eq!(
+            value
+                .pointer("/route/rules/2/ip_cidr")
+                .and_then(Value::as_array),
+            Some(&vec![json!("10.7.5.0/24")])
+        );
     }
 
     #[test]
@@ -1052,10 +1243,11 @@ mod tests {
             rules[1].get("action").and_then(Value::as_str),
             Some("hijack-dns")
         );
-        assert_eq!(rules[2].get("ip_version").and_then(Value::as_u64), Some(6));
-        assert!(rules[3].get("process_path").is_some());
+        assert_eq!(rules[2].get("method").and_then(Value::as_str), Some("drop"));
+        assert_eq!(rules[3].get("ip_version").and_then(Value::as_u64), Some(6));
+        assert!(rules[4].get("process_path").is_some());
         assert_eq!(
-            rules[4].get("ip_is_private").and_then(Value::as_bool),
+            rules[5].get("ip_is_private").and_then(Value::as_bool),
             Some(true)
         );
     }

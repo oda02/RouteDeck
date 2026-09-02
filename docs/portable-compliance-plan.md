@@ -13,12 +13,12 @@ marked `ready`.
 
 The review is limited to the artifact pinned by `engine/sing-box.lock.json`:
 
-- sing-box `1.13.19`, source commit
-  `b5ebaa1fc0f2b94256180b95468e73ef53caa27d`;
+- sing-box `1.13.21`, source commit
+  `628cb31ffa79cffffd34c2f9cde6cae044e4fc12`;
 - official Windows amd64 archive SHA-256
-  `e011a4def2f5e2b143ed54adb2b1a20a6be407806ab4442f3667f1dd817a2c8d`;
+  `a03291793d3a3c6e266447a58140657ac099ff278abf3b8ff678932356a62ced`;
 - `sing-box.exe` SHA-256
-  `a4476dd768168a77e249050066bb32774addefcc37da123978623e7b2819de28`;
+  `ccb2fad603c89efcbc14358ab40b2c7000a5bb4e3bffa170d5c355cda90757ba`;
 - `libcronet.dll` SHA-256
   `257f966119ffca91d7a2ce110a4b668b865d88bf2ed5339fd06a5644b0d02823`;
 - cronet-go source commit
@@ -346,9 +346,9 @@ must not be presented as an approved public redistribution.
 
 ## Primary upstream evidence
 
-- [sing-box exact Windows build workflow](https://github.com/SagerNet/sing-box/blob/b5ebaa1fc0f2b94256180b95468e73ef53caa27d/.github/workflows/build.yml#L556-L648)
-- [sing-box exact go.mod](https://github.com/SagerNet/sing-box/blob/b5ebaa1fc0f2b94256180b95468e73ef53caa27d/go.mod)
-- [sing-box exact license notice](https://github.com/SagerNet/sing-box/blob/b5ebaa1fc0f2b94256180b95468e73ef53caa27d/LICENSE)
+- [sing-box exact Windows build workflow](https://github.com/SagerNet/sing-box/blob/628cb31ffa79cffffd34c2f9cde6cae044e4fc12/.github/workflows/build.yml#L556-L648)
+- [sing-box exact go.mod](https://github.com/SagerNet/sing-box/blob/628cb31ffa79cffffd34c2f9cde6cae044e4fc12/go.mod)
+- [sing-box exact license notice](https://github.com/SagerNet/sing-box/blob/628cb31ffa79cffffd34c2f9cde6cae044e4fc12/LICENSE)
 - [cronet-go exact Windows build code](https://github.com/SagerNet/cronet-go/blob/ec9a39c5ba3b4a8d625ede04deaf3c9020afb916/cmd/build-naive/cmd_build.go)
 - [cronet-go exact source tree and naiveproxy submodule](https://github.com/SagerNet/cronet-go/tree/ec9a39c5ba3b4a8d625ede04deaf3c9020afb916)
 - [naiveproxy exact source tree](https://github.com/SagerNet/naiveproxy/tree/510717a833c95a17218efc550fe6cac02414cad5)

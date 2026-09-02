@@ -1,7 +1,7 @@
 # Engine provenance and portable-assembly notice review
 
-- Review date: 2026-09-01
-- Artifact: official sing-box 1.13.19 Windows amd64 no-suffix release
+- Review date: 2026-09-03
+- Artifact: official sing-box 1.13.21 Windows amd64 no-suffix release
 - Local portable assembly status: **available**
 - Public redistribution review: **incomplete**
 - Legal conclusion: **none** — this is engineering evidence, not legal advice or a compliance claim
@@ -12,7 +12,7 @@ The engine lock pins the official release ZIP, `sing-box.exe`, `libcronet.dll`, 
 
 The pinned chain is:
 
-1. sing-box `b5ebaa1fc0f2b94256180b95468e73ef53caa27d`;
+1. sing-box `628cb31ffa79cffffd34c2f9cde6cae044e4fc12`;
 2. `.github/CRONET_GO_VERSION` selects cronet-go `ec9a39c5ba3b4a8d625ede04deaf3c9020afb916`;
 3. that cronet-go tree selects SagerNet/naiveproxy `510717a833c95a17218efc550fe6cac02414cad5`;
 4. `lib/windows_amd64/libcronet.dll` in the cronet-go tree is the same 9,528,832-byte DLL pinned by RouteDeck (`SHA-256 257f9661...d02823`).
@@ -35,15 +35,15 @@ The three texts under `engine/licenses/` are authentic and hash-pinned, but they
 
 ## Point-in-time malware scan
 
-On 2026-09-01, the exact locked ZIP was verified, extracted into a unique `%TEMP%` directory, verified again as a directory, and scanned with the installed Microsoft Defender command-line scanner. The hash-bound, path-sanitized report is committed at `engine/security/defender-scan-20260901T103906Z.json`; it records scanner `4.18.26070.9-0`, UTC timestamps, command shape, exit code `0`, and the captured `found no threats` output. No exclusions were added and neither binary was executed. `Get-MpComputerStatus` denied access, so the report explicitly marks engine/signature metadata unavailable rather than inferring it.
+On 2026-09-01, the then-locked 1.13.19 ZIP was verified, extracted into a unique `%TEMP%` directory, verified again as a directory, and scanned with the installed Microsoft Defender command-line scanner. The hash-bound, path-sanitized historical report is committed at `engine/security/defender-scan-20260901T103906Z.json`; it records scanner `4.18.26070.9-0`, UTC timestamps, command shape, exit code `0`, and the captured `found no threats` output. No exclusions were added and neither binary was executed. `Get-MpComputerStatus` denied access, so the report explicitly marks engine/signature metadata unavailable rather than inferring it. That historical scan does not cover the newly pinned 1.13.21 archive.
 
 This scan is point-in-time supporting evidence only. It is not proof that the binary is harmless, does not replace provenance/hash/runtime controls, and says nothing about license completeness.
 
 ## Official primary evidence
 
-- [sing-box 1.13.19 release](https://github.com/SagerNet/sing-box/releases/tag/v1.13.19)
-- [sing-box exact Windows build workflow](https://github.com/SagerNet/sing-box/blob/b5ebaa1fc0f2b94256180b95468e73ef53caa27d/.github/workflows/build.yml#L627-L646)
-- [sing-box exact source tree](https://github.com/SagerNet/sing-box/tree/b5ebaa1fc0f2b94256180b95468e73ef53caa27d)
+- [sing-box 1.13.21 release](https://github.com/SagerNet/sing-box/releases/tag/v1.13.21)
+- [sing-box exact Windows build workflow](https://github.com/SagerNet/sing-box/blob/628cb31ffa79cffffd34c2f9cde6cae044e4fc12/.github/workflows/build.yml#L627-L646)
+- [sing-box exact source tree](https://github.com/SagerNet/sing-box/tree/628cb31ffa79cffffd34c2f9cde6cae044e4fc12)
 - [cronet-go exact package code](https://github.com/SagerNet/cronet-go/blob/ec9a39c5ba3b4a8d625ede04deaf3c9020afb916/cmd/build-naive/cmd_package.go#L67-L79)
 - [cronet-go exact prebuilt DLL](https://github.com/SagerNet/cronet-go/blob/ec9a39c5ba3b4a8d625ede04deaf3c9020afb916/lib/windows_amd64/libcronet.dll)
 - [cronet-go exact source tree](https://github.com/SagerNet/cronet-go/tree/ec9a39c5ba3b4a8d625ede04deaf3c9020afb916)
