@@ -104,10 +104,10 @@ test("URL import uses automatic backend transport without a renderer selector", 
   assert.doesNotMatch(source, /SubscriptionFetchTransport|subscriptionTransport|Транспорт HTTPS-загрузки|subscription-transport-help|current_loopback_system_proxy/);
   assert.doesNotMatch(model, /SubscriptionFetchTransport|current_loopback_system_proxy/);
   assert.doesNotMatch(styles, /subscription-transport/);
-  assert.match(source, /Вставьте ссылку и нажмите «Импортировать»/);
+  assert.match(source, /description="Вставьте ссылку от провайдера\."/);
   assert.match(source, /importing \? "Импортируем…" : "Импортировать"/);
   assert.doesNotMatch(source, /Источник подписки|importMethod|clipboardSource|file-adapter-note|import-preview/);
-  assert.doesNotMatch(source, /Безопасно загрузить|опасные перенаправления|заблокирует .*локальные адреса/);
+  assert.doesNotMatch(source, /Безопасно загрузить|опасные перенаправления|заблокирует .*локальные адреса|import-help/);
 });
 
 test("local-only readiness never maps to global Connected", () => {
@@ -524,7 +524,7 @@ test("automatic URL fetch failure performs one backend request", async () => {
     (error: unknown) => {
       assert.ok(error instanceof RouteDeckError);
       assert.equal(error.code, "subscription-fetch-failed");
-      assert.match(toPublicActionError(error).message, /текущий сетевой путь Windows/);
+      assert.equal(toPublicActionError(error).message, "Не удалось загрузить подписку. Проверьте ссылку и подключение к интернету.");
       return true;
     },
   );

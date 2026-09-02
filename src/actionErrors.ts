@@ -24,19 +24,19 @@ export function toPublicActionError(error: unknown): PublicActionError {
       case "subscription-import-rejected":
         return { message: "Полученные данные не распознаны как поддерживаемая подписка. Проверьте формат источника и повторите импорт." };
       case "invalid-subscription-url":
-        return { message: "Проверьте формат HTTPS URL подписки." };
+        return { message: "Проверьте ссылку на подписку." };
       case "insecure-subscription-url":
-        return { message: "Поддерживаются ссылки на подписку по HTTPS." };
+        return { message: "Ссылка на подписку должна начинаться с https://." };
       case "subscription-policy-blocked":
-        return { message: "Ссылка подписки или её перенаправление не поддерживается. Используйте обычный публичный HTTPS URL." };
+        return { message: "Не удалось открыть эту ссылку. Проверьте её и попробуйте снова." };
       case "subscription-fetch-failed":
-        return { message: "Не удалось загрузить подписку через текущий сетевой путь Windows. Проверьте ссылку и повторите попытку." };
+        return { message: "Не удалось загрузить подписку. Проверьте ссылку и подключение к интернету." };
       case "subscription-response-too-large":
         return { message: "Ответ подписки превышает допустимый размер. Используйте более компактную подписку." };
       case "subscription-fetch-timeout":
-        return { message: "Сервер подписки не ответил за отведённое время через текущий сетевой путь Windows. Повторите попытку позже." };
+        return { message: "Сервер подписки не ответил вовремя. Повторите попытку позже." };
       case "subscription-invalid-encoding":
-        return { message: "Сервер вернул подписку в неподдерживаемой кодировке. Нужен корректный текст UTF-8." };
+        return { message: "Сервер вернул данные в неподдерживаемом формате." };
       case "empty-subscription-source":
         return { message: "Ссылка на подписку пустая." };
       case "stale-subscription-preview":

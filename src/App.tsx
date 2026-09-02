@@ -1004,7 +1004,7 @@ export default function App() {
         if (!preview || generation !== importGeneration.current) return;
         clearSubscriptionUrl();
         closeDialog();
-        showToast(`Подписка импортирована · ${preview.nodeNames.length} серверов`, "success");
+        showToast(`Импортировано серверов: ${preview.nodeNames.length}`, "success");
       },
     });
   };
@@ -1065,7 +1065,7 @@ export default function App() {
       {dialog === "import" ? (
         <Dialog
           title="Импорт подписки"
-          description="Вставьте ссылку от провайдера — RouteDeck добавит серверы."
+          description="Вставьте ссылку от провайдера."
           focusKey="subscription-url"
           onClose={closeDialog}
           busy={importing}
@@ -1075,11 +1075,10 @@ export default function App() {
           </>}
         >
           <form id="subscription-import-form" onSubmit={(event) => { event.preventDefault(); importSubscription(); }}>
-            {importing ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><LoaderIcon size={17} />Загружаем и добавляем серверы…</p> : null}
+            {importing ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><LoaderIcon size={17} />Загружаем подписку…</p> : null}
             <div className="dialog-field">
               <label htmlFor="subscription-url">Ссылка на подписку</label>
-              <input ref={subscriptionInputRef} id="subscription-url" type="url" inputMode="url" autoComplete="url" defaultValue="" disabled={importing} data-autofocus data-error-autofocus={importError ? "true" : undefined} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-help"} placeholder="https://provider.example/subscription" onInput={() => setImportError("")} />
-              <small id="import-help">Вставьте ссылку и нажмите «Импортировать».</small>
+              <input ref={subscriptionInputRef} id="subscription-url" type="url" inputMode="url" autoComplete="url" defaultValue="" disabled={importing} data-autofocus data-error-autofocus={importError ? "true" : undefined} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : undefined} placeholder="https://provider.example/subscription" onInput={() => setImportError("")} />
               {importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}
             </div>
           </form>
