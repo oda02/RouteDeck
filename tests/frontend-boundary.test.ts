@@ -899,6 +899,63 @@ test("running application picker uses one typed finite backend call", async () =
   controller.dispose();
 });
 
+test("reset clears backend persistence before publishing an empty local snapshot", async () => {
+  const calls: string[] = [];
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command) => {
+      calls.push(command);
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "confirmed_nodes") return [{
+        id: "saved-node",
+        displayName: "Saved",
+        protocol: "hysteria2",
+        insecureTls: false,
+      }];
+      if (command === "reset_local_state") return null;
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+  assert.equal(controller.getSnapshot().servers.length, 1);
+
+  await controller.resetLocalState();
+
+  assert.equal(controller.getSnapshot().servers.length, 0);
+  assert.equal(controller.getSnapshot().subscriptionName, "Подписка не импортирована");
+  assert.equal(calls.filter((command) => command === "reset_local_state").length, 1);
+  controller.dispose();
+});
+
+test("failed backend reset preserves the visible confirmed subscription", async () => {
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command) => {
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "confirmed_nodes") return [{
+        id: "saved-node",
+        displayName: "Saved",
+        protocol: "vless",
+        insecureTls: false,
+      }];
+      if (command === "reset_local_state") throw {
+        code: "runtime_failure",
+        stage: "session_storage",
+        message: "Could not reset local state",
+      };
+      throw new Error("unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+
+  await assert.rejects(controller.resetLocalState(), { code: "runtime-failure" });
+  assert.equal(controller.getSnapshot().servers.length, 1);
+  assert.equal(controller.getSnapshot().selectedServerId, "saved-node");
+  controller.dispose();
+});
+
 test("runtime detail is available only as expandable detail while the main error stays plain", async () => {
   const backendDetail = "prove_traffic: selected outbound handshake failed";
   const transport: TauriTransport = {

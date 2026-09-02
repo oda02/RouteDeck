@@ -110,6 +110,16 @@ pub fn confirmed_nodes(
 }
 
 #[tauri::command]
+pub async fn reset_local_state(
+    controller: State<'_, Arc<ApplicationController>>,
+) -> Result<(), PublicError> {
+    let controller = Arc::clone(controller.inner());
+    tauri::async_runtime::spawn_blocking(move || controller.reset_local_state())
+        .await
+        .map_err(command_join_error)?
+}
+
+#[tauri::command]
 pub async fn stop_local_proxy(
     controller: State<'_, Arc<ApplicationController>>,
 ) -> Result<RuntimeStatus, PublicError> {

@@ -97,6 +97,14 @@ impl SubscriptionStore {
         }
         result
     }
+
+    pub(crate) fn clear(&self) -> io::Result<()> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 fn create_temporary_file(parent: &Path, destination: &Path) -> io::Result<(PathBuf, File)> {
@@ -198,6 +206,18 @@ mod tests {
 
         store.save("vless://recovered").unwrap();
         assert_eq!(store.load().unwrap().as_deref(), Some("vless://recovered"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clear_removes_saved_content_and_is_idempotent() {
+        let (root, store) = test_store();
+        store.save("vless://saved").unwrap();
+
+        store.clear().unwrap();
+        assert_eq!(store.load().unwrap(), None);
+        store.clear().unwrap();
+
         fs::remove_dir_all(root).unwrap();
     }
 }

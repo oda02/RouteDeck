@@ -887,14 +887,14 @@ impl ApplicationController {
                 "Import preview token is invalid",
             )
         })?;
-        let pending = state.pending.remove(&key).ok_or_else(|| {
+        let pending = state.pending.get(&key).ok_or_else(|| {
             PublicError::fixed(
                 PublicErrorCode::PreviewMissing,
                 PublicErrorStage::Import,
                 "No import preview is pending",
             )
         })?;
-        let prepared = prepare_stored_nodes(pending.report.nodes)?;
+        let prepared = prepare_stored_nodes(pending.report.nodes.clone())?;
         let node_ids = prepared
             .iter()
             .map(|(node_id, _)| node_id.clone())
@@ -908,12 +908,41 @@ impl ApplicationController {
                 )
             })?;
         }
+        state.pending.remove(&key);
         state.nodes = prepared.into_iter().collect();
         state.node_order = node_ids.clone();
         Ok(ConfirmedImport {
             imported: node_ids.len(),
             node_ids,
         })
+    }
+
+    pub fn reset_local_state(&self) -> Result<(), PublicError> {
+        let _operation = self
+            .operation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.lock_state();
+        if state.active.is_some() {
+            return Err(PublicError::fixed(
+                PublicErrorCode::ActiveSessionConflict,
+                PublicErrorStage::SessionStorage,
+                "Stop the active connection before resetting RouteDeck",
+            ));
+        }
+        if let Some(store) = &self.subscription_store {
+            store.clear().map_err(|_| {
+                PublicError::fixed(
+                    PublicErrorCode::RuntimeFailure,
+                    PublicErrorStage::SessionStorage,
+                    "Could not reset local RouteDeck data",
+                )
+            })?;
+        }
+        state.nodes.clear();
+        state.node_order.clear();
+        state.pending.clear();
+        Ok(())
     }
 
     pub fn start_local_proxy(
@@ -3636,6 +3665,66 @@ mod tests {
 
         assert_eq!(controller_at(session_root).confirmed_nodes().len(), 1);
         std::fs::remove_file(persisted_path).unwrap();
+    }
+
+    #[test]
+    fn reset_removes_confirmed_nodes_from_memory_and_persistent_storage() {
+        let session_root = std::env::temp_dir().join(format!(
+            "routedeck-reset-persistence-test-{}",
+            random_hex(8).expect("test random")
+        ));
+        let persisted_path = session_root.with_extension("subscription.json");
+        {
+            let controller = controller_at(session_root.clone());
+            import_node(&controller);
+            assert_eq!(controller.confirmed_nodes().len(), 1);
+
+            controller.reset_local_state().unwrap();
+            assert!(controller.confirmed_nodes().is_empty());
+            assert!(!persisted_path.exists());
+            controller.reset_local_state().unwrap();
+        }
+
+        assert!(controller_at(session_root).confirmed_nodes().is_empty());
+    }
+
+    #[test]
+    fn failed_persistent_replace_keeps_preview_retryable_and_old_nodes_atomic() {
+        let session_root = std::env::temp_dir().join(format!(
+            "routedeck-transactional-persistence-test-{}",
+            random_hex(8).expect("test random")
+        ));
+        let persisted_path = session_root.with_extension("subscription.json");
+        let blocked_path = session_root.with_extension("blocked");
+        let mut controller = controller_at(session_root.clone());
+        let old_node = import_node(&controller);
+        let replacement = controller
+            .preview_import_content(REALITY_NODE.into())
+            .unwrap();
+        std::fs::create_dir(&blocked_path).unwrap();
+        controller.subscription_store = Some(SubscriptionStore::new(blocked_path.clone()));
+
+        let error = controller
+            .confirm_import(&replacement.preview_id)
+            .unwrap_err();
+        assert_eq!(error.stage, PublicErrorStage::SessionStorage);
+        assert_eq!(controller.confirmed_nodes()[0].id, old_node);
+        assert!(controller
+            .lock_state()
+            .pending
+            .contains_key(&replacement.preview_id));
+        assert_eq!(
+            controller_at(session_root.clone()).confirmed_nodes()[0].id,
+            old_node
+        );
+
+        controller.subscription_store = Some(SubscriptionStore::new(persisted_path.clone()));
+        let confirmed = controller.confirm_import(&replacement.preview_id).unwrap();
+        assert_eq!(confirmed.node_ids, vec![replacement.nodes[0].id.clone()]);
+        assert_eq!(controller.confirmed_nodes()[0].id, replacement.nodes[0].id);
+
+        std::fs::remove_file(persisted_path).unwrap();
+        std::fs::remove_dir(blocked_path).unwrap();
     }
 
     #[test]

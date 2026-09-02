@@ -797,6 +797,12 @@ export class TauriController implements RouteDeckController {
   resetLocalState = async (): Promise<void> => {
     if (this.runtime && this.runtime.phase !== "disconnected") await this.disconnect();
     this.cancelImportPreview();
+    const transport = await this.requireTransport();
+    try {
+      parseUnitResponse(await transport.invoke("reset_local_state"));
+    } catch (error) {
+      throw this.invokeError(error);
+    }
     if (typeof window !== "undefined") window.localStorage.removeItem(ROUTING_STORAGE_KEY);
     this.publish({
       phase: "disconnected",

@@ -46,6 +46,7 @@ pub fn run() {
             commands::start_tun,
             commands::runtime_status,
             commands::confirmed_nodes,
+            commands::reset_local_state,
             commands::stop_local_proxy,
             commands::stop_system_proxy,
             commands::stop_tun,
