@@ -7,9 +7,9 @@ export function toPublicActionError(error: unknown): PublicActionError {
   if (error instanceof RouteDeckError) {
     switch (error.code) {
       case "backend-unavailable":
-        return { message: "Backend RouteDeck недоступен. Действие безопасно заблокировано." };
+        return { message: "Backend RouteDeck недоступен. Перезапустите приложение." };
       case "backend-response-invalid":
-        return { message: "Backend вернул неожиданные данные. Сетевые действия безопасно заблокированы." };
+        return { message: "Не удалось прочитать состояние подключения. Перезапустите RouteDeck." };
       case "capability-unavailable":
         return { message: "Эта возможность ещё не подключена к проверенному Windows-backend." };
       case "runtime-failure":

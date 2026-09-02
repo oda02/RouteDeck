@@ -437,8 +437,10 @@ export class TauriController implements RouteDeckController {
         id: code,
         kind: "error",
         title: code === "backend-response-invalid" ? "Backend вернул неожиданные данные" : "Backend RouteDeck недоступен",
-        body: "Действия с сетью безопасно заблокированы. RouteDeck не использует непроверенное состояние.",
-        redactedDetail: "Подробности ответа скрыты, чтобы не вывести секретные данные.",
+        body: code === "backend-response-invalid"
+          ? "Не удалось прочитать состояние подключения. Перезапустите RouteDeck."
+          : "Управление подключением сейчас недоступно. Перезапустите RouteDeck.",
+        redactedDetail: "Технические подробности ответа не показаны.",
       },
     });
   }

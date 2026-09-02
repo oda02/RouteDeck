@@ -1518,6 +1518,10 @@ impl ApplicationController {
                 ProofState::Passed,
                 None,
             );
+            // ApplyingSystemProxy intentionally clears the summary while WinINet
+            // is being changed. Restore the already verified measurement before
+            // publishing the final ready status so the IPC proof stays coherent.
+            state.status.route_check_ms = Some(proof.latency_ms);
             self.update_status(
                 state,
                 RuntimePhase::SystemProxyReady,
@@ -3972,6 +3976,12 @@ mod tests {
         assert_eq!(status.scope, RuntimeScope::SystemProxy);
         assert_eq!(status.mode, RuntimeMode::SystemProxy);
         assert_eq!(status.phase, RuntimePhase::SystemProxyReady);
+        assert_eq!(status.route_check_ms, Some(21));
+        assert!(status.proofs.iter().any(|proof| {
+            proof.kind == ProofKind::SelectedOutboundHttps
+                && proof.state == ProofState::Passed
+                && proof.latency_ms == status.route_check_ms
+        }));
         assert_eq!(proxy.publishes.load(Ordering::SeqCst), 1);
         assert!(status.proofs.iter().any(|proof| {
             proof.kind == ProofKind::SystemProxyOwnership && proof.state == ProofState::Passed

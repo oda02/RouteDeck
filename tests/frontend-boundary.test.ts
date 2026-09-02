@@ -120,6 +120,30 @@ test("verified System Proxy readiness maps to Connected", () => {
   );
 });
 
+test("live System Proxy transition keeps final proof summary coherent", () => {
+  const ready = runtimeStatus(9, "system_proxy_ready");
+  const applying = {
+    ...ready,
+    revision: 8,
+    phase: "applying_system_proxy",
+    routeCheckMs: null,
+    proofs: ready.proofs.map((proof) => proof.kind === "system_proxy_ownership"
+      ? { ...proof, state: "pending" }
+      : proof),
+  };
+  assert.doesNotThrow(() => parseRuntimeStatus(applying));
+  assert.doesNotThrow(() => parseRuntimeStatus(ready));
+  // This is the exact broken final shape observed live before the backend fix.
+  assert.throws(() => parseRuntimeStatus({ ...ready, routeCheckMs: null }), ContractViolation);
+});
+
+test("invalid backend copy stays simple and actionable", () => {
+  const controllerSource = readFileSync(new URL("../src/tauriController.ts", import.meta.url), "utf8");
+  const actionSource = readFileSync(new URL("../src/actionErrors.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(`${controllerSource}\n${actionSource}`, /безопасно заблокирован|непроверенное состояние/i);
+  assert.match(toPublicActionError(new RouteDeckError("backend-response-invalid")).message, /Перезапустите RouteDeck/);
+});
+
 test("revision gate rejects a stale initial snapshot after a newer event", () => {
   const gate = new RuntimeRevisionGate();
   assert.equal(gate.accept(runtimeStatus(2, "local_proxy_ready")), true);
