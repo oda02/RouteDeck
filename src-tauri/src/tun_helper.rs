@@ -1257,85 +1257,39 @@ mod windows {
 
     fn verify_helper_for_launch(path: &Path) -> Result<File, RuntimeError> {
         let (guard, actual) = open_and_hash_helper(path)?;
-        if cfg!(debug_assertions) {
-            if std::env::var_os("ROUTEDECK_ALLOW_UNTRUSTED_TUN_HELPER").as_deref()
-                != Some(OsStr::new("1"))
-            {
-                return Err(RuntimeError::new(
-                    "tun_helper_identity",
-                    "development TUN helper is disabled outside the reviewed VM",
-                ));
-            }
-            return Ok(guard);
+        verify_helper_digest(
+            &actual,
+            option_env!("ROUTEDECK_TUN_HELPER_SHA256"),
+            cfg!(debug_assertions)
+                && std::env::var_os("ROUTEDECK_ALLOW_UNPINNED_TUN_HELPER").as_deref()
+                    == Some(OsStr::new("1")),
+        )?;
+        Ok(guard)
+    }
+
+    fn verify_helper_digest(
+        actual: &str,
+        expected: Option<&str>,
+        allow_unpinned_debug: bool,
+    ) -> Result<(), RuntimeError> {
+        if allow_unpinned_debug {
+            return Ok(());
         }
-        let expected = option_env!("ROUTEDECK_TUN_HELPER_SHA256").ok_or_else(|| {
+        let expected = expected.ok_or_else(|| {
             RuntimeError::new(
                 "tun_helper_identity",
-                "release TUN helper manifest hash is not embedded",
+                "TUN helper hash is not embedded in this RouteDeck build",
             )
         })?;
         if expected.len() != 64
             || !expected.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || actual.len() != 64
+            || !actual.bytes().all(|byte| byte.is_ascii_hexdigit())
             || !constant_time_eq(actual.as_bytes(), expected.to_ascii_lowercase().as_bytes())
         {
             return Err(RuntimeError::new(
                 "tun_helper_identity",
-                "release TUN helper hash was rejected",
-            ));
-        }
-        verify_authenticode(path, &guard)?;
-        Ok(guard)
-    }
-
-    fn verify_authenticode(path: &Path, guard: &File) -> Result<(), RuntimeError> {
-        use windows_sys::Win32::Security::WinTrust::{
-            WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
-            WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE,
-            WTD_REVOKE_WHOLECHAIN, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
-        };
-
-        let path = wide(path.as_os_str())?;
-        let mut file = WINTRUST_FILE_INFO {
-            cbStruct: size_of::<WINTRUST_FILE_INFO>() as u32,
-            pcwszFilePath: path.as_ptr(),
-            hFile: guard.as_raw_handle(),
-            pgKnownSubject: ptr::null_mut(),
-        };
-        let mut data = WINTRUST_DATA {
-            cbStruct: size_of::<WINTRUST_DATA>() as u32,
-            pPolicyCallbackData: ptr::null_mut(),
-            pSIPClientData: ptr::null_mut(),
-            dwUIChoice: WTD_UI_NONE,
-            fdwRevocationChecks: WTD_REVOKE_WHOLECHAIN,
-            dwUnionChoice: WTD_CHOICE_FILE,
-            Anonymous: WINTRUST_DATA_0 { pFile: &mut file },
-            dwStateAction: WTD_STATEACTION_VERIFY,
-            hWVTStateData: ptr::null_mut(),
-            pwszURLReference: ptr::null_mut(),
-            dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL,
-            dwUIContext: 0,
-            pSignatureSettings: ptr::null_mut(),
-        };
-        let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-        let status = unsafe {
-            WinVerifyTrust(
-                ptr::null_mut(),
-                &mut action,
-                (&mut data as *mut WINTRUST_DATA).cast(),
-            )
-        };
-        data.dwStateAction = WTD_STATEACTION_CLOSE;
-        unsafe {
-            WinVerifyTrust(
-                ptr::null_mut(),
-                &mut action,
-                (&mut data as *mut WINTRUST_DATA).cast(),
-            )
-        };
-        if status != 0 {
-            return Err(RuntimeError::new(
-                "tun_helper_identity",
-                "release TUN helper Authenticode signature was rejected",
+                "TUN helper hash does not match this RouteDeck build",
             ));
         }
         Ok(())
@@ -1837,6 +1791,35 @@ mod windows {
             drop(guard);
             fs::remove_file(helper).unwrap();
             fs::remove_dir(root).unwrap();
+        }
+
+        #[test]
+        fn exact_embedded_hash_accepts_an_unsigned_local_helper() {
+            let root = std::env::temp_dir().join(format!(
+                "routedeck-helper-pin-test-{}",
+                random_hex(8).unwrap()
+            ));
+            fs::create_dir(&root).unwrap();
+            let helper = root.join(HELPER_FILE_NAME);
+            fs::write(&helper, b"unsigned portable helper fixture").unwrap();
+            let (guard, digest) = open_and_hash_helper(&helper).unwrap();
+
+            verify_helper_digest(&digest, Some(&digest), false).unwrap();
+
+            drop(guard);
+            fs::remove_file(helper).unwrap();
+            fs::remove_dir(root).unwrap();
+        }
+
+        #[test]
+        fn missing_or_mismatched_embedded_helper_hash_is_rejected() {
+            let actual = "01".repeat(32);
+            let other = "02".repeat(32);
+
+            assert!(verify_helper_digest(&actual, None, false).is_err());
+            assert!(verify_helper_digest(&actual, Some(&other), false).is_err());
+            assert!(verify_helper_digest(&actual, Some("not-a-digest"), false).is_err());
+            assert!(verify_helper_digest(&actual, None, true).is_ok());
         }
 
         #[test]

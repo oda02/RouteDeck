@@ -223,7 +223,7 @@ All W/H proxy tests snapshot the exact WinINet per-connection state before execu
 | PR-10 | W | Same-user stale session/nonce replay | Session challenge rejected after first use/expiry. |
 | PR-11 | W | PID reused after parent exits | Parent creation-time mismatch causes cleanup; no stale authorization. |
 | PR-12 | W | GUI crashes/forced termination | Helper detects it; Job Object kills core; route/adapter cleanup verified. |
-| PR-13 | U/W | Helper is unsigned, wrong signer/version, wrong exact hash, or has an invalid component manifest | Release build refuses before UAC/state mutation; test-signed development helper is limited to disposable VM. |
+| PR-13 | U/W | Embedded helper hash is missing, malformed or does not exactly match the fixed sibling helper | Release build refuses before UAC/state mutation; an unsigned local helper with the exact build-embedded hash is accepted. |
 | PR-14 | U/W | Pipe squatting, remote client, second instance, wrong peer image, stale sequence, duplicate/unknown fields, or over-size frame | Fixed ACL/peer authentication/closed schema rejects the session; no mutation. |
 | PR-15 | W | Renderer or stale controller substitutes a config handle | Only a native registered handle from the authenticated GUI is duplicated; type/file ID/DACL/reparse/hash/schema mismatch is rejected. |
 | PR-16 | W | Core attempts work before Job assignment or spawns an early child | Suspended create, Job assignment, then resume prevents escape; closing the job kills the full tree. |

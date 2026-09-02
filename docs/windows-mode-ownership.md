@@ -253,12 +253,12 @@ started only after an explicit TUN action using a fully qualified fixed path and
 UAC cancellation returns a typed `UacCancelled` result and leaves no journal, process,
 adapter, route, or DNS change.
 
-The release helper is Authenticode-signed. Before launch, the GUI requires
-`WinVerifyTrust` success, the expected signer identity, and the exact helper hash/version
-from a signed component manifest. The helper verifies its own signature and the
-authenticated GUI peer, then independently verifies the component manifest, pinned
-engine, DLL, and config. Unsigned elevation is disabled in release builds; a test-signed
-or explicitly development-only helper may be exercised only in a disposable VM.
+The portable release is built in two passes: first the helper, then the GUI with the exact helper
+SHA-256 embedded. Before UAC the GUI requires that exact hash, a fixed sibling path, a regular
+non-reparse file and a held handle that denies write/delete replacement through launch. Missing
+or mismatched hashes fail closed. Authenticode may be recorded as additional provenance but is
+not required for a locally built portable pair. The helper still authenticates the GUI peer and
+independently verifies the pinned engine, DLL, config and protected session identity.
 
 The helper never accepts an executable path, arbitrary command, arguments, environment,
 working directory, config path, registry path, route command, interface command, service
@@ -267,7 +267,6 @@ name, or destination path.
 Official references:
 
 - [`SHELLEXECUTEINFO`](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-shellexecuteinfow)
-- [`WinVerifyTrust`](https://learn.microsoft.com/en-us/windows/win32/api/wintrust/nf-wintrust-winverifytrust)
 - [Application manifests](https://learn.microsoft.com/en-us/windows/win32/sbscs/application-manifests)
 
 ### 4.2 Authenticated named-pipe protocol
@@ -280,7 +279,7 @@ minimum required rights. The Windows default pipe ACL is forbidden because it gr
 read access to Everyone and anonymous users.
 
 After connection, both sides verify peer PID, process creation time, image file identity,
-and expected signature. The pipe server uses `GetNamedPipeClientProcessId`; the helper
+and fixed sibling image identity. The pipe server uses `GetNamedPipeClientProcessId`; the helper
 performs the corresponding server-process check. A fresh random challenge is sent inside
 the authenticated pipe, never on the command line. The session admits one start,
 monotonic request sequence numbers, bounded request IDs, one-time nonces, and expiry.
@@ -315,7 +314,7 @@ After peer authentication, the helper duplicates the native registered handle fr
 verified GUI process and validates file type, size, file ID, owner/DACL, reparse status,
 hash, and the strict RouteDeck-generated config schema.
 
-The helper resolves the engine and DLL only from the signed component manifest. It opens
+The helper resolves the engine and DLL only from the embedded reviewed component lock. It opens
 and holds both without write/delete sharing, verifies exact sizes, hashes, file IDs, and
 package-relative identities, then revalidates immediately before launch. It invokes only
 fixed `sing-box check` and run argument shapes, fixed environment, and a fixed working
@@ -475,7 +474,7 @@ requires a new fresh proof.
 3. An elevated helper that accepts renderer-controlled paths or commands is a privileged
    confused deputy.
 4. A writable portable directory creates helper, engine, DLL, and config TOCTOU risk;
-   signature, hashes, held handles, and identity revalidation are mandatory.
+   exact hashes, held handles, and identity revalidation are mandatory.
 5. Default named-pipe ACLs, unauthenticated peers, nonce replay, or PID reuse can authorize
    a foreign process.
 6. TUN route recursion, one-family capture, or incorrect DNS can leak traffic or remove
@@ -530,7 +529,7 @@ Only after independent security review and all U/C cases pass:
    final before/after equality.
 2. Test proxy/PAC/autodetect combinations, a simulated second proxy, concurrent foreign
    edits, guardian death, GUI forced termination, and every journal crash gap.
-3. Test helper signature/hash rejection, UAC cancel, pipe ACL attacks, peer identity,
+3. Test missing/mismatched helper-hash rejection, UAC cancel, pipe ACL attacks, peer identity,
    nonce replay, engine/config replacement, PID reuse, and suspended Job launch.
 4. Test clean TUN IPv4/IPv6, DNS policies, both routing defaults, per-app routes, route
    recursion prevention, core/helper/UI crashes, and exact cleanup.

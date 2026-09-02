@@ -57,7 +57,8 @@ name, service name, shell command, or environment value.
 The GUI creates the pipe before UAC. The pipe has one instance,
 `FILE_FLAG_FIRST_PIPE_INSTANCE`, `PIPE_REJECT_REMOTE_CLIENTS`, bounded messages and an
 explicit DACL for the launching user, Administrators and SYSTEM. Both sides verify peer
-PID, process creation time and the expected signed image before accepting a frame.
+PID, process creation time, fixed sibling image identity and exact build-pinned SHA-256 before
+accepting a frame.
 
 Version 1 messages are a length-prefixed, size-limited JSON schema with
 `deny_unknown_fields`:
@@ -102,14 +103,13 @@ New isolated files can be written first:
 
 - `src-tauri/src/tun_helper_protocol.rs` — closed message types, bounds and state machine.
 - `src-tauri/src/tun_helper_client.rs` — unprivileged pipe server, fixed helper discovery,
-  signature/hash verification, `ShellExecuteExW("runas")`, helper process handle and IPC.
+  exact embedded-hash verification, `ShellExecuteExW("runas")`, helper process handle and IPC.
 - `src-tauri/src/tun_helper_server.rs` — peer authentication, duplicated-handle/config
   validation, fixed sing-box launch, Job ownership, journal and exact cleanup checks.
 - `src-tauri/src/bin/routedeck-tun-helper.rs` — minimal native entry point; no Tauri/WebView.
 - `src-tauri/manifests/routedeck-tun-helper.manifest` — `requireAdministrator` for only the
   helper binary. The main app remains `asInvoker`.
-- `engine/tun-helper.lock.json` — helper protocol/version/hash/signer identity bound to the
-  release component manifest.
+- the GUI build embeds the exact helper SHA-256 after building the helper first.
 
 Shared-file registration happens only after those modules pass their isolated tests:
 
@@ -134,7 +134,8 @@ path, or executable selector is added to the frontend contract.
 
 Before UAC, the GUI performs read-only network preflight, creates and validates the TUN
 config, opens and holds its config handle, creates the pipe, and verifies the exact helper
-signature/hash/version. It creates no journal and changes no adapter, route or DNS state.
+embedded hash and file identity. It creates no journal and changes no adapter, route or DNS
+state.
 
 `ShellExecuteExW` uses:
 
@@ -163,9 +164,9 @@ triggers exact cleanup verification.
   the explicit ACL, remote rejection and peer identity checks.
 - PID reuse and stale/replayed messages are rejected by process creation time, session,
   nonce, expiry and monotonic request IDs.
-- Helper/engine replacement is rejected by release signature plus exact signed-manifest
-  hash/version checks repeated on both sides. The helper holds no-write/no-delete handles
-  through launch.
+- Helper replacement is rejected by the exact SHA-256 embedded in the GUI build. The GUI holds
+  the verified helper without write/delete sharing through launch; the fixed engine retains its
+  separate reviewed lock and held handles.
 - GUI/helper/core crashes close the Job. Cleanup removes only exact journaled adapter,
   route and DNS identities; mismatches become `RecoveryRequired` and are not overwritten.
 - UAC cancellation happens before journal or network mutation.
@@ -205,8 +206,10 @@ Windows integration tests in a disposable snapshot after independent review:
 7. Replace helper/config/engine between checks and verify refusal before mutation.
 8. Confirm no service, scheduled task, startup entry or persistent helper remains.
 
-On the normal development PC, run only unit tests, build checks and an unprivileged helper
-self-test. Do not approve an unsigned development helper there. The first real UAC/TUN
-test belongs in the disposable Windows snapshot required by `AGENTS.md`; after a signed
-build passes those tests, the ordinary live test is simply Connect, approve the standard
-UAC prompt, verify traffic, then Disconnect and inspect exact cleanup.
+Build the portable pair with `scripts/build-local-portable.ps1`. It first builds the helper,
+computes SHA-256, then builds the GUI with that exact digest embedded and verifies the helper did
+not change between passes. Authenticode is optional additional provenance, not a launch
+requirement. On the normal development PC, run only unit tests and build checks. The first real
+UAC/TUN test still belongs in the disposable Windows snapshot required by `AGENTS.md`; after the
+exact-hash pair passes those tests, the ordinary live test is simply Connect, approve the
+standard UAC prompt, verify traffic, then Disconnect and inspect exact cleanup.

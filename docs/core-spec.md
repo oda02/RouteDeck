@@ -459,10 +459,11 @@ green state immediately.
 
 The GUI manifest remains `asInvoker`. Launch the fixed helper with the Windows `runas` verb only when the user enables TUN; Windows then displays UAC. Microsoft documents both [`runas`](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecutea) and execution-level manifests in [application manifests](https://learn.microsoft.com/en-us/windows/win32/sbscs/application-manifests).
 
-The helper is a separate minimal binary without Tauri/WebView code. Release builds require
-an Authenticode-trusted helper with the expected signer and exact component-manifest hash;
-unsigned elevation is restricted to explicitly development-only builds in a disposable
-VM. The helper accepts only typed operations such as
+The helper is a separate minimal binary without Tauri/WebView code. Portable release builds use
+a reproducible two-pass build: build the helper, compute SHA-256, then build the GUI with that
+exact digest embedded. Missing or mismatched hashes refuse before UAC; the verified helper handle
+denies write/delete replacement through launch. Authenticode is optional additional provenance,
+not a local portable launch requirement. The helper accepts only typed operations such as
 `StartTun(session_id, registered_config_handle_id, upstream_choice_id, preflight_hash)`
 and `StopTun(session_id)`. It must not accept an executable path, shell command,
 arbitrary arguments/environment, registry path, config path, interface command, service
@@ -471,7 +472,7 @@ name, or output path from the renderer.
 IPC uses a one-instance per-session named pipe with remote clients rejected and an
 explicit ACL restricted to the launching user SID, Administrators, and SYSTEM; do not
 rely on the permissive default descriptor. Both peers verify PID, process creation time,
-image identity, and signature. A challenge sent inside the pipe, a monotonic request
+fixed sibling image identity and process creation time. A challenge sent inside the pipe, a monotonic request
 sequence, expiry, and a one-start state machine reject replay. The command line contains
 no secret or renderer-controlled path. Microsoft notes that a default named-pipe ACL
 grants read access to Everyone and anonymous users; see
