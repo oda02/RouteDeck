@@ -1911,7 +1911,7 @@ mod windows {
             write_journal(
                 &mut file,
                 serde_json::json!({
-                    "schemaVersion": 1,
+                    "schemaVersion": 2,
                     "session": session,
                     "phase": "starting",
                     "configSha256": config_sha256,
@@ -1931,7 +1931,7 @@ mod windows {
             engine_created: u64,
         ) -> Result<(), RuntimeError> {
             self.write(serde_json::json!({
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "session": self.session,
                 "phase": "running",
                 "configSha256": self.config_sha256,
@@ -1942,7 +1942,7 @@ mod windows {
 
         fn mark_conflict(&mut self) -> Result<(), RuntimeError> {
             self.write(serde_json::json!({
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "session": self.session,
                 "phase": "conflict",
                 "configSha256": self.config_sha256,

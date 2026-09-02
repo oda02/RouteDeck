@@ -1597,10 +1597,49 @@ impl ApplicationController {
             );
             self.update_status(
                 &mut state,
-                RuntimePhase::Degraded,
-                Some(node_id.to_owned()),
-                Some(public.clone()),
+                RuntimePhase::RollingBack,
+                Some(node_id.into()),
+                None,
             );
+            if let Some(error) = state
+                .active
+                .as_mut()
+                .and_then(|active| active.child.stop().err())
+            {
+                let redactor = state
+                    .active
+                    .as_ref()
+                    .map(|active| active.redactor.clone())
+                    .unwrap_or_default();
+                let stop = public_runtime_error(error, &redactor);
+                state.recovery_required = true;
+                self.update_status(
+                    &mut state,
+                    RuntimePhase::RecoveryRequired,
+                    Some(node_id.to_owned()),
+                    Some(stop.clone()),
+                );
+                return Err(stop);
+            }
+            let failed = state.active.take();
+            Self::clear_active_metadata(&mut state);
+            drop(failed);
+            if reconcile_stale_sessions(&self.session_root).is_err() {
+                state.recovery_required = true;
+                self.update_status(
+                    &mut state,
+                    RuntimePhase::RecoveryRequired,
+                    Some(node_id.to_owned()),
+                    Some(public.clone()),
+                );
+            } else {
+                self.update_status(
+                    &mut state,
+                    RuntimePhase::DisconnectedWithError,
+                    Some(node_id.to_owned()),
+                    Some(public.clone()),
+                );
+            }
             return Err(public);
         }
         let stored = state.nodes.get(node_id).cloned().ok_or_else(|| {
