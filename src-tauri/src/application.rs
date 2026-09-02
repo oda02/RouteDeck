@@ -396,8 +396,9 @@ impl ManagedChild for RealityProcessPair {
     }
 
     fn stop(&mut self) -> Result<(), RuntimeError> {
-        self.front.stop()?;
-        self.sidecar.stop()
+        let front_result = self.front.stop();
+        let sidecar_result = self.sidecar.stop();
+        front_result.and(sidecar_result)
     }
 }
 
@@ -3570,6 +3571,43 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event == "stop:sing-box"));
+    }
+
+    #[test]
+    fn reality_stop_attempts_sidecar_cleanup_when_front_stop_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "routedeck-reality-stop-test-{}",
+            random_hex(8).expect("test random")
+        ));
+        let front_alive = Arc::new(AtomicBool::new(true));
+        let sidecar_alive = Arc::new(AtomicBool::new(true));
+        let front_stops = Arc::new(AtomicUsize::new(0));
+        let sidecar_stops = Arc::new(AtomicUsize::new(0));
+        let sidecar_config = SessionConfig::create(&root, "{}").unwrap();
+        let mut pair = RealityProcessPair {
+            front: Box::new(FakeChild {
+                alive: Arc::clone(&front_alive),
+                stops: front_stops,
+                stop_fails: true,
+            }),
+            sidecar: Box::new(FakeChild {
+                alive: Arc::clone(&sidecar_alive),
+                stops: Arc::clone(&sidecar_stops),
+                stop_fails: false,
+            }),
+            sidecar_port: 1,
+            listener: Arc::new(FakeListener(true)),
+            _sidecar_config: sidecar_config,
+        };
+
+        let error = pair.stop().unwrap_err();
+
+        assert_eq!(error.stage(), "stop_engine");
+        assert!(front_alive.load(Ordering::SeqCst));
+        assert!(!sidecar_alive.load(Ordering::SeqCst));
+        assert_eq!(sidecar_stops.load(Ordering::SeqCst), 1);
+        drop(pair);
+        let _ = std::fs::remove_dir(root);
     }
 
     #[test]
