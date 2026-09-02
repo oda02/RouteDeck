@@ -7,8 +7,6 @@ use crate::domain::{Node, NodeProtocol, PacketEncoding, Secret, VlessFlow, Vless
 pub struct XrayBridgeRequest<'a> {
     pub node: &'a Node,
     pub listen_port: u16,
-    pub username: &'a str,
-    pub password: &'a str,
 }
 
 pub struct GeneratedXrayConfig(String);
@@ -49,18 +47,16 @@ impl XrayConfigError {
 /// Generates the private Xray v26.3.27 bridge used only for VLESS REALITY.
 ///
 /// sing-box remains the public listener and route owner. This configuration has one
-/// authenticated loopback SOCKS inbound and one VLESS outbound, so it cannot fall back to a
-/// direct route when REALITY authentication fails.
+/// private loopback SOCKS inbound and one VLESS outbound, so it cannot fall back to a direct
+/// route when REALITY authentication fails. The listener is bound to an unpublished,
+/// process-owned loopback port; omitting SOCKS authentication also avoids client/server schema
+/// differences around Xray account fields.
 pub fn generate_xray_bridge_config(
     request: XrayBridgeRequest<'_>,
 ) -> Result<GeneratedXrayConfig, XrayConfigError> {
     if request.listen_port == 0 {
         return Err(XrayConfigError::new("Xray bridge port must be non-zero"));
     }
-    let username = Secret::new(request.username.to_owned())
-        .map_err(|_| XrayConfigError::new("invalid Xray bridge username"))?;
-    let password = Secret::new(request.password.to_owned())
-        .map_err(|_| XrayConfigError::new("invalid Xray bridge password"))?;
     let NodeProtocol::Vless(vless) = request.node.protocol() else {
         return Err(XrayConfigError::new(
             "Xray bridge requires a VLESS REALITY node",
@@ -162,11 +158,7 @@ pub fn generate_xray_bridge_config(
             "protocol": "socks",
             "tag": "bridge-in",
             "settings": {
-                "auth": "password",
-                "users": [{
-                    "user": username.expose(),
-                    "pass": password.expose()
-                }],
+                "auth": "noauth",
                 "udp": true,
                 "ip": "127.0.0.1"
             }
@@ -201,8 +193,6 @@ mod tests {
         generate_xray_bridge_config(XrayBridgeRequest {
             node,
             listen_port: 19191,
-            username: "fixture-bridge-user",
-            password: "fixture-bridge-password",
         })
         .unwrap()
     }
@@ -226,11 +216,7 @@ mod tests {
                     "protocol": "socks",
                     "tag": "bridge-in",
                     "settings": {
-                        "auth": "password",
-                        "users": [{
-                            "user": "fixture-bridge-user",
-                            "pass": "fixture-bridge-password"
-                        }],
+                        "auth": "noauth",
                         "udp": true,
                         "ip": "127.0.0.1"
                     }
@@ -264,7 +250,8 @@ mod tests {
                 }]
             })
         );
-        assert!(!format!("{generated:?}").contains("fixture-bridge-password"));
+        assert!(value.pointer("/inbounds/0/settings/accounts").is_none());
+        assert!(value.pointer("/inbounds/0/settings/users").is_none());
     }
 
     #[test]
@@ -315,35 +302,23 @@ mod tests {
         assert!(generate_xray_bridge_config(XrayBridgeRequest {
             node: &unsupported,
             listen_port: 19191,
-            username: "fixture",
-            password: "fixture",
         })
         .is_err());
     }
 
     #[test]
-    fn rejects_non_reality_and_invalid_bridge_credentials() {
+    fn rejects_non_reality_and_zero_bridge_port() {
         let tls = node("vless://11111111-2222-3333-4444-555555555555@example.test:443?security=tls&type=tcp&sni=cover.test");
         assert!(generate_xray_bridge_config(XrayBridgeRequest {
             node: &tls,
             listen_port: 19191,
-            username: "fixture",
-            password: "fixture",
         })
         .is_err());
         let reality = node("vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&type=tcp&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2");
-        for (port, username, password) in [
-            (0, "fixture", "fixture"),
-            (19191, "", "fixture"),
-            (19191, "fixture", ""),
-        ] {
-            assert!(generate_xray_bridge_config(XrayBridgeRequest {
-                node: &reality,
-                listen_port: port,
-                username,
-                password,
-            })
-            .is_err());
-        }
+        assert!(generate_xray_bridge_config(XrayBridgeRequest {
+            node: &reality,
+            listen_port: 0,
+        })
+        .is_err());
     }
 }

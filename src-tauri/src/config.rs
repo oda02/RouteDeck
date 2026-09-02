@@ -54,21 +54,9 @@ pub struct VpnDnsServer {
     pub path: String,
 }
 
-pub struct SocksBridge<'a> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocksBridge {
     pub server_port: u16,
-    pub username: &'a str,
-    pub password: &'a str,
-}
-
-impl fmt::Debug for SocksBridge<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SocksBridge")
-            .field("server_port", &self.server_port)
-            .field("username", &"[REDACTED]")
-            .field("password", &"[REDACTED]")
-            .finish()
-    }
 }
 
 pub struct GeneratedConfig(String);
@@ -112,7 +100,7 @@ pub fn generate_config(request: ConfigRequest<'_>) -> Result<GeneratedConfig, Co
 
 pub fn generate_socks_bridge_config(
     request: ConfigRequest<'_>,
-    bridge: SocksBridge<'_>,
+    bridge: SocksBridge,
 ) -> Result<GeneratedConfig, ConfigError> {
     if !matches!(
         request.node.protocol(),
@@ -125,18 +113,7 @@ pub fn generate_socks_bridge_config(
     if bridge.server_port == 0 {
         return Err(ConfigError::new("SOCKS bridge port must be non-zero"));
     }
-    let username = Secret::new(bridge.username.to_owned())
-        .map_err(|_| ConfigError::new("invalid SOCKS bridge username"))?;
-    let password = Secret::new(bridge.password.to_owned())
-        .map_err(|_| ConfigError::new("invalid SOCKS bridge password"))?;
-    generate_config_with_selected(
-        request,
-        Some(selected_socks_bridge(
-            bridge.server_port,
-            &username,
-            &password,
-        )),
-    )
+    generate_config_with_selected(request, Some(selected_socks_bridge(bridge.server_port)))
 }
 
 fn generate_config_with_selected(
@@ -270,15 +247,13 @@ fn generate_config_with_selected(
     Ok(GeneratedConfig(text))
 }
 
-fn selected_socks_bridge(server_port: u16, username: &Secret, password: &Secret) -> Value {
+fn selected_socks_bridge(server_port: u16) -> Value {
     json!({
         "type": "socks",
         "tag": "selected",
         "server": "127.0.0.1",
         "server_port": server_port,
-        "version": "5",
-        "username": username.expose(),
-        "password": password.expose()
+        "version": "5"
     })
 }
 
@@ -718,11 +693,7 @@ mod tests {
         let policy = policy(DefaultRoute::Vpn);
         let generated = generate_socks_bridge_config(
             request(&node, &policy),
-            SocksBridge {
-                server_port: 19090,
-                username: "fixture-bridge-user",
-                password: "fixture-bridge-password",
-            },
+            SocksBridge { server_port: 19090 },
         )
         .unwrap();
         let value: Value = serde_json::from_str(generated.as_str()).unwrap();
@@ -764,47 +735,30 @@ mod tests {
             Some("selected")
         );
         assert!(!generated.as_str().contains("example.test"));
-        assert!(!format!("{generated:?}").contains("fixture-bridge-password"));
+        assert!(value.pointer("/outbounds/0/username").is_none());
+        assert!(value.pointer("/outbounds/0/password").is_none());
     }
 
     #[test]
-    fn bridge_rejects_non_reality_nodes_and_invalid_credentials() {
+    fn bridge_rejects_non_reality_nodes_and_zero_port() {
         let policy = policy(DefaultRoute::Vpn);
         let tls = node(
             "vless://11111111-2222-3333-4444-555555555555@example.test:443?security=tls&type=tcp&sni=cover.test",
         );
         assert!(generate_socks_bridge_config(
             request(&tls, &policy),
-            SocksBridge {
-                server_port: 19090,
-                username: "fixture",
-                password: "fixture",
-            }
+            SocksBridge { server_port: 19090 }
         )
         .is_err());
 
         let reality = node(
             "vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&type=tcp&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2",
         );
-        for bridge in [
-            SocksBridge {
-                server_port: 0,
-                username: "fixture",
-                password: "fixture",
-            },
-            SocksBridge {
-                server_port: 19090,
-                username: "",
-                password: "fixture",
-            },
-            SocksBridge {
-                server_port: 19090,
-                username: "fixture",
-                password: "",
-            },
-        ] {
-            assert!(generate_socks_bridge_config(request(&reality, &policy), bridge).is_err());
-        }
+        assert!(generate_socks_bridge_config(
+            request(&reality, &policy),
+            SocksBridge { server_port: 0 }
+        )
+        .is_err());
     }
 
     #[test]

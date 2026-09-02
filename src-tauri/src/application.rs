@@ -1270,22 +1270,16 @@ impl ApplicationController {
             vpn_dns: None,
             insecure_approval: None,
         };
-        let mut bridge_credentials = None;
         let mut bridge_reservation = None;
         let generated = if reality {
             let reservation = LoopbackPortReservation::reserve()?;
-            let username = random_hex(24)?;
-            let bridge_password = random_hex(24)?;
             let generated = generate_socks_bridge_config(
                 request(),
                 SocksBridge {
                     server_port: reservation.port(),
-                    username: &username,
-                    password: &bridge_password,
                 },
             )
             .map_err(|error| RuntimeError::new("generate_config", error.to_string()))?;
-            bridge_credentials = Some((username, bridge_password));
             bridge_reservation = Some(reservation);
             generated
         } else {
@@ -1297,21 +1291,14 @@ impl ApplicationController {
             .clone()
             .with_secret(&password)
             .with_secret(&session.path().to_string_lossy());
-        let sidecar_session = if let (Some(reservation), Some((username, bridge_password))) =
-            (bridge_reservation.as_ref(), bridge_credentials.as_ref())
-        {
+        let sidecar_session = if let Some(reservation) = bridge_reservation.as_ref() {
             let generated = generate_xray_bridge_config(XrayBridgeRequest {
                 node,
                 listen_port: reservation.port(),
-                username,
-                password: bridge_password,
             })
             .map_err(|error| RuntimeError::new("generate_config", error.to_string()))?;
             let sidecar = SessionConfig::create(&self.session_root, generated.as_str())?;
-            process_redactor = process_redactor
-                .with_secret(username)
-                .with_secret(bridge_password)
-                .with_secret(&sidecar.path().to_string_lossy());
+            process_redactor = process_redactor.with_secret(&sidecar.path().to_string_lossy());
             Some(sidecar)
         } else {
             None
@@ -2533,8 +2520,8 @@ mod tests {
 
     #[derive(Default)]
     struct BridgeObservation {
-        sing_box: Option<(u16, String, String)>,
-        xray: Option<(u16, String, String)>,
+        sing_box: Option<u16>,
+        xray: Option<u16>,
     }
 
     struct DualEngineProvider {
@@ -2604,29 +2591,15 @@ mod tests {
                 serde_json::from_str(&std::fs::read_to_string(config.path()).unwrap())
                     .expect("fixture config must be JSON");
             let bridge = if self.kind == EngineKind::SingBox {
-                (
-                    value["outbounds"][0]["server_port"].as_u64().unwrap() as u16,
-                    value["outbounds"][0]["username"]
-                        .as_str()
-                        .unwrap()
-                        .to_owned(),
-                    value["outbounds"][0]["password"]
-                        .as_str()
-                        .unwrap()
-                        .to_owned(),
-                )
+                assert_eq!(value["outbounds"][0]["type"], "socks");
+                assert!(value["outbounds"][0].get("username").is_none());
+                assert!(value["outbounds"][0].get("password").is_none());
+                value["outbounds"][0]["server_port"].as_u64().unwrap() as u16
             } else {
-                (
-                    value["inbounds"][0]["port"].as_u64().unwrap() as u16,
-                    value["inbounds"][0]["settings"]["users"][0]["user"]
-                        .as_str()
-                        .unwrap()
-                        .to_owned(),
-                    value["inbounds"][0]["settings"]["users"][0]["pass"]
-                        .as_str()
-                        .unwrap()
-                        .to_owned(),
-                )
+                assert_eq!(value["inbounds"][0]["settings"]["auth"], "noauth");
+                assert!(value["inbounds"][0]["settings"].get("accounts").is_none());
+                assert!(value["inbounds"][0]["settings"].get("users").is_none());
+                value["inbounds"][0]["port"].as_u64().unwrap() as u16
             };
             let mut observation = self.observation.lock().unwrap();
             if self.kind == EngineKind::SingBox {
@@ -3149,7 +3122,7 @@ mod tests {
         );
         let observation = provider.observation.lock().unwrap();
         assert_eq!(observation.sing_box, observation.xray);
-        assert!(observation.sing_box.as_ref().unwrap().0 > 0);
+        assert!(observation.sing_box.unwrap() > 0);
         drop(observation);
 
         let events = provider.events.lock().unwrap().clone();
