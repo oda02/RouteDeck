@@ -2704,7 +2704,8 @@ fn public_runtime_error(error: RuntimeError, redactor: &Redactor) -> PublicError
     let stage = public_stage(error.stage());
     let detail = matches!(
         stage,
-        PublicErrorStage::ConfigCheck
+        PublicErrorStage::Start
+            | PublicErrorStage::ConfigCheck
             | PublicErrorStage::VerifyListeners
             | PublicErrorStage::ProveTraffic
             | PublicErrorStage::EngineProcess
@@ -2725,6 +2726,7 @@ fn public_runtime_error(error: RuntimeError, redactor: &Redactor) -> PublicError
 fn public_stage(stage: &str) -> PublicErrorStage {
     match stage {
         "session_recovery" => PublicErrorStage::SessionRecovery,
+        "tun_uac_cancelled" => PublicErrorStage::Start,
         "generate_config" => PublicErrorStage::GenerateConfig,
         "engine_layout" => PublicErrorStage::EngineLayout,
         "engine_integrity" => PublicErrorStage::EngineIntegrity,
@@ -4700,6 +4702,21 @@ mod tests {
         assert_eq!(stops.load(Ordering::SeqCst), 0);
         assert!(!alive.load(Ordering::SeqCst));
         assert_eq!(controller.status().phase, RuntimePhase::Disconnected);
+    }
+
+    #[test]
+    fn cancelled_tun_uac_is_reported_as_a_safe_start_cancellation() {
+        let public = public_runtime_error(
+            RuntimeError::new("tun_uac_cancelled", "TUN permission request was cancelled"),
+            &Redactor::default(),
+        );
+
+        assert_eq!(public.code, PublicErrorCode::RuntimeFailure);
+        assert_eq!(public.stage, PublicErrorStage::Start);
+        assert_eq!(
+            public.detail.as_deref(),
+            Some("TUN permission request was cancelled")
+        );
     }
 
     #[test]
