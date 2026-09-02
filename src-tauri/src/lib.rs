@@ -11,6 +11,8 @@ pub mod subscription;
 pub mod subscription_fetch;
 mod subscription_store;
 mod system_proxy;
+pub mod tun_helper;
+mod tun_helper_protocol;
 #[cfg(windows)]
 mod windows_process;
 pub mod xray_config;

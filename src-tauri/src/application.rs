@@ -37,6 +37,9 @@ use crate::{
     xray_config::{generate_xray_bridge_config, XrayBridgeRequest},
 };
 
+#[cfg(windows)]
+use crate::tun_helper::TunHelperLauncher;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimePhase {
@@ -329,7 +332,9 @@ impl TunPrivilegeControl for PlatformTunPrivilege {
     fn is_elevated(&self) -> Result<bool, RuntimeError> {
         #[cfg(windows)]
         {
-            crate::windows_process::current_process_is_elevated()
+            // The ordinary Tauri process intentionally stays at asInvoker. The fixed
+            // native helper requests elevation only when its TUN launcher starts.
+            Ok(true)
         }
         #[cfg(not(windows))]
         {
@@ -340,6 +345,10 @@ impl TunPrivilegeControl for PlatformTunPrivilege {
 
 pub(crate) trait EngineProvider: Send + Sync {
     fn create(&self, kind: EngineKind) -> Result<Box<dyn EngineLauncher>, RuntimeError>;
+
+    fn create_tun(&self) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
+        self.create(EngineKind::SingBox)
+    }
 }
 
 struct FixedEngineProvider;
@@ -347,6 +356,20 @@ struct FixedEngineProvider;
 impl EngineProvider for FixedEngineProvider {
     fn create(&self, kind: EngineKind) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
         Ok(Box::new(VerifiedEngineLauncher::resolve_for(kind)?))
+    }
+
+    fn create_tun(&self) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
+        #[cfg(windows)]
+        {
+            Ok(Box::new(TunHelperLauncher::resolve()?))
+        }
+        #[cfg(not(windows))]
+        {
+            Err(RuntimeError::new(
+                "start_engine",
+                "TUN helper is available only on Windows",
+            ))
+        }
     }
 }
 
@@ -1668,7 +1691,11 @@ impl ApplicationController {
             Some(node.id().to_owned()),
             None,
         );
-        let launcher = self.services.engine.create(EngineKind::SingBox)?;
+        let launcher = if mode == RuntimeMode::Tun {
+            self.services.engine.create_tun()?
+        } else {
+            self.services.engine.create(EngineKind::SingBox)?
+        };
         let sing_box_version =
             launcher.check(&session, process_redactor.clone(), self.diagnostics.clone())?;
         let mut sidecar_launcher = if sidecar_session.is_some() {
