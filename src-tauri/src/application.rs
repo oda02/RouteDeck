@@ -351,7 +351,9 @@ pub(crate) trait EngineProvider: Send + Sync {
     }
 }
 
-struct FixedEngineProvider;
+struct FixedEngineProvider {
+    expected_tun_helper_sha256: Option<&'static str>,
+}
 
 impl EngineProvider for FixedEngineProvider {
     fn create(&self, kind: EngineKind) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
@@ -361,7 +363,9 @@ impl EngineProvider for FixedEngineProvider {
     fn create_tun(&self) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
         #[cfg(windows)]
         {
-            Ok(Box::new(TunHelperLauncher::resolve()?))
+            Ok(Box::new(TunHelperLauncher::resolve(
+                self.expected_tun_helper_sha256,
+            )?))
         }
         #[cfg(not(windows))]
         {
@@ -570,6 +574,7 @@ impl ApplicationController {
     pub fn production(
         session_root: PathBuf,
         event_sink: EventSink,
+        expected_tun_helper_sha256: Option<&'static str>,
     ) -> Result<Arc<Self>, RuntimeError> {
         let proxy_root = session_root
             .parent()
@@ -577,13 +582,19 @@ impl ApplicationController {
             .unwrap_or_else(|| session_root.clone());
         let system_proxy: Arc<dyn SystemProxyControl> =
             Arc::new(SystemProxyManager::new(proxy_root));
-        Self::production_with_system_proxy(session_root, event_sink, system_proxy)
+        Self::production_with_system_proxy(
+            session_root,
+            event_sink,
+            system_proxy,
+            expected_tun_helper_sha256,
+        )
     }
 
     fn production_with_system_proxy(
         session_root: PathBuf,
         event_sink: EventSink,
         system_proxy: Arc<dyn SystemProxyControl>,
+        expected_tun_helper_sha256: Option<&'static str>,
     ) -> Result<Arc<Self>, RuntimeError> {
         let engine_recovery_error = reconcile_stale_sessions(&session_root).err();
         let proxy_recovery_error = system_proxy.reconcile_stale_journal().err();
@@ -596,7 +607,9 @@ impl ApplicationController {
         let mut controller = Self::with_services_and_controls(
             session_root,
             event_sink,
-            Arc::new(FixedEngineProvider),
+            Arc::new(FixedEngineProvider {
+                expected_tun_helper_sha256,
+            }),
             Arc::new(TcpListenerVerifier),
             Arc::new(HttpsTrafficProber),
             Arc::new(HttpsSubscriptionFetcher),
@@ -4523,6 +4536,7 @@ mod tests {
             root.clone(),
             Arc::new(|_| {}),
             proxy,
+            None,
         )
         .unwrap();
         assert_eq!(controller.status().phase, RuntimePhase::RecoveryRequired);

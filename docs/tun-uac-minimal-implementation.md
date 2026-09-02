@@ -206,9 +206,13 @@ Windows integration tests in a disposable snapshot after independent review:
 7. Replace helper/config/engine between checks and verify refusal before mutation.
 8. Confirm no service, scheduled task, startup entry or persistent helper remains.
 
-Build the portable pair with `scripts/build-local-portable.ps1`. It first builds the helper,
-computes SHA-256, then builds the GUI with that exact digest embedded and verifies the helper did
-not change between passes. Authenticode is optional additional provenance, not a launch
+Build the portable pair with `scripts/build-local-portable.ps1`. It uses the isolated
+`src-tauri/target/portable/release` staging directory so a currently running development copy
+cannot lock or contaminate either artifact. It first builds the helper, computes SHA-256, then
+builds the production frontend and only the GUI Rust target with that exact digest embedded. The
+second pass deliberately names `--bin routedeck`, so it cannot rewrite the pinned helper; the
+script then verifies that the helper did not change between passes. Authenticode is optional
+additional provenance, not a launch
 requirement. On the normal development PC, run only unit tests and build checks. The first real
 UAC/TUN test still belongs in the disposable Windows snapshot required by `AGENTS.md`; after the
 exact-hash pair passes those tests, the ordinary live test is simply Connect, approve the

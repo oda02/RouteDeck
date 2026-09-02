@@ -22,9 +22,9 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
+pub fn run(expected_tun_helper_sha256: Option<&'static str>) {
     let app = tauri::Builder::default()
-        .setup(|app| {
+        .setup(move |app| {
             let session_root = app.path().app_local_data_dir()?.join("sessions");
             let handle = app.handle().clone();
             let sink = Arc::new(move |status| {
@@ -33,6 +33,7 @@ pub fn run() {
             app.manage(application::ApplicationController::production(
                 session_root,
                 sink,
+                expected_tun_helper_sha256,
             )?);
             Ok(())
         })

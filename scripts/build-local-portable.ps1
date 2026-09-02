@@ -6,10 +6,12 @@ Set-StrictMode -Version Latest
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $tauriRoot = Join-Path $repoRoot 'src-tauri'
-$releaseRoot = Join-Path $tauriRoot 'target\release'
+$portableTargetRoot = Join-Path $tauriRoot 'target\portable'
+$releaseRoot = Join-Path $portableTargetRoot 'release'
 $helperPath = Join-Path $releaseRoot 'routedeck-tun-helper.exe'
 $guiPath = Join-Path $releaseRoot 'routedeck.exe'
 $hashVariable = 'ROUTEDECK_TUN_HELPER_SHA256'
+$targetVariable = 'CARGO_TARGET_DIR'
 
 foreach ($command in @('cargo.exe', 'npm.cmd')) {
   if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
@@ -17,9 +19,14 @@ foreach ($command in @('cargo.exe', 'npm.cmd')) {
   }
 }
 
+$previousTarget = [Environment]::GetEnvironmentVariable($targetVariable, 'Process')
+[Environment]::SetEnvironmentVariable($targetVariable, $portableTargetRoot, 'Process')
+try {
 Push-Location $tauriRoot
 try {
-  & cargo.exe build --locked --release --bin routedeck-tun-helper
+  # Match the production GUI feature set. A helper built without custom-protocol
+  # would not be the exact sibling from the final portable release configuration.
+  & cargo.exe build --locked --release --features tauri/custom-protocol --bin routedeck-tun-helper
   if ($LASTEXITCODE -ne 0) {
     throw 'TUN helper release build failed'
   }
@@ -41,7 +48,20 @@ try {
   [Environment]::SetEnvironmentVariable($hashVariable, $helperHash, 'Process')
   Push-Location $repoRoot
   try {
-    & npm.cmd run tauri -- build --no-bundle
+    & npm.cmd run build
+    if ($LASTEXITCODE -ne 0) {
+      throw 'RouteDeck production frontend build failed'
+    }
+  }
+  finally {
+    Pop-Location
+  }
+  Push-Location $tauriRoot
+  try {
+    # Tauri CLI builds every binary target and would overwrite the helper whose
+    # digest we just embedded. Build only the GUI target with the same production
+    # custom-protocol feature after the production frontend boundary check.
+    & cargo.exe build --locked --release --features tauri/custom-protocol --bin routedeck
     if ($LASTEXITCODE -ne 0) {
       throw 'RouteDeck GUI release build failed'
     }
@@ -62,8 +82,14 @@ if ($postBuildHash -cne $helperHash) {
   throw 'TUN helper changed after its SHA-256 was embedded in the GUI build'
 }
 
-[pscustomobject]@{
+$result = [pscustomobject]@{
   Gui = $guiPath
   Helper = $helperPath
   HelperSha256 = $helperHash
 }
+}
+finally {
+  [Environment]::SetEnvironmentVariable($targetVariable, $previousTarget, 'Process')
+}
+
+$result

@@ -83,6 +83,7 @@ mod windows {
 
     pub(crate) struct TunHelperLauncher {
         validator: VerifiedEngineLauncher,
+        expected_helper_sha256: Option<&'static str>,
         prepared: Mutex<Option<PreparedTransfer>>,
     }
 
@@ -93,9 +94,12 @@ mod windows {
     }
 
     impl TunHelperLauncher {
-        pub(crate) fn resolve() -> Result<Self, RuntimeError> {
+        pub(crate) fn resolve(
+            expected_helper_sha256: Option<&'static str>,
+        ) -> Result<Self, RuntimeError> {
             Ok(Self {
                 validator: VerifiedEngineLauncher::resolve()?,
+                expected_helper_sha256,
                 prepared: Mutex::new(None),
             })
         }
@@ -139,7 +143,8 @@ mod windows {
                         "TUN helper launch was not prepared by the matching configuration check",
                     )
                 })?;
-            launch_helper(prepared).map(|child| Box::new(child) as Box<dyn ManagedChild>)
+            launch_helper(prepared, self.expected_helper_sha256)
+                .map(|child| Box::new(child) as Box<dyn ManagedChild>)
         }
     }
 
@@ -176,9 +181,12 @@ mod windows {
         Ok((length, format!("{:x}", hasher.finalize())))
     }
 
-    fn launch_helper(prepared: PreparedTransfer) -> Result<TunHelperChild, RuntimeError> {
+    fn launch_helper(
+        prepared: PreparedTransfer,
+        expected_helper_sha256: Option<&str>,
+    ) -> Result<TunHelperChild, RuntimeError> {
         let helper_path = fixed_helper_path()?;
-        let _helper_guard = verify_helper_for_launch(&helper_path)?;
+        let _helper_guard = verify_helper_for_launch(&helper_path, expected_helper_sha256)?;
         let session = random_hex(16)?;
         let suffix = random_hex(16)?;
         let mut pipe = create_server_pipe(&suffix)?;
@@ -1255,11 +1263,14 @@ mod windows {
         Ok(helper)
     }
 
-    fn verify_helper_for_launch(path: &Path) -> Result<File, RuntimeError> {
+    fn verify_helper_for_launch(
+        path: &Path,
+        expected_helper_sha256: Option<&str>,
+    ) -> Result<File, RuntimeError> {
         let (guard, actual) = open_and_hash_helper(path)?;
         verify_helper_digest(
             &actual,
-            option_env!("ROUTEDECK_TUN_HELPER_SHA256"),
+            expected_helper_sha256,
             cfg!(debug_assertions)
                 && std::env::var_os("ROUTEDECK_ALLOW_UNPINNED_TUN_HELPER").as_deref()
                     == Some(OsStr::new("1")),
