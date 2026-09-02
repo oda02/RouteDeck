@@ -36,8 +36,9 @@ mod windows {
             PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
         },
         Storage::FileSystem::{
-            CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_FIRST_PIPE_INSTANCE,
-            FILE_SHARE_READ, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+            CreateFileW, GetFinalPathNameByHandleW, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_NAME_NORMALIZED, FILE_SHARE_READ, OPEN_EXISTING,
+            PIPE_ACCESS_DUPLEX, VOLUME_NAME_DOS,
         },
         System::{
             Pipes::{
@@ -60,8 +61,8 @@ mod windows {
 
     use crate::{
         engine_runtime::{
-            random_hex, reconcile_stale_sessions, DiagnosticBuffer, EngineLauncher, ManagedChild,
-            RuntimeError, SessionConfig, VerifiedEngineLauncher,
+            random_hex, DiagnosticBuffer, EngineLauncher, ManagedChild, RuntimeError,
+            SessionConfig, VerifiedEngineLauncher,
         },
         redaction::Redactor,
         tun_helper_protocol::{
@@ -596,17 +597,20 @@ mod windows {
         }
         let parent = open_verified_parent(invocation)?;
         let config = duplicate_config(parent.raw(), request)?;
+        let config_directory = protected_config_directory(&config)?;
         let contents = read_verified_config(config, request)?;
         validate_tun_config(&contents)?;
 
-        let root = helper_session_root();
-        reconcile_stale_sessions(&root)?;
-        let session = SessionConfig::create(&root, &contents)?;
+        let session = SessionConfig::create(&config_directory, &contents)?;
         let diagnostics = Arc::new(Mutex::new(DiagnosticBuffer::default()));
         let redactor = Redactor::default().with_secret(&contents);
         let launcher = VerifiedEngineLauncher::resolve()?;
         let _version = launcher.check(&session, redactor.clone(), diagnostics.clone())?;
-        let mut journal = TunJournal::create(&invocation.session, &request.config_sha256)?;
+        let mut journal = TunJournal::create(
+            &config_directory,
+            &invocation.session,
+            &request.config_sha256,
+        )?;
         let child = launcher.start(&session, redactor, diagnostics)?;
         let engine_created = process_creation_time_for_pid(child.pid())?;
         journal.mark_running(child.pid(), engine_created)?;
@@ -623,10 +627,15 @@ mod windows {
                 ));
             }
             if let Some(luid) = found.into_iter().next() {
-                break Some(luid);
+                break luid;
             }
             if Instant::now() >= deadline {
-                break None;
+                let mut child = child;
+                let _ = child.stop();
+                return Err(RuntimeError::new(
+                    "tun_preflight",
+                    "the owned RouteDeck TUN adapter did not appear",
+                ));
             }
             thread::sleep(Duration::from_millis(50));
         };
@@ -637,7 +646,7 @@ mod windows {
             }),
             journal,
             engine_created,
-            owned_luid,
+            owned_luid: Some(owned_luid),
         })
     }
 
@@ -809,6 +818,97 @@ mod windows {
         String::from_utf8(bytes).map_err(|_| {
             RuntimeError::new("tun_helper_config", "protected TUN config is not UTF-8")
         })
+    }
+
+    fn protected_config_directory(config: &File) -> Result<PathBuf, RuntimeError> {
+        let path = final_path(config)?;
+        if path.file_name() != Some(OsStr::new("config.json")) {
+            return Err(RuntimeError::new(
+                "tun_helper_config",
+                "protected TUN config file name is invalid",
+            ));
+        }
+        let directory = path.parent().ok_or_else(|| {
+            RuntimeError::new(
+                "tun_helper_config",
+                "protected TUN config directory is missing",
+            )
+        })?;
+        let session_name = directory
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.strip_prefix("session-"))
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    "tun_helper_config",
+                    "protected TUN session identity is invalid",
+                )
+            })?;
+        session_id(session_name).map_err(protocol_runtime_error)?;
+        if directory
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(OsStr::to_str)
+            != Some("sessions")
+        {
+            return Err(RuntimeError::new(
+                "tun_helper_config",
+                "protected TUN session root is invalid",
+            ));
+        }
+        for checked in [
+            directory,
+            directory.parent().expect("session root checked above"),
+        ] {
+            let metadata = fs::symlink_metadata(checked).map_err(|_| {
+                RuntimeError::new(
+                    "tun_helper_config",
+                    "protected TUN session directory could not be inspected",
+                )
+            })?;
+            if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err(RuntimeError::new(
+                    "tun_helper_config",
+                    "protected TUN session directory identity was rejected",
+                ));
+            }
+        }
+        Ok(directory.to_owned())
+    }
+
+    fn final_path(file: &File) -> Result<PathBuf, RuntimeError> {
+        let mut buffer = vec![0_u16; 1024];
+        loop {
+            let length = unsafe {
+                GetFinalPathNameByHandleW(
+                    file.as_raw_handle(),
+                    buffer.as_mut_ptr(),
+                    buffer.len() as u32,
+                    FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+                )
+            };
+            if length == 0 {
+                return Err(last_error(
+                    "tun_helper_config",
+                    "could not resolve the protected TUN config handle",
+                ));
+            }
+            if length < buffer.len() as u32 {
+                buffer.truncate(length as usize);
+                let path = OsString::from_wide(&buffer);
+                let text = path.to_string_lossy();
+                let normalized = text.strip_prefix(r"\\?\").unwrap_or(&text);
+                return Ok(PathBuf::from(normalized));
+            }
+            if length > 32_767 {
+                return Err(RuntimeError::new(
+                    "tun_helper_config",
+                    "protected TUN config path exceeds the Windows limit",
+                ));
+            }
+            buffer.resize(length as usize + 1, 0);
+        }
     }
 
     fn validate_tun_config(contents: &str) -> Result<(), RuntimeError> {
@@ -1417,26 +1517,17 @@ mod windows {
     struct TunJournal {
         path: PathBuf,
         file: Option<File>,
+        session: String,
+        config_sha256: String,
     }
 
     impl TunJournal {
-        fn create(session: &str, config_sha256: &str) -> Result<Self, RuntimeError> {
-            let root = helper_journal_root();
-            fs::create_dir_all(&root)
-                .map_err(|error| RuntimeError::new("session_storage", error.to_string()))?;
-            if fs::read_dir(&root)
-                .map_err(|error| RuntimeError::new("session_storage", error.to_string()))?
-                .next()
-                .transpose()
-                .map_err(|error| RuntimeError::new("session_storage", error.to_string()))?
-                .is_some()
-            {
-                return Err(RuntimeError::new(
-                    "session_recovery",
-                    "a preserved TUN helper journal requires review",
-                ));
-            }
-            let path = root.join(format!("tun-{session}.json"));
+        fn create(
+            session_directory: &Path,
+            session: &str,
+            config_sha256: &str,
+        ) -> Result<Self, RuntimeError> {
+            let path = session_directory.join("tun-journal.json");
             let mut options = OpenOptions::new();
             options
                 .read(true)
@@ -1458,6 +1549,8 @@ mod windows {
             Ok(Self {
                 path,
                 file: Some(file),
+                session: session.to_owned(),
+                config_sha256: config_sha256.to_owned(),
             })
         }
 
@@ -1468,7 +1561,9 @@ mod windows {
         ) -> Result<(), RuntimeError> {
             self.write(serde_json::json!({
                 "schemaVersion": 1,
+                "session": self.session,
                 "phase": "running",
+                "configSha256": self.config_sha256,
                 "enginePid": engine_pid,
                 "engineCreated": engine_created,
             }))
@@ -1477,7 +1572,9 @@ mod windows {
         fn mark_conflict(&mut self) -> Result<(), RuntimeError> {
             self.write(serde_json::json!({
                 "schemaVersion": 1,
+                "session": self.session,
                 "phase": "conflict",
+                "configSha256": self.config_sha256,
             }))
         }
 
@@ -1492,9 +1589,6 @@ mod windows {
             self.file.take();
             fs::remove_file(&self.path)
                 .map_err(|error| RuntimeError::new("session_recovery", error.to_string()))?;
-            if let Some(root) = self.path.parent() {
-                let _ = fs::remove_dir(root);
-            }
             Ok(())
         }
     }
@@ -1507,18 +1601,6 @@ mod windows {
             .and_then(|_| file.write_all(&bytes))
             .and_then(|_| file.sync_all())
             .map_err(|error| RuntimeError::new("session_storage", error.to_string()))
-    }
-
-    fn helper_session_root() -> PathBuf {
-        std::env::temp_dir()
-            .join("RouteDeckTunHelper")
-            .join("sessions")
-    }
-
-    fn helper_journal_root() -> PathBuf {
-        std::env::temp_dir()
-            .join("RouteDeckTunHelper")
-            .join("journals")
     }
 
     struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
@@ -1708,11 +1790,60 @@ mod windows {
         }
 
         #[test]
+        fn duplicated_config_path_must_resolve_to_a_generated_session() {
+            let root = std::env::temp_dir().join(format!(
+                "routedeck-helper-path-test-{}",
+                random_hex(8).unwrap()
+            ));
+            let sessions = root.join("sessions");
+            let config = SessionConfig::create(&sessions, "{}").unwrap();
+            let guard = config.revalidate_for_launch().unwrap();
+            assert_eq!(
+                protected_config_directory(&guard).unwrap(),
+                config.path().parent().unwrap()
+            );
+            let mut journal = TunJournal::create(
+                config.path().parent().unwrap(),
+                &"01".repeat(16),
+                &"02".repeat(32),
+            )
+            .unwrap();
+            assert!(config
+                .path()
+                .parent()
+                .unwrap()
+                .join("tun-journal.json")
+                .is_file());
+            journal.complete().unwrap();
+            drop(guard);
+            drop(config);
+            fs::remove_dir(sessions).unwrap();
+            fs::remove_dir(root).unwrap();
+        }
+
+        #[test]
+        fn held_helper_file_cannot_be_modified_or_replaced_before_launch() {
+            let root = std::env::temp_dir().join(format!(
+                "routedeck-helper-guard-test-{}",
+                random_hex(8).unwrap()
+            ));
+            fs::create_dir(&root).unwrap();
+            let helper = root.join(HELPER_FILE_NAME);
+            fs::write(&helper, b"reviewed helper fixture").unwrap();
+            let (guard, digest) = open_and_hash_helper(&helper).unwrap();
+            assert_eq!(digest.len(), 64);
+            assert!(OpenOptions::new().write(true).open(&helper).is_err());
+            assert!(fs::rename(&helper, root.join("replaced.exe")).is_err());
+            drop(guard);
+            fs::remove_file(helper).unwrap();
+            fs::remove_dir(root).unwrap();
+        }
+
+        #[test]
         fn cancellation_is_distinct_and_precedes_any_session_or_journal_creation() {
             let error = shell_launch_error(ERROR_CANCELLED);
             assert_eq!(error.stage(), "tun_uac_cancelled");
             assert_eq!(shell_launch_error(5).stage(), "tun_helper_launch");
-            assert!(!helper_session_root().join("session-fixture").exists());
         }
     }
 }
