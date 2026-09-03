@@ -4,10 +4,18 @@ RouteDeck treats Windows TUN as an owned, fail-closed session. The ordinary GUI 
 unprivileged; the reviewed elevated helper owns only the adapter created for the current
 session and never stops, disables, deletes, or rewrites a foreign adapter or VPN service.
 
-Before UAC, RouteDeck reads the adapter and route tables. An active foreign full-tunnel
-adapter (including split `/1` capture routes) blocks startup with an actionable conflict.
-The default-route snapshot is hashed into the helper request and recomputed after UAC, so
-a route change while the prompt is open requires a fresh attempt.
+Before UAC, RouteDeck reads the adapter and route tables. It selects the active physical
+Ethernet or Wi-Fi interface owning the effective IPv4 path and records its alias, index,
+and LUID. An active foreign full-tunnel adapter (including split `/1` capture routes)
+blocks startup with an actionable conflict. The exact interface identity, protected
+config hash, and default-route snapshot are hashed into the helper request and recomputed
+after UAC, so a rename, replacement, or route change while the prompt is open requires a
+fresh attempt.
+
+Native sing-box outbounds use the sealed physical alias instead of route auto-detection.
+For VLESS REALITY, the local sing-box-to-Xray SOCKS bridge stays unbound; only Xray's real
+VLESS outbound plus sing-box direct/bootstrap egress bind to the physical interface.
+System Proxy mode is unchanged and continues to follow the current Windows path.
 
 After sing-box starts, the helper requires exactly one adapter named `RouteDeck`, records
 its LUID and owned route keys, and verifies all of the following before reporting the core
@@ -17,6 +25,8 @@ as usable:
 - owned routes cover representative public destinations for every address family enabled
   by the protected TUN config (an IPv4-only config does not require IPv6);
 - `GetBestRoute2` selects that exact LUID for each enabled family;
+- the sealed physical alias, interface index, and LUID still identify the same active
+  hardware adapter, and an interface-constrained best-route query remains usable;
 - no foreign full-tunnel adapter became active.
 
 The GUI then makes both proofs: the authenticated loopback health request proves the

@@ -60,7 +60,7 @@ explicit DACL for the launching user, Administrators and SYSTEM. Both sides veri
 PID, process creation time, fixed sibling image identity and exact build-pinned SHA-256 before
 accepting a frame.
 
-Version 1 messages are a length-prefixed, size-limited JSON schema with
+Version 3 messages are a length-prefixed, size-limited JSON schema with
 `deny_unknown_fields`:
 
 ```text
@@ -75,13 +75,13 @@ StartTun {
   config_len,
   config_sha256,
   preflight_sha256,
-  upstream_choice_id
+  upstream_choice: Physical { interface_luid, interface_index, interface_alias }
 }
 Started { request_id, engine_pid, engine_created, adapter_identity, journal_digest }
 StopTun { protocol_version, session, request_id }
 Stopped { request_id, cleanup: Complete | Conflict }
 Status { protocol_version, session, request_id }
-State { request_id, phase, engine_pid, cleanup }
+State { request_id, phase, engine_pid, cleanup, capture }
 Failure { request_id, code, safe_detail }
 ```
 

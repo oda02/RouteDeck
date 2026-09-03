@@ -294,8 +294,10 @@ Emit exactly the selected protocol outbound plus an explicit direct outbound:
 Local-proxy mode does not emit `auto_detect_interface` or bind an outbound to a
 physical adapter. Its selected outbound follows the effective Windows network path, so
 it can be tested while an existing TUN/VPN remains active (a deliberately nested path).
-RouteDeck emits `auto_detect_interface: true` only with its own TUN capture, where the
-selected server connection must avoid looping back into RouteDeck's adapter.
+RouteDeck TUN also does not use `auto_detect_interface`: before the TUN changes routes it
+seals the effective physical Ethernet/Wi-Fi alias, index, and LUID. Native sing-box
+egress uses `route.default_interface`; the VLESS REALITY bridge keeps its loopback SOCKS
+outbound unbound and binds the real Xray outbound plus direct/bootstrap egress instead.
 
 The internal health rule is immutable and first: its only legal outbound is `selected`. No generated path from `health-in` may reach `direct`.
 
@@ -365,7 +367,7 @@ Addresses are examples, not constants: preflight must choose non-overlapping RFC
 
 - Per-process Direct/VPN rules and the default route are authoritative for traffic captured by the TUN.
 - The UI exposes one clear global choice: `Everything else: Direct | VPN`; app rows override it.
-- The selected server's own connection must bypass the RouteDeck TUN using `route.auto_detect_interface`, explicit physical `default_interface`, or outbound `bind_interface`.
+- The selected server's own connection must bypass the RouteDeck TUN using the preflight-sealed physical `default_interface` or outbound `bind_interface`; `auto_detect_interface` is rejected for RouteDeck TUN.
 - IPv4 and IPv6 must both be configured or IPv6 must be explicitly disabled. Never show connected while one enabled family leaks due to missing route/DNS handling.
 - DNS policy is shown separately because Windows DNS cannot be promised to follow per-process payload routing. The default is `DNS via VPN`; `Current network` carries an explicit leak warning.
 
@@ -502,9 +504,12 @@ adapter/route metrics influence the preferred route. See
 [GetIpForwardTable2](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/getipforwardtable2),
 and [interface metrics](https://learn.microsoft.com/en-us/windows-server/networking/technologies/network-subsystem/net-sub-interface-metric).
 
-Offer these explicit policies when another VPN/default tunnel is detected:
+The current protocol v3 release accepts only a verified physical upstream and safely
+cancels when another VPN/default tunnel makes ownership ambiguous. The following are
+the longer-term explicit policy choices; the nested choice is not currently accepted
+by the elevated helper:
 
-1. **Use current network path (nested)**: `auto_detect_interface=true`; selected server traffic may itself travel through the already active VPN. UI says this is nested and measures the actual result.
+1. **Use current network path (nested, future)**: selected server traffic may itself travel through the already active VPN. This needs a separately authenticated policy and traffic proof; the current helper continues to reject `auto_detect_interface`.
 2. **Use physical adapter**: user selects a verified up, non-loopback, non-tunnel NIC; set `route.default_interface` (or outbound `bind_interface`) to its exact current interface identifier. Revalidate immediately before launch.
 3. **Cancel**: safe default when ownership is ambiguous or routes overlap.
 

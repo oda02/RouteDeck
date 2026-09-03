@@ -1,3 +1,10 @@
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TunUpstreamIdentity {
+    pub(crate) interface_luid: u64,
+    pub(crate) interface_index: u32,
+    pub(crate) interface_alias: String,
+}
+
 #[cfg(windows)]
 mod windows {
     use std::{
@@ -34,7 +41,7 @@ mod windows {
             IF_TYPE_TUNNEL, IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2, MIB_IPFORWARD_ROW2,
             MIB_IPFORWARD_TABLE2,
         },
-        NetworkManagement::Ndis::TUNNEL_TYPE_NONE,
+        NetworkManagement::Ndis::{IfOperStatusUp, NET_LUID_LH, TUNNEL_TYPE_NONE},
         Networking::WinSock::{
             AF_INET, AF_INET6, AF_UNSPEC, IN6_ADDR, IN_ADDR, SOCKADDR_IN, SOCKADDR_IN6,
             SOCKADDR_INET,
@@ -69,6 +76,7 @@ mod windows {
         },
     };
 
+    use super::TunUpstreamIdentity;
     use crate::{
         engine_runtime::{
             random_hex, DiagnosticBuffer, EngineLauncher, ManagedChild, RuntimeError,
@@ -94,6 +102,7 @@ mod windows {
     pub(crate) struct TunHelperLauncher {
         validator: VerifiedEngineLauncher,
         expected_helper_sha256: Option<&'static str>,
+        upstream: TunUpstreamIdentity,
         prepared: Mutex<Option<PreparedTransfer>>,
     }
 
@@ -106,10 +115,12 @@ mod windows {
     impl TunHelperLauncher {
         pub(crate) fn resolve(
             expected_helper_sha256: Option<&'static str>,
+            upstream: TunUpstreamIdentity,
         ) -> Result<Self, RuntimeError> {
             Ok(Self {
                 validator: VerifiedEngineLauncher::resolve()?,
                 expected_helper_sha256,
+                upstream,
                 prepared: Mutex::new(None),
             })
         }
@@ -153,7 +164,7 @@ mod windows {
                         "TUN helper launch was not prepared by the matching configuration check",
                     )
                 })?;
-            launch_helper(prepared, self.expected_helper_sha256)
+            launch_helper(prepared, self.expected_helper_sha256, &self.upstream)
                 .map(|child| Box::new(child) as Box<dyn ManagedChild>)
         }
     }
@@ -194,8 +205,9 @@ mod windows {
     fn launch_helper(
         prepared: PreparedTransfer,
         expected_helper_sha256: Option<&str>,
+        upstream: &TunUpstreamIdentity,
     ) -> Result<TunHelperChild, RuntimeError> {
-        let route_context = preflight_route_context()?;
+        let route_context = preflight_route_context(upstream)?;
         let helper_path = fixed_helper_path()?;
         let _helper_guard = verify_helper_for_launch(&helper_path, expected_helper_sha256)?;
         let session = random_hex(16)?;
@@ -245,7 +257,9 @@ mod windows {
             },
         )
         .map_err(protocol_runtime_error)?;
-        let preflight_sha256 = preflight_digest(&prepared.config_sha256, &route_context);
+        let upstream_choice = upstream_choice(upstream);
+        let preflight_sha256 =
+            preflight_digest(&prepared.config_sha256, &route_context, &upstream_choice);
         write_frame(
             &mut pipe,
             &Frame::StartTun {
@@ -258,7 +272,7 @@ mod windows {
                 config_len: prepared.config_len,
                 config_sha256: prepared.config_sha256,
                 preflight_sha256,
-                upstream_choice: UpstreamChoice::CurrentPath,
+                upstream_choice,
             },
         )
         .map_err(protocol_runtime_error)?;
@@ -297,11 +311,49 @@ mod windows {
         }
     }
 
-    fn preflight_digest(config_sha256: &str, route_context: &str) -> String {
+    fn upstream_choice(upstream: &TunUpstreamIdentity) -> UpstreamChoice {
+        UpstreamChoice::Physical {
+            interface_luid: upstream.interface_luid,
+            interface_index: upstream.interface_index,
+            interface_alias: upstream.interface_alias.clone(),
+        }
+    }
+
+    fn upstream_identity(choice: &UpstreamChoice) -> TunUpstreamIdentity {
+        match choice {
+            UpstreamChoice::Physical {
+                interface_luid,
+                interface_index,
+                interface_alias,
+            } => TunUpstreamIdentity {
+                interface_luid: *interface_luid,
+                interface_index: *interface_index,
+                interface_alias: interface_alias.clone(),
+            },
+        }
+    }
+
+    fn preflight_digest(
+        config_sha256: &str,
+        route_context: &str,
+        upstream: &UpstreamChoice,
+    ) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(b"RouteDeck TUN current-path launch context v2\0");
+        hasher.update(b"RouteDeck TUN physical-upstream launch context v3\0");
         hasher.update(config_sha256.as_bytes());
         hasher.update(route_context.as_bytes());
+        match upstream {
+            UpstreamChoice::Physical {
+                interface_luid,
+                interface_index,
+                interface_alias,
+            } => {
+                hasher.update(interface_luid.to_le_bytes());
+                hasher.update(interface_index.to_le_bytes());
+                hasher.update((interface_alias.len() as u64).to_le_bytes());
+                hasher.update(interface_alias.as_bytes());
+            }
+        }
         format!("{:x}", hasher.finalize())
     }
 
@@ -565,7 +617,7 @@ mod windows {
                 config_len,
                 config_sha256,
                 preflight_sha256,
-                upstream_choice: UpstreamChoice::CurrentPath,
+                upstream_choice,
                 ..
             } if session == invocation.session
                 && received_challenge == challenge
@@ -577,6 +629,7 @@ mod windows {
                     config_len,
                     config_sha256,
                     preflight_sha256,
+                    upstream: upstream_identity(&upstream_choice),
                 }
             }
             _ => {
@@ -592,8 +645,7 @@ mod windows {
                 let child = &mut running.child;
                 let journal = &mut running.journal;
                 let engine_created = running.engine_created;
-                let owned_luid = running.owned_luid;
-                let expected_families = running.expected_families;
+                let capture = &running.capture;
                 let engine_pid = child.pid();
                 write_frame(
                     &mut pipe,
@@ -610,8 +662,7 @@ mod windows {
                     &mut state,
                     child.as_mut(),
                     journal,
-                    owned_luid,
-                    expected_families,
+                    capture,
                 )
             }
             Err(error) => {
@@ -634,22 +685,31 @@ mod windows {
         config_len: u64,
         config_sha256: String,
         preflight_sha256: String,
+        upstream: TunUpstreamIdentity,
     }
 
     struct RunningSession {
         child: Box<dyn ManagedChild>,
         journal: TunJournal,
         engine_created: u64,
+        capture: CaptureExpectation,
+    }
+
+    struct CaptureExpectation {
         owned_luid: Option<u64>,
         expected_families: ExpectedFamilies,
+        upstream: TunUpstreamIdentity,
     }
 
     fn start_engine_session(
         invocation: &HelperInvocation,
         request: &StartRequest,
     ) -> Result<RunningSession, RuntimeError> {
-        let route_context = preflight_route_context()?;
-        if request.preflight_sha256 != preflight_digest(&request.config_sha256, &route_context) {
+        let route_context = preflight_route_context(&request.upstream)?;
+        let choice = upstream_choice(&request.upstream);
+        if request.preflight_sha256
+            != preflight_digest(&request.config_sha256, &route_context, &choice)
+        {
             return Err(RuntimeError::new(
                 "tun_preflight",
                 "network routes changed while TUN permission was being granted; retry the connection",
@@ -665,7 +725,7 @@ mod windows {
         let config = duplicate_config(parent.raw(), request)?;
         let config_directory = protected_config_directory(&config)?;
         let contents = read_verified_config(config, request)?;
-        let expected_families = validate_tun_config(&contents)?;
+        let expected_families = validate_tun_config(&contents, &request.upstream.interface_alias)?;
 
         let session = SessionConfig::create(&config_directory, &contents)?;
         let diagnostics = Arc::new(Mutex::new(DiagnosticBuffer::default()));
@@ -735,6 +795,10 @@ mod windows {
             rollback_failed_start(child.as_mut(), &mut journal, Some(owned_luid))?;
             return Err(error);
         }
+        if let Err(error) = validate_physical_upstream_after_start(&request.upstream) {
+            rollback_failed_start(child.as_mut(), &mut journal, Some(owned_luid))?;
+            return Err(error);
+        }
         Ok(RunningSession {
             child: Box::new(HelperEngineChild {
                 child,
@@ -742,8 +806,11 @@ mod windows {
             }),
             journal,
             engine_created,
-            owned_luid: Some(owned_luid),
-            expected_families,
+            capture: CaptureExpectation {
+                owned_luid: Some(owned_luid),
+                expected_families,
+                upstream: request.upstream.clone(),
+            },
         })
     }
 
@@ -790,15 +857,14 @@ mod windows {
         state: &mut ServerState,
         child: &mut dyn ManagedChild,
         journal: &mut TunJournal,
-        owned_luid: Option<u64>,
-        expected_families: ExpectedFamilies,
+        capture: &CaptureExpectation,
     ) -> Result<(), RuntimeError> {
         loop {
             let frame = match read_frame(pipe) {
                 Ok(frame) => frame,
                 Err(_) => {
                     let stop = child.stop();
-                    let cleanup = wait_for_cleanup(owned_luid, Duration::from_secs(3));
+                    let cleanup = wait_for_cleanup(capture.owned_luid, Duration::from_secs(3));
                     if stop.is_ok() && cleanup == CleanupState::Complete {
                         journal.complete()?;
                         return Ok(());
@@ -821,10 +887,21 @@ mod windows {
                 Frame::Status { request_id, .. } => {
                     let alive = child.is_alive()?;
                     if alive {
-                        match owned_luid
-                            .and_then(|luid| inspect_owned_capture(luid, expected_families).ok())
-                        {
-                            Some(capture) => write_frame(
+                        let verified = capture.owned_luid.map_or_else(
+                            || {
+                                Err(RuntimeError::new(
+                                    "tun_capture",
+                                    "the helper-owned TUN adapter identity is unavailable",
+                                ))
+                            },
+                            |luid| {
+                                validate_physical_upstream_after_start(&capture.upstream).and_then(
+                                    |_| inspect_owned_capture(luid, capture.expected_families),
+                                )
+                            },
+                        );
+                        match verified {
+                            Ok(capture) => write_frame(
                                 pipe,
                                 &Frame::State {
                                     request_id,
@@ -835,15 +912,12 @@ mod windows {
                                 },
                             )
                             .map_err(protocol_runtime_error)?,
-                            None => write_frame(
+                            Err(error) => write_frame(
                                 pipe,
                                 &Frame::Failure {
                                     request_id,
                                     code: HelperFailureCode::CaptureInvalid,
-                                    safe_detail: Some(
-                                        "RouteDeck TUN capture routes are missing or no longer own the system path"
-                                            .into(),
-                                    ),
+                                    safe_detail: Some(safe_helper_detail(error.stage()).into()),
                                 },
                             )
                             .map_err(protocol_runtime_error)?,
@@ -864,7 +938,7 @@ mod windows {
                 }
                 Frame::StopTun { request_id, .. } => {
                     let stop = child.stop();
-                    let cleanup = wait_for_cleanup(owned_luid, Duration::from_secs(3));
+                    let cleanup = wait_for_cleanup(capture.owned_luid, Duration::from_secs(3));
                     if stop.is_ok() && cleanup == CleanupState::Complete {
                         journal.complete()?;
                     } else {
@@ -1060,7 +1134,10 @@ mod windows {
         ipv6: bool,
     }
 
-    fn validate_tun_config(contents: &str) -> Result<ExpectedFamilies, RuntimeError> {
+    fn validate_tun_config(
+        contents: &str,
+        upstream_alias: &str,
+    ) -> Result<ExpectedFamilies, RuntimeError> {
         let root: serde_json::Value = serde_json::from_str(contents).map_err(|_| {
             RuntimeError::new(
                 "tun_helper_config",
@@ -1149,17 +1226,86 @@ mod windows {
                 ));
             }
         }
-        if tun_count != 1
-            || object
-                .get("route")
-                .and_then(serde_json::Value::as_object)
-                .and_then(|route| route.get("auto_detect_interface"))
-                .and_then(serde_json::Value::as_bool)
-                != Some(true)
+        let route = object
+            .get("route")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                RuntimeError::new("tun_helper_config", "protected TUN route policy is invalid")
+            })?;
+        let outbounds = object
+            .get("outbounds")
+            .and_then(serde_json::Value::as_array)
+            .filter(|outbounds| outbounds.len() == 2)
+            .ok_or_else(|| {
+                RuntimeError::new("tun_helper_config", "protected TUN outbounds are invalid")
+            })?;
+        let selected = outbounds
+            .iter()
+            .find(|outbound| {
+                outbound.get("tag").and_then(serde_json::Value::as_str) == Some("selected")
+            })
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    "tun_helper_config",
+                    "protected TUN selected outbound is invalid",
+                )
+            })?;
+        let direct = outbounds
+            .iter()
+            .find(|outbound| {
+                outbound.get("tag").and_then(serde_json::Value::as_str) == Some("direct")
+            })
+            .filter(|outbound| {
+                outbound.get("type").and_then(serde_json::Value::as_str) == Some("direct")
+            })
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    "tun_helper_config",
+                    "protected TUN direct outbound is invalid",
+                )
+            })?;
+        let bootstrap = root
+            .pointer("/dns/servers")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|servers| {
+                servers.iter().find(|server| {
+                    server.get("tag").and_then(serde_json::Value::as_str) == Some("bootstrap")
+                })
+            })
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    "tun_helper_config",
+                    "protected TUN bootstrap DNS server is invalid",
+                )
+            })?;
+        let selected_is_bridge =
+            selected.get("type").and_then(serde_json::Value::as_str) == Some("socks");
+        let upstream_binding_valid = if selected_is_bridge {
+            route.get("default_interface").is_none()
+                && selected.get("server").and_then(serde_json::Value::as_str) == Some("127.0.0.1")
+                && selected.get("bind_interface").is_none()
+                && direct
+                    .get("bind_interface")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(upstream_alias)
+                && bootstrap
+                    .get("bind_interface")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(upstream_alias)
+        } else {
+            route
+                .get("default_interface")
+                .and_then(serde_json::Value::as_str)
+                == Some(upstream_alias)
+                && selected.get("bind_interface").is_none()
+                && direct.get("bind_interface").is_none()
+                && bootstrap.get("bind_interface").is_none()
+        };
+        if tun_count != 1 || route.get("auto_detect_interface").is_some() || !upstream_binding_valid
         {
             return Err(RuntimeError::new(
                 "tun_helper_config",
-                "protected TUN route policy is invalid",
+                "protected TUN physical upstream binding is invalid",
             ));
         }
         Ok(expected_families)
@@ -1589,11 +1735,13 @@ mod windows {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct AdapterState {
         luid: u64,
+        if_index: u32,
         friendly_name: String,
         description: String,
         if_type: u32,
         tunnel_type: i32,
         physical_address_length: u32,
+        oper_status: i32,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1632,11 +1780,13 @@ mod windows {
                 let adapter = unsafe { &*current };
                 output.push(AdapterState {
                     luid: unsafe { adapter.Luid.Value },
+                    if_index: unsafe { adapter.Anonymous1.Anonymous.IfIndex },
                     friendly_name: wide_ptr_string(adapter.FriendlyName).unwrap_or_default(),
                     description: wide_ptr_string(adapter.Description).unwrap_or_default(),
                     if_type: adapter.IfType,
                     tunnel_type: adapter.TunnelType,
                     physical_address_length: adapter.PhysicalAddressLength,
+                    oper_status: adapter.OperStatus,
                 });
                 current = adapter.Next;
             }
@@ -1747,13 +1897,83 @@ mod windows {
         })
     }
 
-    fn preflight_route_context() -> Result<String, RuntimeError> {
+    pub(crate) fn select_physical_upstream() -> Result<TunUpstreamIdentity, RuntimeError> {
+        let adapters = adapter_states()?;
+        let routes = route_states()?;
+        if foreign_full_tunnel(&adapters, &routes).is_some() {
+            return Err(RuntimeError::new(
+                "tun_preflight",
+                "another full-tunnel VPN is active; turn it off before starting RouteDeck TUN",
+            ));
+        }
+        let best_luid = best_route_luid_v4([1, 1, 1, 1])?;
+        physical_upstream_from(&adapters, best_luid).ok_or_else(|| {
+            RuntimeError::new(
+                "tun_preflight",
+                "the current IPv4 path is not an active physical Ethernet or Wi-Fi adapter",
+            )
+        })
+    }
+
+    fn physical_upstream_from(
+        adapters: &[AdapterState],
+        best_luid: u64,
+    ) -> Option<TunUpstreamIdentity> {
+        let adapter = adapters.iter().find(|adapter| {
+            adapter.luid == best_luid
+                && adapter.if_index != 0
+                && adapter.oper_status == IfOperStatusUp
+                && adapter.tunnel_type == TUNNEL_TYPE_NONE
+                && adapter.physical_address_length > 0
+                && matches!(adapter.if_type, IF_TYPE_ETHERNET_CSMACD | IF_TYPE_IEEE80211)
+                && !adapter.friendly_name.is_empty()
+                && adapter.friendly_name.trim() == adapter.friendly_name
+                && adapter.friendly_name.encode_utf16().count() <= 256
+                && !adapter.friendly_name.chars().any(char::is_control)
+                && !adapter
+                    .friendly_name
+                    .eq_ignore_ascii_case(TUN_INTERFACE_NAME)
+        })?;
+        Some(TunUpstreamIdentity {
+            interface_luid: adapter.luid,
+            interface_index: adapter.if_index,
+            interface_alias: adapter.friendly_name.clone(),
+        })
+    }
+
+    fn exact_upstream_adapter<'a>(
+        adapters: &'a [AdapterState],
+        expected: &TunUpstreamIdentity,
+    ) -> Option<&'a AdapterState> {
+        if physical_upstream_from(adapters, expected.interface_luid).as_ref() != Some(expected) {
+            return None;
+        }
+        adapters.iter().find(|adapter| {
+            adapter.luid == expected.interface_luid
+                && adapter.if_index == expected.interface_index
+                && adapter.friendly_name == expected.interface_alias
+                && adapter.oper_status == IfOperStatusUp
+                && adapter.tunnel_type == TUNNEL_TYPE_NONE
+                && adapter.physical_address_length > 0
+                && matches!(adapter.if_type, IF_TYPE_ETHERNET_CSMACD | IF_TYPE_IEEE80211)
+        })
+    }
+
+    fn preflight_route_context(upstream: &TunUpstreamIdentity) -> Result<String, RuntimeError> {
         let adapters = adapter_states()?;
         let mut routes = route_states()?;
         if foreign_full_tunnel(&adapters, &routes).is_some() {
             return Err(RuntimeError::new(
                 "tun_preflight",
                 "another full-tunnel VPN is active; turn it off before starting RouteDeck TUN",
+            ));
+        }
+        if exact_upstream_adapter(&adapters, upstream).is_none()
+            || best_route_luid_v4([1, 1, 1, 1])? != upstream.interface_luid
+        {
+            return Err(RuntimeError::new(
+                "tun_preflight",
+                "the selected physical upstream changed before TUN startup",
             ));
         }
         routes.retain(|route| route.prefix_len <= 1);
@@ -1776,6 +1996,22 @@ mod windows {
             hasher.update(route.metric.to_le_bytes());
         }
         Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    fn validate_physical_upstream_after_start(
+        upstream: &TunUpstreamIdentity,
+    ) -> Result<(), RuntimeError> {
+        let adapters = adapter_states()?;
+        if exact_upstream_adapter(&adapters, upstream).is_none()
+            || best_route_luid_v4_on_interface([1, 1, 1, 1], upstream.interface_luid)?
+                != upstream.interface_luid
+        {
+            return Err(RuntimeError::new(
+                "tun_upstream",
+                "the sealed physical upstream is unavailable or changed identity",
+            ));
+        }
+        Ok(())
     }
 
     fn address_is_covered(route: &RouteState, family: u16, address: &[u8]) -> bool {
@@ -1809,7 +2045,26 @@ mod windows {
                 sin_zero: [0; 8],
             },
         };
-        best_route_luid(&destination)
+        best_route_luid(&destination, None)
+    }
+
+    fn best_route_luid_v4_on_interface(
+        address: [u8; 4],
+        interface_luid: u64,
+    ) -> Result<u64, RuntimeError> {
+        let destination = SOCKADDR_INET {
+            Ipv4: SOCKADDR_IN {
+                sin_family: AF_INET,
+                sin_port: 0,
+                sin_addr: IN_ADDR {
+                    S_un: windows_sys::Win32::Networking::WinSock::IN_ADDR_0 {
+                        S_addr: u32::from_ne_bytes(address),
+                    },
+                },
+                sin_zero: [0; 8],
+            },
+        };
+        best_route_luid(&destination, Some(interface_luid))
     }
 
     fn best_route_luid_v6(address: [u8; 16]) -> Result<u64, RuntimeError> {
@@ -1824,15 +2079,19 @@ mod windows {
                 Anonymous: Default::default(),
             },
         };
-        best_route_luid(&destination)
+        best_route_luid(&destination, None)
     }
 
-    fn best_route_luid(destination: &SOCKADDR_INET) -> Result<u64, RuntimeError> {
+    fn best_route_luid(
+        destination: &SOCKADDR_INET,
+        interface_luid: Option<u64>,
+    ) -> Result<u64, RuntimeError> {
         let mut route = MIB_IPFORWARD_ROW2::default();
         let mut source = SOCKADDR_INET::default();
+        let luid = interface_luid.map(|luid| NET_LUID_LH { Value: luid });
         let status = unsafe {
             GetBestRoute2(
-                ptr::null(),
+                luid.as_ref().map_or(ptr::null(), ptr::from_ref),
                 0,
                 ptr::null(),
                 destination,
@@ -2541,6 +2800,7 @@ mod windows {
             "tun_capture" => {
                 "TUN started but did not obtain every enabled address-family capture route"
             }
+            "tun_upstream" => "The sealed physical network adapter changed or became unavailable",
             "tun_helper_config" | "config_check" => "The generated TUN configuration was rejected",
             "engine_integrity" | "engine_layout" => {
                 "The reviewed sing-box component could not be verified"
@@ -2553,7 +2813,7 @@ mod windows {
     fn helper_failure_code(stage: &str) -> HelperFailureCode {
         match stage {
             "tun_preflight" => HelperFailureCode::PreflightConflict,
-            "tun_capture" => HelperFailureCode::CaptureInvalid,
+            "tun_capture" | "tun_upstream" => HelperFailureCode::CaptureInvalid,
             _ => HelperFailureCode::StartFailed,
         }
     }
@@ -2638,16 +2898,19 @@ mod windows {
         fn strict_tun_config_rejects_non_tun_and_non_loopback_inputs() {
             let valid = serde_json::json!({
                 "log": {},
-                "dns": {},
+                "dns": {"servers":[{"tag":"bootstrap"}]},
                 "inbounds": [
                     {"type":"http","listen":"127.0.0.1"},
                     {"type":"tun","tag":"tun-in","interface_name":"RouteDeck","address":["172.19.0.1/30"],"auto_route":true,"strict_route":true,"stack":"system"}
                 ],
-                "outbounds": [],
-                "route": {"auto_detect_interface":true}
+                "outbounds": [
+                    {"type":"hysteria2","tag":"selected"},
+                    {"type":"direct","tag":"direct"}
+                ],
+                "route": {"default_interface":"Ethernet"}
             });
             assert_eq!(
-                validate_tun_config(&valid.to_string()).unwrap(),
+                validate_tun_config(&valid.to_string(), "Ethernet").unwrap(),
                 ExpectedFamilies {
                     ipv4: true,
                     ipv6: false,
@@ -2657,18 +2920,65 @@ mod windows {
             dual["inbounds"][1]["address"] =
                 serde_json::json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"]);
             assert_eq!(
-                validate_tun_config(&dual.to_string()).unwrap(),
+                validate_tun_config(&dual.to_string(), "Ethernet").unwrap(),
                 ExpectedFamilies {
                     ipv4: true,
                     ipv6: true,
                 }
             );
+            assert!(validate_tun_config(&dual.to_string(), "Wi-Fi").is_err());
+            let mut automatic = dual.clone();
+            automatic["route"]["auto_detect_interface"] = serde_json::json!(true);
+            assert!(validate_tun_config(&automatic.to_string(), "Ethernet").is_err());
+            let mut native_selected_override = valid.clone();
+            native_selected_override["outbounds"][0]["bind_interface"] = serde_json::json!("Wi-Fi");
+            assert!(
+                validate_tun_config(&native_selected_override.to_string(), "Ethernet").is_err()
+            );
+            let mut native_direct_override = valid.clone();
+            native_direct_override["outbounds"][1]["bind_interface"] =
+                serde_json::json!("Ethernet");
+            assert!(validate_tun_config(&native_direct_override.to_string(), "Ethernet").is_err());
+            let mut native_dns_override = valid.clone();
+            native_dns_override["dns"] = serde_json::json!({
+                "servers": [{"tag":"bootstrap", "bind_interface":"Ethernet"}]
+            });
+            assert!(validate_tun_config(&native_dns_override.to_string(), "Ethernet").is_err());
+            let bridge = serde_json::json!({
+                "log": {},
+                "dns": {"servers":[{"tag":"bootstrap","bind_interface":"Ethernet"}]},
+                "inbounds": [
+                    {"type":"http","listen":"127.0.0.1"},
+                    {"type":"tun","tag":"tun-in","interface_name":"RouteDeck","address":["172.19.0.1/30"],"auto_route":true,"strict_route":true,"stack":"system"}
+                ],
+                "outbounds": [
+                    {"type":"socks","tag":"selected","server":"127.0.0.1","server_port":19090},
+                    {"type":"direct","tag":"direct","bind_interface":"Ethernet"}
+                ],
+                "route": {}
+            });
+            assert!(validate_tun_config(&bridge.to_string(), "Ethernet").is_ok());
+            let mut remote_bridge = bridge.clone();
+            remote_bridge["outbounds"][0]["server"] = serde_json::json!("192.0.2.1");
+            assert!(validate_tun_config(&remote_bridge.to_string(), "Ethernet").is_err());
+            let mut bound_bridge = bridge.clone();
+            bound_bridge["outbounds"][0]["bind_interface"] = serde_json::json!("Ethernet");
+            assert!(validate_tun_config(&bound_bridge.to_string(), "Ethernet").is_err());
+            let mut fake_direct = bridge.clone();
+            fake_direct["outbounds"][1]["type"] = serde_json::json!("socks");
+            assert!(validate_tun_config(&fake_direct.to_string(), "Ethernet").is_err());
+            let mut wrong_direct_tag = bridge.clone();
+            wrong_direct_tag["outbounds"][1]["tag"] = serde_json::json!("other");
+            assert!(validate_tun_config(&wrong_direct_tag.to_string(), "Ethernet").is_err());
+            let mut wrong_bootstrap = bridge;
+            wrong_bootstrap["dns"]["servers"][0]["tag"] = serde_json::json!("other");
+            assert!(validate_tun_config(&wrong_bootstrap.to_string(), "Ethernet").is_err());
             let mut foreign = valid.clone();
             foreign["inbounds"][0]["listen"] = serde_json::json!("0.0.0.0");
-            assert!(validate_tun_config(&foreign.to_string()).is_err());
+            assert!(validate_tun_config(&foreign.to_string(), "Ethernet").is_err());
             let mut no_tun = valid;
             no_tun["inbounds"].as_array_mut().unwrap().pop();
-            assert!(validate_tun_config(&no_tun.to_string()).is_err());
+            assert!(validate_tun_config(&no_tun.to_string(), "Ethernet").is_err());
         }
 
         #[test]
@@ -2760,11 +3070,13 @@ mod windows {
         fn adapter(luid: u64, name: &str, if_type: u32, physical: u32) -> AdapterState {
             AdapterState {
                 luid,
+                if_index: luid as u32,
                 friendly_name: name.into(),
                 description: name.into(),
                 if_type,
                 tunnel_type: TUNNEL_TYPE_NONE,
                 physical_address_length: physical,
+                oper_status: IfOperStatusUp,
             }
         }
 
@@ -2810,6 +3122,26 @@ mod windows {
                     .luid,
                 3
             );
+        }
+
+        #[test]
+        fn physical_upstream_requires_the_exact_active_hardware_default() {
+            let ethernet = adapter(7, "Ethernet", IF_TYPE_ETHERNET_CSMACD, 6);
+            assert_eq!(
+                physical_upstream_from(std::slice::from_ref(&ethernet), 7),
+                Some(TunUpstreamIdentity {
+                    interface_luid: 7,
+                    interface_index: 7,
+                    interface_alias: "Ethernet".into(),
+                })
+            );
+            assert!(physical_upstream_from(std::slice::from_ref(&ethernet), 8).is_none());
+
+            let mut down = ethernet.clone();
+            down.oper_status = 2;
+            assert!(physical_upstream_from(&[down], 7).is_none());
+            let tunnel = adapter(9, "xray_tun", IF_TYPE_TUNNEL, 0);
+            assert!(physical_upstream_from(&[tunnel], 9).is_none());
         }
 
         #[test]
@@ -2991,15 +3323,53 @@ mod windows {
 
         #[test]
         fn preflight_digest_binds_config_and_route_snapshot() {
-            let base = preflight_digest(&"01".repeat(32), &"02".repeat(32));
-            assert_ne!(base, preflight_digest(&"03".repeat(32), &"02".repeat(32)));
-            assert_ne!(base, preflight_digest(&"01".repeat(32), &"04".repeat(32)));
+            let upstream = UpstreamChoice::Physical {
+                interface_luid: 7,
+                interface_index: 9,
+                interface_alias: "Ethernet".into(),
+            };
+            let base = preflight_digest(&"01".repeat(32), &"02".repeat(32), &upstream);
+            assert_ne!(
+                base,
+                preflight_digest(&"03".repeat(32), &"02".repeat(32), &upstream)
+            );
+            assert_ne!(
+                base,
+                preflight_digest(&"01".repeat(32), &"04".repeat(32), &upstream)
+            );
+            assert_ne!(
+                base,
+                preflight_digest(
+                    &"01".repeat(32),
+                    &"02".repeat(32),
+                    &UpstreamChoice::Physical {
+                        interface_luid: 8,
+                        interface_index: 9,
+                        interface_alias: "Ethernet".into(),
+                    },
+                )
+            );
         }
     }
 }
 
 #[cfg(windows)]
 pub(crate) use windows::TunHelperLauncher;
+
+#[cfg(windows)]
+pub(crate) fn select_physical_upstream(
+) -> Result<TunUpstreamIdentity, crate::engine_runtime::RuntimeError> {
+    windows::select_physical_upstream()
+}
+
+#[cfg(not(windows))]
+pub(crate) fn select_physical_upstream(
+) -> Result<TunUpstreamIdentity, crate::engine_runtime::RuntimeError> {
+    Err(crate::engine_runtime::RuntimeError::new(
+        "tun_preflight",
+        "physical TUN upstream selection is available only on Windows",
+    ))
+}
 
 #[cfg(windows)]
 pub(crate) fn reconcile_stale_tun_sessions(

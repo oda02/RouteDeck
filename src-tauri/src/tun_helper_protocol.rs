@@ -5,7 +5,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 2;
+pub(crate) const PROTOCOL_VERSION: u16 = 3;
 pub(crate) const MAX_FRAME_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
@@ -79,10 +79,14 @@ pub(crate) struct TunInterfaceState {
     pub out_octets: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum UpstreamChoice {
-    CurrentPath,
+    Physical {
+        interface_luid: u64,
+        interface_index: u32,
+        interface_alias: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,7 +213,7 @@ pub(crate) fn validate_frame(frame: &Frame) -> Result<(), ProtocolError> {
             config_len,
             config_sha256,
             preflight_sha256,
-            upstream_choice: _,
+            upstream_choice,
         } => {
             version(*protocol_version)?;
             session_id(session)?;
@@ -222,6 +226,24 @@ pub(crate) fn validate_frame(frame: &Frame) -> Result<(), ProtocolError> {
             }
             exact_hex(config_sha256, 64)?;
             exact_hex(preflight_sha256, 64)?;
+            match upstream_choice {
+                UpstreamChoice::Physical {
+                    interface_luid,
+                    interface_index,
+                    interface_alias,
+                } => {
+                    nonzero(*interface_luid)?;
+                    nonzero(*interface_index as u64)?;
+                    if interface_alias.is_empty()
+                        || interface_alias.encode_utf16().count() > 256
+                        || interface_alias.chars().any(char::is_control)
+                    {
+                        return Err(ProtocolError::new(
+                            "helper upstream interface identity is invalid",
+                        ));
+                    }
+                }
+            }
         }
         Frame::Started {
             request_id,
@@ -404,7 +426,11 @@ mod tests {
             config_len: 128,
             config_sha256: "04".repeat(32),
             preflight_sha256: "05".repeat(32),
-            upstream_choice: UpstreamChoice::CurrentPath,
+            upstream_choice: UpstreamChoice::Physical {
+                interface_luid: 7,
+                interface_index: 9,
+                interface_alias: "Ethernet".into(),
+            },
         }
     }
 
@@ -487,6 +513,38 @@ mod tests {
             }),
         })
         .is_err());
+    }
+
+    #[test]
+    fn physical_upstream_identity_is_nonzero_bounded_and_control_free() {
+        let mut frame = start(2);
+        if let Frame::StartTun {
+            upstream_choice:
+                UpstreamChoice::Physical {
+                    interface_luid,
+                    interface_alias,
+                    ..
+                },
+            ..
+        } = &mut frame
+        {
+            *interface_luid = 0;
+            *interface_alias = "Ethernet\nspoofed".into();
+        }
+        assert!(validate_frame(&frame).is_err());
+
+        let mut frame = start(2);
+        if let Frame::StartTun {
+            upstream_choice:
+                UpstreamChoice::Physical {
+                    interface_alias, ..
+                },
+            ..
+        } = &mut frame
+        {
+            *interface_alias = "x".repeat(257);
+        }
+        assert!(validate_frame(&frame).is_err());
     }
 
     #[test]

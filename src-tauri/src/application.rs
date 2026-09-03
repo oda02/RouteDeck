@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::{
         generate_config, generate_socks_bridge_config, CaptureMode, ConfigRequest, SocksBridge,
-        TunSettings,
+        TunSettings, TunUpstream,
     },
     domain::{
         AppRoute, AppRouteAction, DefaultRoute, DnsPolicy, Ipv6Policy, LanPolicy, Node,
@@ -34,7 +34,7 @@ use crate::{
     },
     subscription_store::SubscriptionStore,
     system_proxy::{SystemProxyControl, SystemProxyManager, SystemProxyRestoreOutcome},
-    tun_helper::reconcile_stale_tun_sessions,
+    tun_helper::{reconcile_stale_tun_sessions, select_physical_upstream, TunUpstreamIdentity},
     xray_config::{generate_xray_bridge_config, XrayBridgeRequest},
 };
 
@@ -348,7 +348,28 @@ impl TunPrivilegeControl for PlatformTunPrivilege {
 pub(crate) trait EngineProvider: Send + Sync {
     fn create(&self, kind: EngineKind) -> Result<Box<dyn EngineLauncher>, RuntimeError>;
 
-    fn create_tun(&self) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
+    fn select_tun_upstream(&self) -> Result<TunUpstreamIdentity, RuntimeError> {
+        #[cfg(test)]
+        {
+            Ok(TunUpstreamIdentity {
+                interface_luid: 7,
+                interface_index: 9,
+                interface_alias: "Ethernet".into(),
+            })
+        }
+        #[cfg(not(test))]
+        {
+            Err(RuntimeError::new(
+                "tun_preflight",
+                "TUN provider does not implement physical upstream selection",
+            ))
+        }
+    }
+
+    fn create_tun(
+        &self,
+        _upstream: TunUpstreamIdentity,
+    ) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
         self.create(EngineKind::SingBox)
     }
 }
@@ -362,11 +383,19 @@ impl EngineProvider for FixedEngineProvider {
         Ok(Box::new(VerifiedEngineLauncher::resolve_for(kind)?))
     }
 
-    fn create_tun(&self) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
+    fn select_tun_upstream(&self) -> Result<TunUpstreamIdentity, RuntimeError> {
+        select_physical_upstream()
+    }
+
+    fn create_tun(
+        &self,
+        upstream: TunUpstreamIdentity,
+    ) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
         #[cfg(windows)]
         {
             Ok(Box::new(TunHelperLauncher::resolve(
                 self.expected_tun_helper_sha256,
+                upstream,
             )?))
         }
         #[cfg(not(windows))]
@@ -1765,6 +1794,14 @@ impl ApplicationController {
             RuntimeMode::SystemProxy => CaptureMode::SystemProxy,
             RuntimeMode::Tun => CaptureMode::Tun(TunSettings::default()),
         };
+        let tun_upstream_identity = if mode == RuntimeMode::Tun {
+            Some(self.services.engine.select_tun_upstream()?)
+        } else {
+            None
+        };
+        let tun_upstream = tun_upstream_identity.as_ref().map(|upstream| TunUpstream {
+            interface_alias: upstream.interface_alias.clone(),
+        });
         let request = || ConfigRequest {
             node,
             policy: &policy,
@@ -1773,6 +1810,7 @@ impl ApplicationController {
             health_password: password.clone(),
             vpn_dns: None,
             insecure_approval: None,
+            tun_upstream: tun_upstream.clone(),
         };
         let mut bridge_reservation = None;
         let generated = if reality {
@@ -1799,6 +1837,7 @@ impl ApplicationController {
             let generated = generate_xray_bridge_config(XrayBridgeRequest {
                 node,
                 listen_port: reservation.port(),
+                tun_upstream: tun_upstream.clone(),
             })
             .map_err(|error| RuntimeError::new("generate_config", error.to_string()))?;
             let sidecar = SessionConfig::create(&self.session_root, generated.as_str())?;
@@ -1815,7 +1854,11 @@ impl ApplicationController {
             None,
         );
         let launcher = if mode == RuntimeMode::Tun {
-            self.services.engine.create_tun()?
+            self.services.engine.create_tun(
+                tun_upstream_identity
+                    .clone()
+                    .expect("TUN mode must have a selected physical upstream"),
+            )?
         } else {
             self.services.engine.create(EngineKind::SingBox)?
         };
@@ -3022,7 +3065,10 @@ mod tests {
             }))
         }
 
-        fn create_tun(&self) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
+        fn create_tun(
+            &self,
+            _upstream: TunUpstreamIdentity,
+        ) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
             Ok(Box::new(FakeLauncher {
                 check_fails: self.check_fails,
                 stop_fails: self.stop_fails,
@@ -3158,6 +3204,8 @@ mod tests {
     struct BridgeObservation {
         sing_box: Option<u16>,
         xray: Option<u16>,
+        sing_box_upstream: Option<String>,
+        xray_upstream: Option<String>,
     }
 
     struct DualEngineProvider {
@@ -3240,8 +3288,16 @@ mod tests {
             let mut observation = self.observation.lock().unwrap();
             if self.kind == EngineKind::SingBox {
                 observation.sing_box = Some(bridge);
+                observation.sing_box_upstream = value
+                    .pointer("/dns/servers/0/bind_interface")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
             } else {
                 observation.xray = Some(bridge);
+                observation.xray_upstream = value
+                    .pointer("/outbounds/0/streamSettings/sockopt/interface")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
             }
             if self.fail_check {
                 Err(RuntimeError::new(
@@ -3970,6 +4026,21 @@ mod tests {
         assert!(sing_box_stop < xray_stop);
         assert!(!provider.sing_box_alive.load(Ordering::SeqCst));
         assert!(!provider.xray_alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn reality_tun_populates_the_same_physical_upstream_in_both_engine_configs() {
+        let provider = Arc::new(DualEngineProvider::new());
+        let controller = controller_with_dual_provider(Arc::clone(&provider), true);
+        let node = import_node_from(&controller, REALITY_NODE);
+
+        let error = controller
+            .start_tun(&node, tun_routing(DefaultRoute::Vpn))
+            .unwrap_err();
+        assert_eq!(error.stage, PublicErrorStage::ProveTraffic);
+        let observation = provider.observation.lock().unwrap();
+        assert_eq!(observation.sing_box_upstream.as_deref(), Some("Ethernet"));
+        assert_eq!(observation.xray_upstream.as_deref(), Some("Ethernet"));
     }
 
     #[test]
