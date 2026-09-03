@@ -37,3 +37,37 @@ Next diagnostic work:
    subscription URL, response body, server names, credentials, or personal paths.
 3. If it recurs, capture those diagnostics before restarting and compare them with
    the successful relaunch. Keep the original saved subscription untouched.
+
+## 2026-09-04: HTTPS import DNS argument and proxy-selection failures
+
+This is separate from the unresolved empty-startup-state incident above.
+
+- A read-only diagnostic under the actual interactive Windows account reproduced
+  direct-path import failure before HTTP: `WSAStartup=0`, `GetAddrInfoExW=10022`
+  (`WSAEINVAL`). WinINet per-connection FLAGS and FLAGS_UI reported direct-only while
+  the current manual proxy settings had an enabled, parseable local proxy. RAS was
+  inactive. The same import through that explicitly selected existing local proxy
+  returned HTTP 200; no provider-side workaround was needed.
+- A localhost-only A/B check isolated the DNS call defect: identical name, namespace,
+  and hints with the old synchronous call plus non-NULL timeout returned 10022;
+  changing only timeout to NULL returned success. The corrected asynchronous resolver
+  also resolves localhost successfully without an external endpoint.
+- A follow-up under the interactive account used the corrected production proxy
+  provider automatically, with no manual proxy override: it selected the local proxy
+  despite the informational WinINet flags still reporting direct-only, returned
+  HTTP 200, and parsed 14 nodes with zero rejected entries. The corrected native
+  localhost self-test returned two addresses, both loopback. This was a read-only
+  diagnostic import; it did not replace the saved subscription.
+- The resolver now follows the documented asynchronous callback pattern, with a
+  bounded caller wait and exact-handle cancellation. Callback-owned query buffers,
+  result list, event, Winsock reference, and one of four outstanding-request permits
+  remain alive until native completion, even after timeout or cancellation failure.
+  There is no abandoned worker thread or unbounded cancellation wait.
+- Deterministic tests cover immediate completion/error, callback-before-return,
+  completion during wait/cancellation, late completion, cancellation failure/missing
+  handle, resource release, and the outstanding-request cap. A real localhost-only
+  test covers the Windows API shape. Successful application-level re-import must
+  still be verified in the rebuilt portable; these tests do not establish that the
+  unrelated startup-state incident is fixed.
+
+Windows API reference: [GetAddrInfoExW asynchronous example and cancellation lifetime](https://learn.microsoft.com/en-us/windows/win32/api/ws2tcpip/nf-ws2tcpip-getaddrinfoexw).

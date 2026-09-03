@@ -440,7 +440,10 @@ impl FetchProxyRegistry for WindowsFetchProxyRegistry {
 }
 
 fn decode_fetch_proxy_string(bytes: &[u8]) -> Result<String, SystemProxyError> {
-    if bytes.len() < 2 || bytes.len() > (MAX_PROXY_CONFIG_CHARS + 1) * 2 || !bytes.len().is_multiple_of(2) {
+    if bytes.len() < 2
+        || bytes.len() > (MAX_PROXY_CONFIG_CHARS + 1) * 2
+        || !bytes.len().is_multiple_of(2)
+    {
         return Err(fetch_proxy_error());
     }
     let mut wide = bytes

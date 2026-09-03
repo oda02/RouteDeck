@@ -69,7 +69,9 @@ impl SubscriptionFetcher for HttpsSubscriptionFetcher {
     fn fetch(&self, raw_url: &str) -> Result<String, SubscriptionFetchError> {
         // Reject malformed secret-bearing input before inspecting machine state.
         validate_url(raw_url)?;
-        let proxy = WindowsSystemProxyProvider.current_loopback_proxy();
+        let proxy = WindowsSystemProxyProvider
+            .current_loopback_proxy()
+            .map_err(|_| fetch_error())?;
         fetch_with(
             raw_url,
             &SystemDnsResolver,
@@ -448,98 +450,15 @@ impl DnsResolver for SystemDnsResolver {
 }
 
 #[cfg(windows)]
+#[path = "subscription_windows_dns.rs"]
+mod windows_dns;
+
+#[cfg(windows)]
 fn resolve_windows_dns(
     host: &str,
     timeout: Duration,
 ) -> Result<Vec<IpAddr>, SubscriptionFetchError> {
-    use std::{mem::size_of, os::windows::ffi::OsStrExt, ptr};
-    use windows_sys::Win32::Networking::WinSock::{
-        FreeAddrInfoExW, GetAddrInfoExW, WSACleanup, WSAStartup, ADDRINFOEXW, AF_INET, AF_INET6,
-        AF_UNSPEC, IPPROTO_TCP, NS_DNS, SOCKADDR_IN, SOCKADDR_IN6, SOCK_STREAM, TIMEVAL, WSADATA,
-    };
-
-    struct Winsock;
-    impl Drop for Winsock {
-        fn drop(&mut self) {
-            unsafe { WSACleanup() };
-        }
-    }
-
-    let mut data = WSADATA::default();
-    if unsafe { WSAStartup(0x0202, &mut data) } != 0 {
-        return Err(dns_fetch_error());
-    }
-    let _winsock = Winsock;
-    let wide_host = std::ffi::OsStr::new(host)
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let hints = ADDRINFOEXW {
-        ai_family: AF_UNSPEC as i32,
-        ai_socktype: SOCK_STREAM,
-        ai_protocol: IPPROTO_TCP,
-        ..Default::default()
-    };
-    let mut results = ptr::null_mut();
-    let timeout = TIMEVAL {
-        tv_sec: timeout.as_secs().min(i32::MAX as u64) as i32,
-        tv_usec: timeout.subsec_micros() as i32,
-    };
-    let status = unsafe {
-        GetAddrInfoExW(
-            wide_host.as_ptr(),
-            ptr::null(),
-            NS_DNS,
-            ptr::null(),
-            &hints,
-            &mut results,
-            &timeout,
-            ptr::null(),
-            None,
-            ptr::null_mut(),
-        )
-    };
-    if status != 0 {
-        return Err(windows_dns_error(status));
-    }
-    struct Results(*mut ADDRINFOEXW);
-    impl Drop for Results {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe { FreeAddrInfoExW(self.0) };
-            }
-        }
-    }
-    let _results = Results(results);
-    let mut addresses = Vec::new();
-    let mut current = results;
-    while !current.is_null() {
-        if addresses.len() == MAX_RESOLVED_ADDRESSES {
-            return Err(policy_error(SubscriptionFetchStage::Dns));
-        }
-        let entry = unsafe { &*current };
-        if entry.ai_addr.is_null() {
-            return Err(policy_error(SubscriptionFetchStage::Dns));
-        }
-        match entry.ai_family as u16 {
-            AF_INET if entry.ai_addrlen >= size_of::<SOCKADDR_IN>() => {
-                let address = unsafe { &*entry.ai_addr.cast::<SOCKADDR_IN>() };
-                let bytes = unsafe { address.sin_addr.S_un.S_un_b };
-                addresses.push(IpAddr::V4(Ipv4Addr::new(
-                    bytes.s_b1, bytes.s_b2, bytes.s_b3, bytes.s_b4,
-                )));
-            }
-            AF_INET6 if entry.ai_addrlen >= size_of::<SOCKADDR_IN6>() => {
-                let address = unsafe { &*entry.ai_addr.cast::<SOCKADDR_IN6>() };
-                addresses.push(IpAddr::V6(Ipv6Addr::from(unsafe {
-                    address.sin6_addr.u.Byte
-                })));
-            }
-            _ => return Err(policy_error(SubscriptionFetchStage::Dns)),
-        }
-        current = entry.ai_next;
-    }
-    Ok(addresses)
+    windows_dns::resolve(host, timeout)
 }
 
 #[cfg(windows)]
