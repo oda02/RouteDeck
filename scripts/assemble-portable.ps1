@@ -96,8 +96,12 @@ if ([IO.File]::Exists($target) -or [IO.Directory]::Exists($target)) {
 $manifestPath = Join-Path $build 'routedeck-build.json'
 $manifestItem = Assert-RegularFile $manifestPath 'build manifest'
 $manifest = Get-Content -Raw -LiteralPath $manifestItem.FullName | ConvertFrom-Json
-if ([int] $manifest.schemaVersion -ne 1) {
+if ([int] $manifest.schemaVersion -ne 2) {
   Fail 'unsupported build manifest schema'
+}
+if ([string] $manifest.sourceCommit -cnotmatch '^[0-9a-f]{40}$' -or
+    [string] $manifest.buildMetadata -cne "RouteDeckBuildCommit=$($manifest.sourceCommit)") {
+  Fail 'build manifest source metadata is invalid'
 }
 $files = @($manifest.files)
 if ($files.Count -ne 2) {

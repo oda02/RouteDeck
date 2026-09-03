@@ -12,16 +12,36 @@ $helperPath = Join-Path $releaseRoot 'routedeck-tun-helper.exe'
 $guiPath = Join-Path $releaseRoot 'routedeck.exe'
 $manifestPath = Join-Path $releaseRoot 'routedeck-build.json'
 $hashVariable = 'ROUTEDECK_TUN_HELPER_SHA256'
+$metadataVariable = 'ROUTEDECK_BUILD_METADATA'
 $targetVariable = 'CARGO_TARGET_DIR'
 
-foreach ($command in @('cargo.exe', 'npm.cmd')) {
+foreach ($command in @('cargo.exe', 'npm.cmd', 'git.exe')) {
   if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
     throw "Required build command is unavailable: $command"
   }
 }
 
+$sourceCommit = (& git.exe -C $repoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $sourceCommit -cnotmatch '^[0-9a-f]{40}$') {
+  throw 'Could not resolve the source commit for portable build metadata'
+}
+$trackedChanges = @(& git.exe -C $repoRoot status --porcelain --untracked-files=no)
+if ($LASTEXITCODE -ne 0 -or $trackedChanges.Count -ne 0) {
+  throw 'Portable build metadata requires a clean tracked source tree'
+}
+$buildMetadata = "RouteDeckBuildCommit=$sourceCommit"
+
+function Assert-BuildMetadata([string] $Path) {
+  $binaryText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($Path))
+  if ($binaryText.IndexOf($buildMetadata, [StringComparison]::Ordinal) -lt 0) {
+    throw "Executable does not contain the expected build metadata: $Path"
+  }
+}
+
 $previousTarget = [Environment]::GetEnvironmentVariable($targetVariable, 'Process')
+$previousMetadata = [Environment]::GetEnvironmentVariable($metadataVariable, 'Process')
 [Environment]::SetEnvironmentVariable($targetVariable, $portableTargetRoot, 'Process')
+[Environment]::SetEnvironmentVariable($metadataVariable, $buildMetadata, 'Process')
 try {
 Push-Location $tauriRoot
 try {
@@ -39,6 +59,7 @@ finally {
 if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
   throw 'TUN helper build did not produce the fixed sibling executable'
 }
+Assert-BuildMetadata $helperPath
 $helperHash = (Get-FileHash -LiteralPath $helperPath -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($helperHash -notmatch '^[0-9a-f]{64}$') {
   throw 'TUN helper SHA-256 is invalid'
@@ -78,6 +99,7 @@ finally {
 if (-not (Test-Path -LiteralPath $guiPath -PathType Leaf)) {
   throw 'RouteDeck GUI build did not produce routedeck.exe'
 }
+Assert-BuildMetadata $guiPath
 $postBuildHash = (Get-FileHash -LiteralPath $helperPath -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($postBuildHash -cne $helperHash) {
   throw 'TUN helper changed after its SHA-256 was embedded in the GUI build'
@@ -86,7 +108,9 @@ $guiItem = Get-Item -LiteralPath $guiPath -Force
 $helperItem = Get-Item -LiteralPath $helperPath -Force
 $guiHash = (Get-FileHash -LiteralPath $guiPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $manifest = [ordered] @{
-  schemaVersion = 1
+  schemaVersion = 2
+  sourceCommit = $sourceCommit
+  buildMetadata = $buildMetadata
   files = @(
     [ordered] @{
       path = 'routedeck.exe'
@@ -112,6 +136,7 @@ $result = [pscustomobject]@{
 }
 finally {
   [Environment]::SetEnvironmentVariable($targetVariable, $previousTarget, 'Process')
+  [Environment]::SetEnvironmentVariable($metadataVariable, $previousMetadata, 'Process')
 }
 
 $result
