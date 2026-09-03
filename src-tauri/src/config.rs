@@ -32,6 +32,11 @@ pub struct TunSettings {
     pub ipv6_address: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunUpstream {
+    pub interface_alias: String,
+}
+
 impl Default for TunSettings {
     fn default() -> Self {
         Self {
@@ -49,6 +54,7 @@ pub struct ConfigRequest<'a> {
     pub health_password: String,
     pub vpn_dns: Option<VpnDnsServer>,
     pub insecure_approval: Option<&'a InsecureApproval>,
+    pub tun_upstream: Option<TunUpstream>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +131,12 @@ fn generate_config_with_selected(
     selected_override: Option<Value>,
 ) -> Result<GeneratedConfig, ConfigError> {
     validate_request(&request)?;
+    let selected_is_socks_bridge = selected_override.is_some();
+    let tun_upstream_alias = request
+        .tun_upstream
+        .as_ref()
+        .map(validated_tun_interface_alias)
+        .transpose()?;
     let tun_own_prefixes = match &request.mode {
         CaptureMode::Tun(settings) => {
             let mut prefixes = vec![canonical_tun_prefix(&settings.ipv4_address)?];
@@ -186,7 +198,16 @@ fn generate_config_with_selected(
         Some(selected) => selected,
         None => selected_outbound(request.node)?,
     };
-    let mut dns_servers = vec![json!({ "type": "local", "tag": "bootstrap" })];
+    let mut bootstrap_dns = json!({ "type": "local", "tag": "bootstrap" });
+    if selected_is_socks_bridge {
+        if let Some(interface_alias) = tun_upstream_alias {
+            bootstrap_dns
+                .as_object_mut()
+                .expect("generated DNS server must be an object")
+                .insert("bind_interface".into(), json!(interface_alias));
+        }
+    }
+    let mut dns_servers = vec![bootstrap_dns];
     let dns_final = match request.policy.dns {
         DnsPolicy::CurrentNetwork => "bootstrap",
         DnsPolicy::Vpn => {
@@ -248,11 +269,24 @@ fn generate_config_with_selected(
         "final": default_outbound(request.policy.default),
         "default_domain_resolver": "bootstrap"
     });
-    if matches!(request.mode, CaptureMode::Tun(_)) {
+    if matches!(request.mode, CaptureMode::Tun(_)) && !selected_is_socks_bridge {
         route
             .as_object_mut()
             .expect("generated route must be an object")
-            .insert("auto_detect_interface".into(), json!(true));
+            .insert(
+                "default_interface".into(),
+                json!(tun_upstream_alias.expect("validated TUN mode must have an upstream")),
+            );
+    }
+
+    let mut direct = json!({ "type": "direct", "tag": "direct" });
+    if selected_is_socks_bridge {
+        if let Some(interface_alias) = tun_upstream_alias {
+            direct
+                .as_object_mut()
+                .expect("generated direct outbound must be an object")
+                .insert("bind_interface".into(), json!(interface_alias));
+        }
     }
 
     let root = json!({
@@ -265,12 +299,17 @@ fn generate_config_with_selected(
             "strategy": if request.policy.ipv6 == Ipv6Policy::Enabled { "prefer_ipv4" } else { "ipv4_only" }
         },
         "inbounds": inbounds,
-        "outbounds": [selected, { "type": "direct", "tag": "direct" }],
+        "outbounds": [selected, direct],
         "route": route
     });
     validate_no_direct_health(&root)?;
     if let Some(prefixes) = &tun_own_prefixes {
         validate_tun_own_prefix_guard(&root, prefixes)?;
+        validate_tun_upstream_binding(
+            &root,
+            tun_upstream_alias.expect("validated TUN mode must have an upstream"),
+            selected_is_socks_bridge,
+        )?;
     }
     let text = serde_json::to_string_pretty(&root)
         .map_err(|_| ConfigError::new("could not serialize generated configuration"))?;
@@ -420,6 +459,68 @@ fn validate_tun_own_prefix_guard(
     Ok(())
 }
 
+fn validate_tun_upstream_binding(
+    config: &Value,
+    expected_alias: &str,
+    socks_bridge: bool,
+) -> Result<(), ConfigError> {
+    let route = config
+        .get("route")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ConfigError::new("generated configuration has no route"))?;
+    if route.contains_key("auto_detect_interface") {
+        return Err(ConfigError::new(
+            "TUN upstream must be sealed before automatic route mutation",
+        ));
+    }
+    let outbounds = config
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ConfigError::new("generated configuration has no outbounds"))?;
+    let selected = outbounds
+        .iter()
+        .find(|outbound| outbound.get("tag").and_then(Value::as_str) == Some("selected"))
+        .ok_or_else(|| ConfigError::new("generated configuration has no selected outbound"))?;
+    let direct = outbounds
+        .iter()
+        .find(|outbound| outbound.get("tag").and_then(Value::as_str) == Some("direct"))
+        .ok_or_else(|| ConfigError::new("generated configuration has no direct outbound"))?;
+    let bootstrap = config
+        .pointer("/dns/servers")
+        .and_then(Value::as_array)
+        .and_then(|servers| {
+            servers
+                .iter()
+                .find(|server| server.get("tag").and_then(Value::as_str) == Some("bootstrap"))
+        })
+        .ok_or_else(|| ConfigError::new("generated configuration has no bootstrap DNS server"))?;
+
+    if socks_bridge {
+        let selected_is_unbound_loopback = selected.get("type").and_then(Value::as_str)
+            == Some("socks")
+            && selected.get("server").and_then(Value::as_str) == Some("127.0.0.1")
+            && selected.get("bind_interface").is_none();
+        if !selected_is_unbound_loopback
+            || route.get("default_interface").is_some()
+            || direct.get("bind_interface").and_then(Value::as_str) != Some(expected_alias)
+            || bootstrap.get("bind_interface").and_then(Value::as_str) != Some(expected_alias)
+        {
+            return Err(ConfigError::new(
+                "TUN SOCKS bridge does not preserve loopback and physical bindings",
+            ));
+        }
+    } else if route.get("default_interface").and_then(Value::as_str) != Some(expected_alias)
+        || selected.get("bind_interface").is_some()
+        || direct.get("bind_interface").is_some()
+        || bootstrap.get("bind_interface").is_some()
+    {
+        return Err(ConfigError::new(
+            "native TUN outbounds are not sealed to the physical interface",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_request(request: &ConfigRequest<'_>) -> Result<(), ConfigError> {
     if request.node.requires_insecure_approval()
         && !request
@@ -454,6 +555,11 @@ fn validate_request(request: &ConfigRequest<'_>) -> Result<(), ConfigError> {
         ));
     }
     if let CaptureMode::Tun(settings) = &request.mode {
+        let upstream = request
+            .tun_upstream
+            .as_ref()
+            .ok_or_else(|| ConfigError::new("TUN physical upstream is required"))?;
+        validated_tun_interface_alias(upstream)?;
         validate_tun_address(&settings.ipv4_address, false)?;
         if request.policy.ipv6 == Ipv6Policy::Enabled {
             let address = settings
@@ -462,6 +568,10 @@ fn validate_request(request: &ConfigRequest<'_>) -> Result<(), ConfigError> {
                 .ok_or_else(|| ConfigError::new("IPv6 TUN address is required"))?;
             validate_tun_address(address, true)?;
         }
+    } else if request.tun_upstream.is_some() {
+        return Err(ConfigError::new(
+            "physical upstream binding is only valid in TUN mode",
+        ));
     }
     if let Some(dns) = &request.vpn_dns {
         if dns.server_name.is_empty()
@@ -474,6 +584,19 @@ fn validate_request(request: &ConfigRequest<'_>) -> Result<(), ConfigError> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn validated_tun_interface_alias(upstream: &TunUpstream) -> Result<&str, ConfigError> {
+    let alias = upstream.interface_alias.as_str();
+    if alias.is_empty()
+        || alias.trim() != alias
+        || alias.encode_utf16().count() > 256
+        || alias.chars().any(char::is_control)
+        || alias.eq_ignore_ascii_case("RouteDeck")
+    {
+        return Err(ConfigError::new("TUN physical interface alias is invalid"));
+    }
+    Ok(alias)
 }
 
 fn validate_tun_address(value: &str, ipv6: bool) -> Result<(), ConfigError> {
@@ -728,6 +851,13 @@ mod tests {
             health_password: "fixture-health-secret".into(),
             vpn_dns: None,
             insecure_approval: None,
+            tun_upstream: None,
+        }
+    }
+
+    fn tun_upstream(interface_alias: &str) -> TunUpstream {
+        TunUpstream {
+            interface_alias: interface_alias.into(),
         }
     }
 
@@ -873,6 +1003,11 @@ mod tests {
         assert!(!generated.as_str().contains("example.test"));
         assert!(value.pointer("/outbounds/0/username").is_none());
         assert!(value.pointer("/outbounds/0/password").is_none());
+        assert!(value.pointer("/route/default_interface").is_none());
+        assert!(value.pointer("/route/auto_detect_interface").is_none());
+        assert!(value.pointer("/outbounds/0/bind_interface").is_none());
+        assert!(value.pointer("/outbounds/1/bind_interface").is_none());
+        assert!(value.pointer("/dns/servers/0/bind_interface").is_none());
     }
 
     #[test]
@@ -960,6 +1095,11 @@ mod tests {
             value.pointer("/route/final").and_then(Value::as_str),
             Some("direct")
         );
+        assert!(value.pointer("/route/default_interface").is_none());
+        assert!(value.pointer("/route/auto_detect_interface").is_none());
+        assert!(value.pointer("/outbounds/0/bind_interface").is_none());
+        assert!(value.pointer("/outbounds/1/bind_interface").is_none());
+        assert!(value.pointer("/dns/servers/0/bind_interface").is_none());
     }
 
     #[test]
@@ -1083,6 +1223,7 @@ mod tests {
         let policy = policy(DefaultRoute::Vpn);
         let mut request = request(&node, &policy);
         request.mode = CaptureMode::Tun(TunSettings::default());
+        request.tun_upstream = Some(tun_upstream("Ethernet"));
         let config = generate_config(request).unwrap();
         let value: Value = serde_json::from_str(config.as_str()).unwrap();
         assert_eq!(
@@ -1092,12 +1233,20 @@ mod tests {
             Some("RouteDeck")
         );
         assert!(value.pointer("/inbounds/3/dns_mode").is_none());
+        assert!(value.pointer("/route/auto_detect_interface").is_none());
         assert_eq!(
             value
-                .pointer("/route/auto_detect_interface")
-                .and_then(Value::as_bool),
-            Some(true)
+                .pointer("/route/default_interface")
+                .and_then(Value::as_str),
+            Some("Ethernet")
         );
+        for pointer in [
+            "/outbounds/0/bind_interface",
+            "/outbounds/1/bind_interface",
+            "/dns/servers/0/bind_interface",
+        ] {
+            assert!(value.pointer(pointer).is_none(), "unexpected {pointer}");
+        }
         let own_prefix_guard = value.pointer("/route/rules/2").unwrap();
         assert_eq!(
             own_prefix_guard.get("ip_cidr").and_then(Value::as_array),
@@ -1114,11 +1263,137 @@ mod tests {
     }
 
     #[test]
+    fn native_naive_tun_uses_the_sealed_route_interface() {
+        let node = node("naive+quic://fixture-user:fixture-pass@example.test:443");
+        let policy = policy(DefaultRoute::Vpn);
+        let mut config_request = request(&node, &policy);
+        config_request.mode = CaptureMode::Tun(TunSettings::default());
+        config_request.tun_upstream = Some(tun_upstream("Wi-Fi 2"));
+        let value: Value =
+            serde_json::from_str(generate_config(config_request).unwrap().as_str()).unwrap();
+
+        assert_eq!(
+            value.pointer("/outbounds/0/type").and_then(Value::as_str),
+            Some("naive")
+        );
+        assert_eq!(
+            value
+                .pointer("/route/default_interface")
+                .and_then(Value::as_str),
+            Some("Wi-Fi 2")
+        );
+        assert!(value.pointer("/route/auto_detect_interface").is_none());
+        validate_tun_upstream_binding(&value, "Wi-Fi 2", false).unwrap();
+    }
+
+    #[test]
+    fn reality_tun_keeps_loopback_unbound_and_binds_physical_egress() {
+        let node = node(
+            "vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&type=tcp&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2",
+        );
+        let policy = policy(DefaultRoute::Vpn);
+        let mut config_request = request(&node, &policy);
+        config_request.mode = CaptureMode::Tun(TunSettings::default());
+        config_request.tun_upstream = Some(tun_upstream("Ethernet 3"));
+        let value: Value = serde_json::from_str(
+            generate_socks_bridge_config(config_request, SocksBridge { server_port: 19090 })
+                .unwrap()
+                .as_str(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            value.pointer("/outbounds/0/type").and_then(Value::as_str),
+            Some("socks")
+        );
+        assert_eq!(
+            value.pointer("/outbounds/0/server").and_then(Value::as_str),
+            Some("127.0.0.1")
+        );
+        assert!(value.pointer("/outbounds/0/bind_interface").is_none());
+        assert_eq!(
+            value
+                .pointer("/outbounds/1/bind_interface")
+                .and_then(Value::as_str),
+            Some("Ethernet 3")
+        );
+        assert_eq!(
+            value
+                .pointer("/dns/servers/0/bind_interface")
+                .and_then(Value::as_str),
+            Some("Ethernet 3")
+        );
+        assert!(value.pointer("/route/default_interface").is_none());
+        assert!(value.pointer("/route/auto_detect_interface").is_none());
+        validate_tun_upstream_binding(&value, "Ethernet 3", true).unwrap();
+    }
+
+    #[test]
+    fn tun_upstream_validator_rejects_mutated_native_and_bridge_bindings() {
+        let hy2_node = node("hysteria2://fixture-password@example.test:443?sni=example.test");
+        let policy = policy(DefaultRoute::Vpn);
+        let mut native_request = request(&hy2_node, &policy);
+        native_request.mode = CaptureMode::Tun(TunSettings::default());
+        native_request.tun_upstream = Some(tun_upstream("Ethernet"));
+        let native = generate_config(native_request).unwrap();
+        let mut native_value: Value = serde_json::from_str(native.as_str()).unwrap();
+        native_value["route"]["default_interface"] = json!("Wi-Fi");
+        assert!(validate_tun_upstream_binding(&native_value, "Ethernet", false).is_err());
+        native_value["route"]["default_interface"] = json!("Ethernet");
+        native_value["route"]["auto_detect_interface"] = json!(true);
+        assert!(validate_tun_upstream_binding(&native_value, "Ethernet", false).is_err());
+
+        let reality = node(
+            "vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&type=tcp&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2",
+        );
+        let mut bridge_request = request(&reality, &policy);
+        bridge_request.mode = CaptureMode::Tun(TunSettings::default());
+        bridge_request.tun_upstream = Some(tun_upstream("Ethernet"));
+        let bridge =
+            generate_socks_bridge_config(bridge_request, SocksBridge { server_port: 19090 })
+                .unwrap();
+        let mut bridge_value: Value = serde_json::from_str(bridge.as_str()).unwrap();
+        bridge_value["outbounds"][0]["bind_interface"] = json!("Ethernet");
+        assert!(validate_tun_upstream_binding(&bridge_value, "Ethernet", true).is_err());
+        bridge_value["outbounds"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("bind_interface");
+        bridge_value["dns"]["servers"][0]["bind_interface"] = json!("Wi-Fi");
+        assert!(validate_tun_upstream_binding(&bridge_value, "Ethernet", true).is_err());
+    }
+
+    #[test]
+    fn upstream_binding_is_required_only_for_tun_and_aliases_are_strict() {
+        let node = node("hysteria2://fixture-password@example.test:443?sni=example.test");
+        let policy = policy(DefaultRoute::Vpn);
+        let mut missing = request(&node, &policy);
+        missing.mode = CaptureMode::Tun(TunSettings::default());
+        assert!(generate_config(missing).is_err());
+
+        for invalid in ["", " Ethernet", "Ethernet ", "RouteDeck", "bad\nname"] {
+            let mut invalid_request = request(&node, &policy);
+            invalid_request.mode = CaptureMode::Tun(TunSettings::default());
+            invalid_request.tun_upstream = Some(tun_upstream(invalid));
+            assert!(
+                generate_config(invalid_request).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+
+        let mut proxy_request = request(&node, &policy);
+        proxy_request.mode = CaptureMode::SystemProxy;
+        proxy_request.tun_upstream = Some(tun_upstream("Ethernet"));
+        assert!(generate_config(proxy_request).is_err());
+    }
+
+    #[test]
     fn tun_own_prefix_guard_is_structurally_required_after_dns_hijack() {
         let node = node("hysteria2://fixture-password@example.test:443?sni=example.test");
         let policy = policy(DefaultRoute::Vpn);
         let mut config_request = request(&node, &policy);
         config_request.mode = CaptureMode::Tun(TunSettings::default());
+        config_request.tun_upstream = Some(tun_upstream("Wi-Fi"));
         let generated = generate_config(config_request).unwrap();
         let mut value: Value = serde_json::from_str(generated.as_str()).unwrap();
         let expected = vec![
@@ -1147,6 +1422,7 @@ mod tests {
             ipv4_address: "10.7.5.9/24".into(),
             ipv6_address: Some("fdfe:dcba:9876::1/126".into()),
         });
+        config_request.tun_upstream = Some(tun_upstream("Wi-Fi"));
         let value: Value =
             serde_json::from_str(generate_config(config_request).unwrap().as_str()).unwrap();
 
@@ -1170,6 +1446,7 @@ mod tests {
             ipv4_address: "203.0.113.1/30".into(),
             ipv6_address: Some("fdfe:dcba:9876::1/126".into()),
         });
+        public.tun_upstream = Some(tun_upstream("Ethernet"));
         assert!(generate_config(public).is_err());
     }
 
@@ -1232,6 +1509,7 @@ mod tests {
         });
         let mut config_request = request(&node, &policy);
         config_request.mode = CaptureMode::Tun(TunSettings::default());
+        config_request.tun_upstream = Some(tun_upstream("Ethernet"));
         let value: Value =
             serde_json::from_str(generate_config(config_request).unwrap().as_str()).unwrap();
         let rules = value.pointer("/route/rules").unwrap().as_array().unwrap();

@@ -2,11 +2,13 @@ use std::fmt;
 
 use serde_json::{json, Map, Value};
 
+use crate::config::{validated_tun_interface_alias, TunUpstream};
 use crate::domain::{Node, NodeProtocol, PacketEncoding, Secret, VlessFlow, VlessTransport};
 
 pub struct XrayBridgeRequest<'a> {
     pub node: &'a Node,
     pub listen_port: u16,
+    pub tun_upstream: Option<TunUpstream>,
 }
 
 pub struct GeneratedXrayConfig(String);
@@ -57,6 +59,12 @@ pub fn generate_xray_bridge_config(
     if request.listen_port == 0 {
         return Err(XrayConfigError::new("Xray bridge port must be non-zero"));
     }
+    let tun_upstream_alias = request
+        .tun_upstream
+        .as_ref()
+        .map(validated_tun_interface_alias)
+        .transpose()
+        .map_err(|_| XrayConfigError::new("Xray physical interface alias is invalid"))?;
     let NodeProtocol::Vless(vless) = request.node.protocol() else {
         return Err(XrayConfigError::new(
             "Xray bridge requires a VLESS REALITY node",
@@ -152,6 +160,9 @@ pub fn generate_xray_bridge_config(
             );
         }
     }
+    if let Some(interface_alias) = tun_upstream_alias {
+        stream.insert("sockopt".into(), json!({ "interface": interface_alias }));
+    }
 
     let root = json!({
         // Xray reports remote REALITY/VLESS handshake failures at Info. The launcher captures
@@ -175,9 +186,33 @@ pub fn generate_xray_bridge_config(
             "streamSettings": Value::Object(stream)
         }]
     });
+    validate_xray_upstream_binding(&root, tun_upstream_alias)?;
     serde_json::to_string_pretty(&root)
         .map(GeneratedXrayConfig)
         .map_err(|_| XrayConfigError::new("could not serialize Xray configuration"))
+}
+
+fn validate_xray_upstream_binding(
+    config: &Value,
+    expected_alias: Option<&str>,
+) -> Result<(), XrayConfigError> {
+    let actual = config
+        .pointer("/outbounds/0/streamSettings/sockopt/interface")
+        .and_then(Value::as_str);
+    if actual != expected_alias {
+        return Err(XrayConfigError::new(
+            "Xray selected outbound physical binding is invalid",
+        ));
+    }
+    if config
+        .pointer("/inbounds/0/streamSettings/sockopt/interface")
+        .is_some()
+    {
+        return Err(XrayConfigError::new(
+            "Xray loopback bridge inbound must remain unbound",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -198,6 +233,7 @@ mod tests {
         generate_xray_bridge_config(XrayBridgeRequest {
             node,
             listen_port: 19191,
+            tun_upstream: None,
         })
         .unwrap()
     }
@@ -264,6 +300,55 @@ mod tests {
     }
 
     #[test]
+    fn tun_reality_binds_only_the_selected_xray_outbound() {
+        let public_key = "abcdefghijklmnopqrstuvwxyzABCDEFGH123456789";
+        let node = node(&format!(
+            "vless://11111111-2222-3333-4444-555555555555@example.test:443?encryption=none&security=reality&type=tcp&sni=cover.test&fp=chrome&pbk={public_key}&sid=a1b2#Reality"
+        ));
+        let generated = generate_xray_bridge_config(XrayBridgeRequest {
+            node: &node,
+            listen_port: 19191,
+            tun_upstream: Some(TunUpstream {
+                interface_alias: "Wi-Fi 2".into(),
+            }),
+        })
+        .unwrap();
+        let value: Value = serde_json::from_str(generated.as_str()).unwrap();
+
+        assert_eq!(
+            value
+                .pointer("/outbounds/0/streamSettings/sockopt/interface")
+                .and_then(Value::as_str),
+            Some("Wi-Fi 2")
+        );
+        assert!(value
+            .pointer("/inbounds/0/streamSettings/sockopt")
+            .is_none());
+        validate_xray_upstream_binding(&value, Some("Wi-Fi 2")).unwrap();
+    }
+
+    #[test]
+    fn xray_upstream_validator_rejects_alias_mismatch_and_loopback_binding() {
+        let public_key = "abcdefghijklmnopqrstuvwxyzABCDEFGH123456789";
+        let node = node(&format!(
+            "vless://11111111-2222-3333-4444-555555555555@example.test:443?encryption=none&security=reality&type=tcp&sni=cover.test&fp=chrome&pbk={public_key}&sid=a1b2#Reality"
+        ));
+        let generated = generate_xray_bridge_config(XrayBridgeRequest {
+            node: &node,
+            listen_port: 19191,
+            tun_upstream: Some(TunUpstream {
+                interface_alias: "Ethernet".into(),
+            }),
+        })
+        .unwrap();
+        let mut value: Value = serde_json::from_str(generated.as_str()).unwrap();
+
+        assert!(validate_xray_upstream_binding(&value, Some("Wi-Fi")).is_err());
+        value["inbounds"][0]["streamSettings"] = json!({ "sockopt": { "interface": "Ethernet" } });
+        assert!(validate_xray_upstream_binding(&value, Some("Ethernet")).is_err());
+    }
+
+    #[test]
     fn maps_websocket_and_grpc_transports_without_extra_outbounds() {
         let ws = node("vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&type=ws&path=%2Fsocket&host=cdn.test&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2");
         let grpc = node("vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&type=grpc&serviceName=route&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2");
@@ -311,6 +396,7 @@ mod tests {
         assert!(generate_xray_bridge_config(XrayBridgeRequest {
             node: &unsupported,
             listen_port: 19191,
+            tun_upstream: None,
         })
         .is_err());
 
@@ -334,12 +420,14 @@ mod tests {
         assert!(generate_xray_bridge_config(XrayBridgeRequest {
             node: &tls,
             listen_port: 19191,
+            tun_upstream: None,
         })
         .is_err());
         let reality = node("vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&type=tcp&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2");
         assert!(generate_xray_bridge_config(XrayBridgeRequest {
             node: &reality,
             listen_port: 0,
+            tun_upstream: None,
         })
         .is_err());
     }
