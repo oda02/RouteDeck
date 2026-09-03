@@ -341,23 +341,178 @@ impl LoopbackProxyEndpoint {
 }
 
 pub(crate) trait SystemProxyProvider: Send + Sync {
-    fn current_loopback_proxy(&self) -> Option<LoopbackProxyEndpoint>;
+    fn current_loopback_proxy(&self) -> Result<Option<LoopbackProxyEndpoint>, SystemProxyError>;
 }
 
 pub(crate) struct WindowsSystemProxyProvider;
 
 impl SystemProxyProvider for WindowsSystemProxyProvider {
-    fn current_loopback_proxy(&self) -> Option<LoopbackProxyEndpoint> {
+    fn current_loopback_proxy(&self) -> Result<Option<LoopbackProxyEndpoint>, SystemProxyError> {
         #[cfg(windows)]
         {
-            let mut state = query_wininet_state().ok()?;
-            state.ras_active = query_ras_active().unwrap_or(true);
-            select_loopback_proxy(state)
+            if query_ras_active().map_err(|_| fetch_proxy_error())? {
+                return Ok(None);
+            }
+            // Some VPN clients update the flat manual settings while WinInet's
+            // per-connection flags remain stale. This read-only fetch path must
+            // not change the ownership snapshots used by SystemProxyManager.
+            match read_manual_fetch_proxy(&WindowsFetchProxyRegistry)? {
+                ManualFetchProxy::Disabled => Ok(None),
+                ManualFetchProxy::Enabled(endpoint) => Ok(Some(endpoint)),
+                ManualFetchProxy::Absent => {
+                    let state = query_wininet_state().map_err(|_| fetch_proxy_error())?;
+                    Ok(select_loopback_proxy(state))
+                }
+            }
         }
         #[cfg(not(windows))]
         {
-            None
+            Ok(None)
         }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FetchProxyScope {
+    User,
+    Machine,
+}
+
+enum ManualFetchProxy {
+    Absent,
+    Disabled,
+    Enabled(LoopbackProxyEndpoint),
+}
+
+trait FetchProxyRegistry {
+    fn policy(&self) -> Result<Option<u32>, SystemProxyError>;
+    fn enabled(&self, scope: FetchProxyScope) -> Result<Option<u32>, SystemProxyError>;
+    fn server(&self, scope: FetchProxyScope) -> Result<Option<String>, SystemProxyError>;
+}
+
+fn fetch_proxy_error() -> SystemProxyError {
+    SystemProxyError("could not read the current manual proxy configuration")
+}
+
+fn read_manual_fetch_proxy(
+    registry: &impl FetchProxyRegistry,
+) -> Result<ManualFetchProxy, SystemProxyError> {
+    let scope = match registry.policy()? {
+        Some(0) => FetchProxyScope::Machine,
+        None | Some(1) => FetchProxyScope::User,
+        Some(_) => return Err(fetch_proxy_error()),
+    };
+    match registry.enabled(scope)? {
+        // Explicitly disabled must not revive a stale WinInet proxy value.
+        Some(0) => Ok(ManualFetchProxy::Disabled),
+        Some(1) => {
+            let server = registry.server(scope)?.ok_or_else(fetch_proxy_error)?;
+            let endpoint = parse_proxy_server(&server).ok_or_else(fetch_proxy_error)?;
+            Ok(ManualFetchProxy::Enabled(endpoint))
+        }
+        Some(_) => Err(fetch_proxy_error()),
+        // A machine policy must never fall back to another user's settings.
+        None if scope == FetchProxyScope::Machine => Ok(ManualFetchProxy::Disabled),
+        None => Ok(ManualFetchProxy::Absent),
+    }
+}
+
+#[cfg(windows)]
+struct WindowsFetchProxyRegistry;
+
+#[cfg(windows)]
+impl FetchProxyRegistry for WindowsFetchProxyRegistry {
+    fn policy(&self) -> Result<Option<u32>, SystemProxyError> {
+        read_fetch_registry_dword(FetchProxyScope::Machine, true, "ProxySettingsPerUser")
+    }
+
+    fn enabled(&self, scope: FetchProxyScope) -> Result<Option<u32>, SystemProxyError> {
+        read_fetch_registry_dword(scope, false, "ProxyEnable")
+    }
+
+    fn server(&self, scope: FetchProxyScope) -> Result<Option<String>, SystemProxyError> {
+        use windows_sys::Win32::System::Registry::RRF_RT_REG_SZ;
+        let Some(bytes) = read_fetch_registry(scope, false, "ProxyServer", RRF_RT_REG_SZ)? else {
+            return Ok(None);
+        };
+        decode_fetch_proxy_string(&bytes).map(Some)
+    }
+}
+
+fn decode_fetch_proxy_string(bytes: &[u8]) -> Result<String, SystemProxyError> {
+    if bytes.len() < 2 || bytes.len() > (MAX_PROXY_CONFIG_CHARS + 1) * 2 || !bytes.len().is_multiple_of(2) {
+        return Err(fetch_proxy_error());
+    }
+    let mut wide = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    if wide.pop() != Some(0) || wide.contains(&0) {
+        return Err(fetch_proxy_error());
+    }
+    String::from_utf16(&wide).map_err(|_| fetch_proxy_error())
+}
+
+#[cfg(windows)]
+fn read_fetch_registry_dword(
+    scope: FetchProxyScope,
+    policy: bool,
+    name: &str,
+) -> Result<Option<u32>, SystemProxyError> {
+    use windows_sys::Win32::System::Registry::RRF_RT_REG_DWORD;
+    read_fetch_registry(scope, policy, name, RRF_RT_REG_DWORD)?
+        .map(|bytes| {
+            let bytes: [u8; 4] = bytes.try_into().map_err(|_| fetch_proxy_error())?;
+            Ok(u32::from_le_bytes(bytes))
+        })
+        .transpose()
+}
+
+#[cfg(windows)]
+fn read_fetch_registry(
+    scope: FetchProxyScope,
+    policy: bool,
+    name: &str,
+    flags: u32,
+) -> Result<Option<Vec<u8>>, SystemProxyError> {
+    use std::ptr;
+    use windows_sys::Win32::{
+        Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS},
+        System::Registry::{RegGetValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE},
+    };
+    let root = match scope {
+        FetchProxyScope::User => HKEY_CURRENT_USER,
+        FetchProxyScope::Machine => HKEY_LOCAL_MACHINE,
+    };
+    let path = if policy {
+        "Software\\Policies\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
+    } else {
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
+    };
+    let path = path.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let name = name.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let mut bytes = vec![0u8; (MAX_PROXY_CONFIG_CHARS + 1) * 2];
+    let mut length = bytes.len() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            path.as_ptr(),
+            name.as_ptr(),
+            flags,
+            ptr::null_mut(),
+            bytes.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    match status {
+        ERROR_SUCCESS if length as usize <= bytes.len() => {
+            bytes.truncate(length as usize);
+            Ok(Some(bytes))
+        }
+        ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(None),
+        _ => Err(fetch_proxy_error()),
     }
 }
 
@@ -720,6 +875,143 @@ mod tests {
             flags,
             proxy_server: proxy_server.map(str::to_owned),
             ras_active: false,
+        }
+    }
+
+    struct FakeFetchRegistry {
+        policy: Result<Option<u32>, SystemProxyError>,
+        user_enabled: Option<u32>,
+        machine_enabled: Option<u32>,
+        server: Option<String>,
+        expected_scope: FetchProxyScope,
+    }
+
+    impl FetchProxyRegistry for FakeFetchRegistry {
+        fn policy(&self) -> Result<Option<u32>, SystemProxyError> {
+            self.policy.clone()
+        }
+        fn enabled(&self, scope: FetchProxyScope) -> Result<Option<u32>, SystemProxyError> {
+            assert!(scope == self.expected_scope);
+            Ok(match scope {
+                FetchProxyScope::User => self.user_enabled,
+                FetchProxyScope::Machine => self.machine_enabled,
+            })
+        }
+        fn server(&self, scope: FetchProxyScope) -> Result<Option<String>, SystemProxyError> {
+            assert!(scope == self.expected_scope);
+            Ok(self.server.clone())
+        }
+    }
+
+    fn fetch_registry(enabled: Option<u32>, server: Option<&str>) -> FakeFetchRegistry {
+        FakeFetchRegistry {
+            policy: Ok(None),
+            user_enabled: enabled,
+            machine_enabled: None,
+            server: server.map(str::to_owned),
+            expected_scope: FetchProxyScope::User,
+        }
+    }
+
+    #[test]
+    fn fetch_manual_setting_is_authoritative_even_when_wininet_flags_are_stale() {
+        let enabled = fetch_registry(Some(1), Some("127.0.0.1:10808"));
+        // DIRECT-only WinInet flags are irrelevant when flat settings exist.
+        let stale = state(PROXY_TYPE_DIRECT_VALUE, Some("127.0.0.1:10808"));
+        assert!(select_loopback_proxy(stale).is_none());
+        let ManualFetchProxy::Enabled(endpoint) = read_manual_fetch_proxy(&enabled).unwrap() else {
+            panic!("manual proxy was not selected");
+        };
+        assert_eq!(endpoint.http_url(), "http://127.0.0.1:10808");
+
+        let disabled = fetch_registry(Some(0), Some("127.0.0.1:10808"));
+        assert!(matches!(
+            read_manual_fetch_proxy(&disabled).unwrap(),
+            ManualFetchProxy::Disabled
+        ));
+        let stale = state(PROXY_TYPE_PROXY_VALUE, Some("127.0.0.1:10808"));
+        assert!(select_loopback_proxy(stale).is_some());
+    }
+
+    #[test]
+    fn fetch_machine_policy_never_uses_user_manual_settings() {
+        let mut registry = fetch_registry(Some(1), Some("127.0.0.1:10808"));
+        registry.policy = Ok(Some(0));
+        registry.expected_scope = FetchProxyScope::Machine;
+        for machine_enabled in [None, Some(0)] {
+            registry.machine_enabled = machine_enabled;
+            assert!(matches!(
+                read_manual_fetch_proxy(&registry).unwrap(),
+                ManualFetchProxy::Disabled
+            ));
+        }
+        registry.user_enabled = Some(0);
+        registry.machine_enabled = Some(1);
+        assert!(matches!(
+            read_manual_fetch_proxy(&registry).unwrap(),
+            ManualFetchProxy::Enabled(_)
+        ));
+        registry.policy = Ok(Some(1));
+        registry.expected_scope = FetchProxyScope::User;
+        assert!(matches!(
+            read_manual_fetch_proxy(&registry).unwrap(),
+            ManualFetchProxy::Disabled
+        ));
+    }
+
+    #[test]
+    fn fetch_missing_disabled_and_invalid_settings_remain_distinct() {
+        assert!(matches!(
+            read_manual_fetch_proxy(&fetch_registry(None, None)).unwrap(),
+            ManualFetchProxy::Absent
+        ));
+        assert!(matches!(
+            read_manual_fetch_proxy(&fetch_registry(Some(0), None)).unwrap(),
+            ManualFetchProxy::Disabled
+        ));
+        for server in [
+            None,
+            Some(""),
+            Some("8.8.8.8:8080"),
+            Some("user:token@127.0.0.1:8080"),
+            Some("127.0.0.1:0"),
+            Some("127.0.0.1:8080\r\n"),
+        ] {
+            assert!(read_manual_fetch_proxy(&fetch_registry(Some(1), server)).is_err());
+        }
+        assert!(read_manual_fetch_proxy(&fetch_registry(Some(7), Some("127.0.0.1:8080"))).is_err());
+        let mut registry = fetch_registry(Some(1), Some("127.0.0.1:8080"));
+        registry.policy = Err(fetch_proxy_error());
+        assert!(read_manual_fetch_proxy(&registry).is_err());
+        registry.policy = Ok(Some(7));
+        assert!(read_manual_fetch_proxy(&registry).is_err());
+        registry.policy = Ok(None);
+        registry.server = Some("x".repeat(MAX_PROXY_CONFIG_CHARS + 1));
+        assert!(read_manual_fetch_proxy(&registry).is_err());
+    }
+
+    #[test]
+    fn fetch_registry_string_decoding_is_bounded_and_strict() {
+        let encode = |value: &str| {
+            value
+                .encode_utf16()
+                .chain(Some(0))
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            decode_fetch_proxy_string(&encode("127.0.0.1:8080")).unwrap(),
+            "127.0.0.1:8080"
+        );
+        for bytes in [
+            vec![],
+            vec![0],
+            vec![1, 0],
+            vec![0, 0, 0, 0],
+            vec![0, 0xd8, 0, 0],
+            vec![0; (MAX_PROXY_CONFIG_CHARS + 2) * 2],
+        ] {
+            assert!(decode_fetch_proxy_string(&bytes).is_err());
         }
     }
 
