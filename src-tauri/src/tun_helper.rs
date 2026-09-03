@@ -1308,6 +1308,12 @@ mod windows {
                 "protected TUN physical upstream binding is invalid",
             ));
         }
+        crate::config::validate_tun_dns_hijack(&root).map_err(|_| {
+            RuntimeError::new(
+                "tun_helper_config",
+                "protected TUN DNS port hijack is missing or ambiguous",
+            )
+        })?;
         Ok(expected_families)
     }
 
@@ -2907,7 +2913,10 @@ mod windows {
                     {"type":"hysteria2","tag":"selected"},
                     {"type":"direct","tag":"direct"}
                 ],
-                "route": {"default_interface":"Ethernet"}
+                "route": {"default_interface":"Ethernet","rules":[
+                    {"inbound":["health-in"],"action":"route","outbound":"selected"},
+                    {"inbound":["tun-in"],"network":["tcp","udp"],"port":53,"action":"hijack-dns"}
+                ]}
             });
             assert_eq!(
                 validate_tun_config(&valid.to_string(), "Ethernet").unwrap(),
@@ -2917,6 +2926,19 @@ mod windows {
                 }
             );
             let mut dual = valid.clone();
+            let mut legacy_dns = valid.clone();
+            legacy_dns["route"]["rules"][1] =
+                serde_json::json!({"inbound":["tun-in"],"protocol":"dns","action":"hijack-dns"});
+            assert!(validate_tun_config(&legacy_dns.to_string(), "Ethernet").is_err());
+            let mut narrowed_dns = valid.clone();
+            narrowed_dns["route"]["rules"][1]["protocol"] = serde_json::json!("dns");
+            assert!(validate_tun_config(&narrowed_dns.to_string(), "Ethernet").is_err());
+            let mut reordered_dns = valid.clone();
+            reordered_dns["route"]["rules"]
+                .as_array_mut()
+                .unwrap()
+                .swap(0, 1);
+            assert!(validate_tun_config(&reordered_dns.to_string(), "Ethernet").is_err());
             dual["inbounds"][1]["address"] =
                 serde_json::json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"]);
             assert_eq!(
@@ -2955,7 +2977,10 @@ mod windows {
                     {"type":"socks","tag":"selected","server":"127.0.0.1","server_port":19090},
                     {"type":"direct","tag":"direct","bind_interface":"Ethernet"}
                 ],
-                "route": {}
+                "route": {"rules":[
+                    {"inbound":["health-in"],"action":"route","outbound":"selected"},
+                    {"inbound":["tun-in"],"network":["tcp","udp"],"port":53,"action":"hijack-dns"}
+                ]}
             });
             assert!(validate_tun_config(&bridge.to_string(), "Ethernet").is_ok());
             let mut remote_bridge = bridge.clone();

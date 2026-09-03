@@ -71,3 +71,70 @@ This is separate from the unresolved empty-startup-state incident above.
   unrelated startup-state incident is fixed.
 
 Windows API reference: [GetAddrInfoExW asynchronous example and cancellation lifetime](https://learn.microsoft.com/en-us/windows/win32/api/ws2tcpip/nf-ws2tcpip-getaddrinfoexw).
+
+## 2026-09-04: TUN VLESS startup proof fails after the tunnel transition
+
+Status: **a concrete DNS-routing defect is identified; live TUN recovery is not yet verified**.
+
+Confirmed observations on portable source `9b74499`:
+
+- The selected VLESS REALITY node failed the first private-health HTTPS proof after
+  TUN startup. The ordinary unproxied TUN proof had not run. Xray's sanitized log
+  showed the loopback SOCKS request reaching its selected outbound and starting the
+  remote TCP dial; this does not distinguish DNS lookup, TCP connect, and REALITY
+  handshake completion.
+- The saved endpoint was a hostname. A read-only lookup outside RouteDeck TUN found
+  one real IPv4 address, not a fake-IP address. Separate TCP connection controls with
+  the original route and an explicitly bound physical interface both succeeded.
+- A disposable diagnostic using the current parser/config generator, pinned Xray,
+  an ephemeral loopback SOCKS listener, and the fixed HTTPS proof endpoint compared
+  three paths without enabling TUN or changing Windows settings. Hostname/unbound
+  timed out; hostname/physical-bound and frozen-IPv4/physical-bound both returned
+  HTTP 204. The frozen case retained the original REALITY server name. These results
+  establish that the selected VLESS credentials and bound physical path can work;
+  they do not establish that TUN works or prove why the unbound control timed out.
+- Each diagnostic child was stopped and its protected temporary session removed.
+  No subscription contents, endpoints, credentials, personal paths, or captured IPs
+  were written into this incident record.
+
+Source-confirmed defect and focused change:
+
+- The generated DNS rule matched `protocol: dns`, but there was no preceding sniff
+  action. The pinned TUN inbound creates initially unclassified metadata. Its router
+  only performs protocol sniffing for a matched sniff action, and the protocol matcher
+  compares that metadata field. Consequently raw DNS to the TUN virtual DNS address
+  misses the DNS rule and reaches the subsequent own-prefix drop rule.
+- Match TCP and UDP destination port 53 on `tun-in` directly, after the private-health
+  rule and before the own-prefix guard. Keep the guard, physical binding, DNS policy,
+  and System Proxy behavior unchanged. The elevated validator rejects the obsolete
+  protocol-only shape and extra narrowing conditions.
+- Do not attribute this defect to sing-box `local` DNS automatically recursing into
+  its own TUN. The pinned Windows resolver excludes its registered own interfaces;
+  its DNS exchanges use the configured dialer. It can still enumerate DNS servers on
+  other eligible adapters, so interface binding is not equivalent to selecting only
+  that adapter's DNS list. No resolver-policy expansion is part of this fix.
+
+An opt-in loopback-only data-plane regression using pinned sing-box 1.13.21 confirmed
+the behavior with a local fake DNS responder and no TUN or Windows settings changes:
+
+| Generated rule under test | UDP DNS answer | TCP DNS answer | Upstream fixture requests |
+| --- | --- | --- | --- |
+| Old protocol-only DNS selector, destination port 53 | No | No | 0 |
+| New TCP/UDP port 53 selector, destination port 53 | Yes | Yes | 2 |
+| New selector, destination port 54 control | No | No | 0 |
+
+Every fixture child stopped and every protected temporary session was removed. The
+reproducible opt-in example is `src-tauri/examples/diagnose_dns_hijack.rs`; it uses only
+fixture names/addresses and never loads the saved subscription. Unit tests additionally
+reject the old selector, extra protocol predicates, altered scope/port, and wrong order.
+
+Remaining acceptance gate: test the rebuilt application on the user-authorized TUN
+path. Require both selected-outbound HTTPS and actual TUN traffic proof, followed by
+verified owned-state cleanup. Neither the no-TUN baseline nor the loopback regression
+establishes successful live TUN operation.
+
+Pinned source references: [TUN inbound metadata](https://github.com/SagerNet/sing-box/blob/v1.13.21/protocol/tun/inbound.go),
+[route/sniff execution](https://github.com/SagerNet/sing-box/blob/v1.13.21/route/route.go),
+[protocol matcher](https://github.com/SagerNet/sing-box/blob/v1.13.21/route/rule/rule_item_protocol.go),
+[Windows local DNS selection](https://github.com/SagerNet/sing-box/blob/v1.13.21/dns/transport/local/resolv_windows.go),
+[local DNS exchanges](https://github.com/SagerNet/sing-box/blob/v1.13.21/dns/transport/local/local_shared.go).

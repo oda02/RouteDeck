@@ -235,7 +235,9 @@ fn generate_config_with_selected(
     // This must stay first: it makes an end-to-end probe structurally incapable of direct fallback.
     rules.push(json!({ "inbound": ["health-in"], "action": "route", "outbound": "selected" }));
     if matches!(request.mode, CaptureMode::Tun(_)) {
-        rules.push(json!({ "inbound": ["tun-in"], "protocol": "dns", "action": "hijack-dns" }));
+        // TUN metadata has no sniffed protocol at pre-match time. Match the DNS port
+        // directly so Windows DNS to the virtual gateway is handled before its own-prefix drop.
+        rules.push(tun_dns_hijack_rule());
         rules.push(json!({
             "inbound": ["tun-in"],
             "ip_cidr": tun_own_prefixes
@@ -385,6 +387,19 @@ pub fn validate_no_direct_health(config: &Value) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn tun_dns_hijack_rule() -> Value {
+    json!({ "inbound": ["tun-in"], "network": ["tcp", "udp"], "port": 53, "action": "hijack-dns" })
+}
+
+pub(crate) fn validate_tun_dns_hijack(config: &Value) -> Result<(), ConfigError> {
+    if config.pointer("/route/rules/1") != Some(&tun_dns_hijack_rule()) {
+        return Err(ConfigError::new(
+            "TUN TCP/UDP port 53 DNS hijack must precede the own-prefix guard",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_tun_own_prefix_guard(
     config: &Value,
     expected_prefixes: &[String],
@@ -419,17 +434,7 @@ fn validate_tun_own_prefix_guard(
         .pointer("/route/rules")
         .and_then(Value::as_array)
         .ok_or_else(|| ConfigError::new("generated configuration has no route rules"))?;
-    let dns_rule = rules
-        .get(1)
-        .ok_or_else(|| ConfigError::new("TUN DNS hijack rule is missing"))?;
-    if dns_rule.pointer("/inbound/0").and_then(Value::as_str) != Some("tun-in")
-        || dns_rule.get("protocol").and_then(Value::as_str) != Some("dns")
-        || dns_rule.get("action").and_then(Value::as_str) != Some("hijack-dns")
-    {
-        return Err(ConfigError::new(
-            "TUN DNS hijack must precede the own-prefix guard",
-        ));
-    }
+    validate_tun_dns_hijack(config)?;
     let guard = rules
         .get(2)
         .ok_or_else(|| ConfigError::new("TUN own-prefix guard is missing"))?;
@@ -1410,6 +1415,56 @@ mod tests {
         value["route"]["rules"][2]["ip_cidr"] = json!(["172.19.0.0/30", "fdfe:dcba:9876::/126"]);
         value["inbounds"][3]["address"][0] = json!("10.9.0.1/30");
         assert!(validate_tun_own_prefix_guard(&value, &expected).is_err());
+    }
+
+    #[test]
+    fn tun_dns_hijack_uses_port_without_sniff_for_both_networks_and_families() {
+        let node = node("hysteria2://fixture-password@example.test:443?sni=example.test");
+        for ipv6 in [Ipv6Policy::Disabled, Ipv6Policy::Enabled] {
+            for default in [DefaultRoute::Direct, DefaultRoute::Vpn] {
+                let mut policy = policy(default);
+                policy.ipv6 = ipv6;
+                let mut config_request = request(&node, &policy);
+                config_request.mode = CaptureMode::Tun(TunSettings::default());
+                config_request.tun_upstream = Some(tun_upstream("Ethernet"));
+                let generated = generate_config(config_request).unwrap();
+                let value: Value = serde_json::from_str(generated.as_str()).unwrap();
+                validate_tun_dns_hijack(&value).unwrap();
+                assert_eq!(value["route"]["rules"][0]["outbound"], "selected");
+                assert_eq!(value["route"]["rules"][1]["network"], json!(["tcp", "udp"]));
+                assert_eq!(value["route"]["rules"][1]["port"], 53);
+                assert!(value["route"]["rules"][1].get("protocol").is_none());
+                assert_eq!(value["route"]["rules"][2]["method"], "drop");
+                assert!(value["route"]["rules"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|rule| rule["action"] != "sniff"));
+            }
+        }
+    }
+
+    #[test]
+    fn tun_dns_validator_rejects_sniff_dependency_and_scope_or_order_mutations() {
+        let valid = json!({"route":{"rules":[{},tun_dns_hijack_rule(),{}]}});
+        validate_tun_dns_hijack(&valid).unwrap();
+        for invalid_rule in [
+            json!({"inbound":["tun-in"],"protocol":"dns","action":"hijack-dns"}),
+            json!({"inbound":["tun-in"],"network":["tcp","udp"],"port":53,"protocol":"dns","action":"hijack-dns"}),
+            json!({"inbound":["tun-in","http-in"],"network":["tcp","udp"],"port":53,"action":"hijack-dns"}),
+            json!({"inbound":["tun-in"],"network":["udp"],"port":53,"action":"hijack-dns"}),
+            json!({"inbound":["tun-in"],"network":["tcp","udp"],"port":54,"action":"hijack-dns"}),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["route"]["rules"][1] = invalid_rule;
+            assert!(validate_tun_dns_hijack(&invalid).is_err());
+        }
+        let mut reordered = valid;
+        reordered["route"]["rules"]
+            .as_array_mut()
+            .unwrap()
+            .swap(1, 2);
+        assert!(validate_tun_dns_hijack(&reordered).is_err());
     }
 
     #[test]
