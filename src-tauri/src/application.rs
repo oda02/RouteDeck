@@ -1709,6 +1709,7 @@ impl ApplicationController {
             .as_mut()
             .and_then(|active| active.child.stop().err())
         {
+            self.record_runtime_failure(&stop_error, &redactor);
             let public = public_runtime_error(stop_error, &redactor);
             state.recovery_required = true;
             self.update_status(
@@ -1991,11 +1992,35 @@ impl ApplicationController {
         if matches!(mode, RuntimeMode::LocalOnly | RuntimeMode::SystemProxy) {
             self.services.prober.prove_ordinary(ports.http)?;
         } else if mode == RuntimeMode::Tun {
+            // Selected outbound success and system capture are separate facts:
+            // a later TUN failure must not leave the completed HTTPS proof pending.
+            Self::set_proof(
+                state,
+                ProofKind::SelectedOutboundHttps,
+                ProofState::Passed,
+                Some(selected_proof.latency_ms),
+            );
+            Self::set_proof(
+                state,
+                ProofKind::LocalScopeOwnership,
+                ProofState::Pending,
+                None,
+            );
             let active = state
                 .active
                 .as_mut()
                 .expect("provisional TUN session disappeared");
-            prove_tun_capture(self.services.prober.as_ref(), active.child.as_mut())?;
+            if let Err(error) =
+                prove_tun_capture(self.services.prober.as_ref(), active.child.as_mut())
+            {
+                Self::set_proof(
+                    state,
+                    ProofKind::LocalScopeOwnership,
+                    ProofState::Failed,
+                    None,
+                );
+                return Err(error);
+            }
         }
         Self::set_proof(
             state,
@@ -2683,6 +2708,9 @@ impl ApplicationController {
             "start_engine" | "engine_process" => {
                 Self::set_proof(state, ProofKind::EngineProcess, ProofState::Failed, None);
             }
+            stage if is_safe_helper_start_stage(stage) => {
+                Self::set_proof(state, ProofKind::EngineProcess, ProofState::Failed, None);
+            }
             "verify_listeners" => {
                 for kind in [
                     ProofKind::HttpListener,
@@ -2696,6 +2724,12 @@ impl ApplicationController {
             "prove_traffic" => Self::set_proof(
                 state,
                 ProofKind::SelectedOutboundHttps,
+                ProofState::Failed,
+                None,
+            ),
+            "tun_capture" => Self::set_proof(
+                state,
+                ProofKind::LocalScopeOwnership,
                 ProofState::Failed,
                 None,
             ),
@@ -2896,18 +2930,19 @@ fn prove_tun_capture(
 
 fn public_runtime_error(error: RuntimeError, redactor: &Redactor) -> PublicError {
     let stage = public_stage(error.stage());
-    let detail = matches!(
-        stage,
-        PublicErrorStage::Start
-            | PublicErrorStage::ConfigCheck
-            | PublicErrorStage::VerifyListeners
-            | PublicErrorStage::ProveTraffic
-            | PublicErrorStage::EngineProcess
-            | PublicErrorStage::StopEngine
-            | PublicErrorStage::SystemProxyPublish
-            | PublicErrorStage::SystemProxyRestore
-            | PublicErrorStage::SystemProxyOwnership
-    )
+    let detail = (is_safe_helper_start_stage(error.stage())
+        || matches!(
+            stage,
+            PublicErrorStage::Start
+                | PublicErrorStage::ConfigCheck
+                | PublicErrorStage::VerifyListeners
+                | PublicErrorStage::ProveTraffic
+                | PublicErrorStage::EngineProcess
+                | PublicErrorStage::StopEngine
+                | PublicErrorStage::SystemProxyPublish
+                | PublicErrorStage::SystemProxyRestore
+                | PublicErrorStage::SystemProxyOwnership
+        ))
     .then(|| redactor.redact(error.message()));
     PublicError {
         code: PublicErrorCode::RuntimeFailure,
@@ -2917,8 +2952,24 @@ fn public_runtime_error(error: RuntimeError, redactor: &Redactor) -> PublicError
     }
 }
 
+// These reviewed helper paths emit helper/Windows diagnostics, not arbitrary
+// engine stderr; their detail still passes through the redactor. Keep this exact
+// allowlist separate from generic start_engine errors, whose detail stays hidden.
+fn is_safe_helper_start_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        "tun_helper_pipe"
+            | "tun_helper_protocol"
+            | "tun_helper_identity"
+            | "tun_helper_launch"
+            | "tun_helper_start"
+            | "tun_helper_exit"
+    )
+}
+
 fn public_stage(stage: &str) -> PublicErrorStage {
     match stage {
+        stage if is_safe_helper_start_stage(stage) => PublicErrorStage::StartEngine,
         "session_recovery" => PublicErrorStage::SessionRecovery,
         "tun_uac_cancelled" | "tun_preflight" => PublicErrorStage::Start,
         "generate_config" => PublicErrorStage::GenerateConfig,
@@ -4990,6 +5041,125 @@ mod tests {
         assert_eq!(
             public.detail.as_deref(),
             Some("TUN permission request was cancelled")
+        );
+    }
+
+    #[test]
+    fn helper_start_failures_preserve_redacted_detail_and_fail_only_engine_proof() {
+        for stage in [
+            "tun_helper_pipe",
+            "tun_helper_protocol",
+            "tun_helper_identity",
+            "tun_helper_launch",
+            "tun_helper_start",
+            "tun_helper_exit",
+        ] {
+            let (controller, _, _) = controller_with_tun(true, true, false);
+            let mut state = controller.lock_state();
+            ApplicationController::set_proof(
+                &mut state,
+                ProofKind::EngineConfig,
+                ProofState::Passed,
+                None,
+            );
+            ApplicationController::mark_failed_proof(&mut state, stage);
+            let proof = |kind| {
+                state
+                    .status
+                    .proofs
+                    .iter()
+                    .find(|row| row.kind == kind)
+                    .unwrap()
+                    .state
+            };
+            assert_eq!(proof(ProofKind::EngineProcess), ProofState::Failed);
+            assert_eq!(proof(ProofKind::EngineConfig), ProofState::Passed);
+            assert_eq!(proof(ProofKind::SelectedOutboundHttps), ProofState::NotRun);
+            assert_eq!(proof(ProofKind::LocalScopeOwnership), ProofState::NotRun);
+
+            let public = public_runtime_error(
+                RuntimeError::new(
+                    stage,
+                    "fixed helper failure (Windows error 232); password=fixture-secret",
+                ),
+                &Redactor::default().with_secret("fixture-secret"),
+            );
+            assert_eq!(public.stage, PublicErrorStage::StartEngine);
+            let detail = public.detail.unwrap();
+            assert!(detail.contains("Windows error 232"));
+            assert!(!detail.contains("fixture-secret"));
+        }
+        for stage in ["start_engine", "tun_helper_unreviewed"] {
+            let public = public_runtime_error(
+                RuntimeError::new(stage, "arbitrary raw process stderr"),
+                &Redactor::default(),
+            );
+            assert!(public.detail.is_none());
+        }
+    }
+
+    #[test]
+    fn tun_capture_failure_preserves_successful_selected_https_proof() {
+        struct CaptureFailProber;
+        impl TrafficProber for CaptureFailProber {
+            fn prove(&self, _route: &HealthRoute) -> Result<ProofResult, RuntimeError> {
+                Ok(ProofResult { latency_ms: 42 })
+            }
+            fn prove_tun_capture(&self) -> Result<ProofResult, RuntimeError> {
+                Err(RuntimeError::new(
+                    "tun_capture",
+                    "fixture TUN capture failed",
+                ))
+            }
+        }
+        let (mut controller, stops, alive) = controller_with_tun(true, true, false);
+        controller.services.prober = Arc::new(CaptureFailProber);
+        let node = import_node(&controller);
+        let error = controller
+            .start_tun(&node, tun_routing(DefaultRoute::Vpn))
+            .unwrap_err();
+        assert_eq!(error.stage, PublicErrorStage::ProveTraffic);
+        let status = controller.status();
+        assert_eq!(status.phase, RuntimePhase::DisconnectedWithError);
+        let selected = status
+            .proofs
+            .iter()
+            .find(|row| row.kind == ProofKind::SelectedOutboundHttps)
+            .unwrap();
+        assert_eq!(selected.state, ProofState::Passed);
+        assert_eq!(selected.latency_ms, Some(42));
+        assert_eq!(
+            status
+                .proofs
+                .iter()
+                .find(|row| row.kind == ProofKind::LocalScopeOwnership)
+                .unwrap()
+                .state,
+            ProofState::Failed
+        );
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert!(!alive.load(Ordering::SeqCst));
+        assert_eq!(
+            controller.diagnostics().lines,
+            vec!["tun_capture: fixture TUN capture failed"]
+        );
+    }
+
+    #[test]
+    fn tun_failed_start_retains_first_error_and_separate_cleanup_failure() {
+        let (controller, _, _) = controller_with_tun(true, false, true);
+        let node = import_node(&controller);
+        let error = controller
+            .start_tun(&node, tun_routing(DefaultRoute::Vpn))
+            .unwrap_err();
+        assert_eq!(error.stage, PublicErrorStage::StopEngine);
+        assert_eq!(controller.status().phase, RuntimePhase::RecoveryRequired);
+        assert_eq!(
+            controller.diagnostics().lines,
+            vec![
+                "prove_traffic: fixture selected outbound failed",
+                "stop_engine: fixture process refused to stop",
+            ]
         );
     }
 
