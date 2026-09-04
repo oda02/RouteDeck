@@ -142,3 +142,13 @@ Endpoint address freezing is an optional, independently justified bootstrap tech
 - [ ] Confirm System Proxy remains working.
 
 Until these gates pass, describe the build as a test build with TUN unverified. Successful unit tests, a DNS fixture, a VLESS sidecar proof, or a clean installation must never be presented as successful end-to-end TUN.
+
+## Implemented slice and current verification (2026-09-04)
+
+The current implementation extracts helper transport into a separate module with bounded overlapped I/O, cancellation-safe operation ownership, fail-closed incomplete frames, and an idle wait distinct from the frame deadline. Bootstrap diagnostics distinguish finite early helper-exit causes and verify that the pipe peer is the exact launched process. The handshake-only `--diagnose-tun-helper` command does not send `StartTun` or configure networking; it checks bootstrap and the exact child's exit after closing its channel.
+
+Application diagnostics now expose reviewed helper bootstrap stages, preserve successful selected-outbound HTTPS evidence when capture fails, and retain the first failure plus any later cleanup failure as separate diagnostic lines. Structured primary/cleanup UI fields and the complete TunSession separation remain planned, not finished.
+
+Reported checks for this slice: 233 Rust tests passed, including 10 local IPC tests; Rust formatting and Clippy passed. The frontend suite passed 48 tests in this work cycle. The three pinned-engine localhost DNS cases were repeated and passed. These are separate checks, not proof that every hostile fixture listed above or the release gates are complete.
+
+The reason for the user's latest error 232 and successful actual Windows TUN capture remain unverified. Keep those checklist items open until a traced live attempt establishes the result; System Proxy routing and the active v2rayN configuration are not changed by this slice.
