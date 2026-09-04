@@ -149,6 +149,6 @@ The current implementation extracts helper transport into a separate module with
 
 Application diagnostics now expose reviewed helper bootstrap stages, preserve successful selected-outbound HTTPS evidence when capture fails, and retain the first failure plus any later cleanup failure as separate diagnostic lines. Structured primary/cleanup UI fields and the complete TunSession separation remain planned, not finished.
 
-Reported checks for this slice: 233 Rust tests passed, including 10 local IPC tests; Rust formatting and Clippy passed. The frontend suite passed 48 tests in this work cycle. The three pinned-engine localhost DNS cases were repeated and passed. These are separate checks, not proof that every hostile fixture listed above or the release gates are complete.
+Reported checks for this slice: 233 Rust tests passed, including 10 local IPC tests; Rust formatting and Clippy passed. The frontend suite passed 48 tests in this work cycle. The three pinned-engine localhost DNS cases were repeated and passed. See the [incident backlog](runtime-incident-backlog.md) for the implementation and test record. These are separate checks, not proof that every hostile fixture listed above or the release gates are complete.
 
 The reason for the user's latest error 232 and successful actual Windows TUN capture remain unverified. Keep those checklist items open until a traced live attempt establishes the result; System Proxy routing and the active v2rayN configuration are not changed by this slice.
