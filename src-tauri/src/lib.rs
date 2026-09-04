@@ -14,6 +14,8 @@ mod system_proxy;
 pub mod tun_helper;
 mod tun_helper_protocol;
 #[cfg(windows)]
+mod tun_helper_transport;
+#[cfg(windows)]
 mod windows_process;
 pub mod xray_config;
 

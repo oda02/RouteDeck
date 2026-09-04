@@ -138,3 +138,48 @@ Pinned source references: [TUN inbound metadata](https://github.com/SagerNet/sin
 [protocol matcher](https://github.com/SagerNet/sing-box/blob/v1.13.21/route/rule/rule_item_protocol.go),
 [Windows local DNS selection](https://github.com/SagerNet/sing-box/blob/v1.13.21/dns/transport/local/resolv_windows.go),
 [local DNS exchanges](https://github.com/SagerNet/sing-box/blob/v1.13.21/dns/transport/local/local_shared.go).
+
+## 2026-09-04: elevated helper disconnects during activation
+
+Status: **the observed helper exit cause remains unknown; control-plane diagnostics
+and bounded transport are added, not a claim of recovered live TUN connectivity**.
+
+- A later live attempt stopped before sing-box/TUN startup with named-pipe Windows
+  error 232 (`ERROR_NO_DATA`). The Xray sidecar had started. This is a different
+  failure phase from the earlier selected-outbound HTTPS timeout.
+- Local named-pipe tests reproduce 232 when a client connects and closes before
+  server acceptance. On this Windows build an unconnected NOWAIT pipe returned
+  `ERROR_PIPE_LISTENING`; the documented available-to-connect success behavior was
+  not reproduced. Neither result identifies why the actual elevated helper exited.
+  Client handles opened with CreateFile use blocking wait mode by default; inheriting
+  the server's NOWAIT mode is not an established cause.
+- Helper IPC now uses overlapped PIPE_WAIT handles with bounded connects and whole-
+  frame deadlines. Partial reads/writes cannot reset the frame deadline. An incomplete
+  operation closes/poisons its transport, with exact-operation cancellation. A single
+  reaper retains native buffers, OVERLAPPED, event and duplicated handle until native
+  completion. At most eight active or cancel-pending operations are retained; no
+  unbounded per-request worker is created. Healthy established-session idle does not
+  expire a frame deadline: the deadline starts with the first byte, while verified
+  parent-process death and pipe closure remain observable.
+- Authentication still requires the fixed verified helper image, exact launched
+  process PID, pipe peer PID, process creation time and protocol/session handshake.
+  Parent validation is not relaxed. Finite helper exit codes distinguish pipe-server
+  PID lookup, parent open/creation/image checks, same-directory/name checks, nonce
+  creation and Hello write. The GUI may report that finite exit reason instead of a
+  secondary pipe error; no arbitrary native error text, paths or subscription data
+  are exposed. Running-channel failures retain the engine-process stage rather than
+  being mislabeled as startup failures.
+- The exact GUI-only `--diagnose-tun-helper` switch performs the existing elevated
+  helper/Hello authentication without reading configuration or subscription data,
+  inspecting routes, sending a challenge or sending StartTun. It closes the channel
+  and waits at most eight seconds for that exact child to exit. Output is a finite
+  handshake result and safe failure category. It still invokes standard Windows UAC
+  and is therefore an explicit, reviewed manual diagnostic, not an automatic test.
+- Local unprivileged tests cover pending/already-connected acceptance, early close,
+  prefix/body deadlines, blocked writes, malformed frame size, idle/parent exit,
+  cancellation failure with late completion, bounded permits and poisoned reuse.
+  These tests never start a VPN or change Windows networking. Live handshake and
+  subsequent end-to-end TUN acceptance remain pending user-authorized testing.
+
+Windows references: [ConnectNamedPipe return semantics](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-connectnamedpipe),
+[named-pipe client default wait mode](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-client).

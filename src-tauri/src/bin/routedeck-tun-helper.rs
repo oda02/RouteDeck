@@ -5,7 +5,7 @@ fn main() {
     std::hint::black_box(
         option_env!("ROUTEDECK_BUILD_METADATA").unwrap_or("RouteDeckBuildCommit=unrecorded"),
     );
-    if routedeck_lib::tun_helper::helper_main().is_err() {
-        std::process::exit(1);
+    if let Err(code) = routedeck_lib::tun_helper::helper_main() {
+        std::process::exit(code);
     }
 }

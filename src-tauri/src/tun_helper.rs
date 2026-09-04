@@ -30,9 +30,8 @@ mod windows {
     use windows_sys::Win32::{
         Foundation::{
             CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS,
-            ERROR_BUFFER_OVERFLOW, ERROR_CANCELLED, ERROR_INVALID_PARAMETER, ERROR_PIPE_CONNECTED,
-            ERROR_PIPE_LISTENING, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-            WAIT_OBJECT_0, WAIT_TIMEOUT,
+            ERROR_BUFFER_OVERFLOW, ERROR_CANCELLED, ERROR_INVALID_PARAMETER, GENERIC_READ,
+            GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         NetworkManagement::IpHelper::{
             FreeMibTable, GetAdaptersAddresses, GetBestRoute2, GetIfEntry2, GetIpForwardTable2,
@@ -54,20 +53,19 @@ mod windows {
         },
         Storage::FileSystem::{
             CreateFileW, GetFinalPathNameByHandleW, FILE_ATTRIBUTE_REPARSE_POINT,
-            FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_NAME_NORMALIZED, FILE_SHARE_READ, OPEN_EXISTING,
-            PIPE_ACCESS_DUPLEX, VOLUME_NAME_DOS,
+            FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_NAME_NORMALIZED,
+            FILE_SHARE_READ, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, VOLUME_NAME_DOS,
         },
         System::{
             Pipes::{
-                ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
-                GetNamedPipeServerProcessId, SetNamedPipeHandleState, WaitNamedPipeW, PIPE_NOWAIT,
-                PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+                CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
+                WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
                 PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
             },
             Threading::{
-                GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess,
-                QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_DUP_HANDLE,
-                PROCESS_QUERY_LIMITED_INFORMATION,
+                GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, GetProcessId,
+                GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject,
+                PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION,
             },
         },
         UI::Shell::{
@@ -84,10 +82,11 @@ mod windows {
         },
         redaction::Redactor,
         tun_helper_protocol::{
-            exact_hex, pipe_suffix, read_frame, session_id, write_frame, CleanupState, Frame,
-            HelperFailureCode, HelperPhase, ServerState, TunInterfaceState, UpstreamChoice,
-            MAX_CONFIG_BYTES, PROTOCOL_VERSION,
+            exact_hex, pipe_suffix, session_id, CleanupState, Frame, HelperFailureCode,
+            HelperPhase, ServerState, TunInterfaceState, UpstreamChoice, MAX_CONFIG_BYTES,
+            PROTOCOL_VERSION,
         },
+        tun_helper_transport::{read_frame, write_frame, PipeTransport, TransportError},
     };
 
     const HELPER_FILE_NAME: &str = "routedeck-tun-helper.exe";
@@ -217,11 +216,14 @@ mod windows {
         let parent_created = process_creation_time(unsafe { GetCurrentProcess() })?;
         let arguments = helper_arguments(&session, &suffix, parent_pid, parent_created)?;
         let helper_process = shell_execute_runas(&helper_path, &arguments)?;
-        connect_helper(&pipe, &helper_process)?;
-        let helper_pid = pipe_client_pid(&pipe)?;
+        connect_helper(&mut pipe, &helper_process)?;
+        let helper_pid =
+            pipe_client_pid(&pipe).map_err(|error| helper_exit_or(&helper_process, error))?;
+        verify_launched_peer_pid(helper_pid, unsafe { GetProcessId(helper_process.raw()) })?;
         let actual_helper_created = process_creation_time(helper_process.raw())?;
 
-        let hello = read_frame(&mut pipe).map_err(protocol_runtime_error)?;
+        let hello =
+            read_frame(&mut pipe).map_err(|error| helper_exit_or(&helper_process, error.into()))?;
         let (hello_nonce, claimed_pid, claimed_created) = match hello {
             Frame::HelperHello {
                 protocol_version: _,
@@ -276,7 +278,8 @@ mod windows {
             },
         )
         .map_err(protocol_runtime_error)?;
-        let response = read_frame(&mut pipe).map_err(protocol_runtime_error)?;
+        let response =
+            read_frame(&mut pipe).map_err(|error| helper_exit_or(&helper_process, error.into()))?;
         match response {
             Frame::Started {
                 request_id: 2,
@@ -300,7 +303,7 @@ mod windows {
                 match code {
                     HelperFailureCode::PreflightConflict => "tun_preflight",
                     HelperFailureCode::CaptureInvalid => "tun_capture",
-                    _ => "start_engine",
+                    _ => "tun_helper_start",
                 },
                 safe_detail.unwrap_or_else(|| "elevated TUN helper rejected startup".into()),
             )),
@@ -309,6 +312,97 @@ mod windows {
                 "TUN helper returned an unexpected startup response",
             )),
         }
+    }
+
+    // Explicit GUI-only control-plane diagnostic. It deliberately sends no challenge
+    // or StartTun frame and never reads configuration, subscription, adapter or routes.
+    pub fn diagnose_helper_handshake(expected_helper_sha256: Option<&str>) -> Result<(), String> {
+        diagnose_helper_handshake_inner(expected_helper_sha256).map_err(|error| {
+            match error.stage() {
+                "tun_helper_exit" | "tun_helper_pipe" | "tun_helper_launch" => {
+                    format!("stage={} cause={}", error.stage(), error.message())
+                }
+                "tun_helper_protocol" => {
+                    "stage=tun_helper_protocol cause=helper authentication frame rejected".into()
+                }
+                "tun_helper_identity" => {
+                    "stage=tun_helper_identity cause=helper image or process identity rejected"
+                        .into()
+                }
+                _ => "stage=tun_helper_start cause=control-plane diagnostic could not start".into(),
+            }
+        })
+    }
+
+    fn diagnose_helper_handshake_inner(
+        expected_helper_sha256: Option<&str>,
+    ) -> Result<(), RuntimeError> {
+        let helper_path = fixed_helper_path()?;
+        let _helper_guard = verify_helper_for_launch(&helper_path, expected_helper_sha256)?;
+        let session = random_hex(16)?;
+        let suffix = random_hex(16)?;
+        let mut pipe = create_server_pipe(&suffix)?;
+        let parent_pid = unsafe { GetCurrentProcessId() };
+        let parent_created = process_creation_time(unsafe { GetCurrentProcess() })?;
+        let arguments = helper_arguments(&session, &suffix, parent_pid, parent_created)?;
+        let helper = shell_execute_runas(&helper_path, &arguments)?;
+        let result = (|| {
+            connect_helper(&mut pipe, &helper)?;
+            let peer_pid =
+                pipe_client_pid(&pipe).map_err(|error| helper_exit_or(&helper, error))?;
+            verify_launched_peer_pid(peer_pid, unsafe { GetProcessId(helper.raw()) })?;
+            let actual_created = process_creation_time(helper.raw())?;
+            let hello =
+                read_frame(&mut pipe).map_err(|error| helper_exit_or(&helper, error.into()))?;
+            match hello {
+                Frame::HelperHello {
+                    session: claimed_session,
+                    helper_pid,
+                    helper_created,
+                    ..
+                } if claimed_session == session
+                    && helper_pid == peer_pid
+                    && helper_created == actual_created =>
+                {
+                    Ok(())
+                }
+                _ => Err(RuntimeError::new(
+                    "tun_helper_protocol",
+                    "TUN helper identity message was rejected",
+                )),
+            }
+        })();
+        // Closing the channel makes the existing helper stop before it can receive
+        // a StartTun frame. Keep its exact process handle until bounded exit proof.
+        drop(pipe);
+        if unsafe { WaitForSingleObject(helper.raw(), HELPER_STOP_TIMEOUT.as_millis() as u32) }
+            != WAIT_OBJECT_0
+        {
+            if let Err(error) = result {
+                return Err(RuntimeError::new(
+                    error.stage(),
+                    format!(
+                        "{}; helper exit after pipe closure was not confirmed",
+                        error.message()
+                    ),
+                ));
+            }
+            return Err(RuntimeError::new(
+                "tun_helper_pipe",
+                "handshake-only helper did not exit after its pipe closed",
+            ));
+        }
+        result
+    }
+
+    fn verify_launched_peer_pid(peer_pid: u32, launched_pid: u32) -> Result<(), RuntimeError> {
+        if launched_pid == 0 || peer_pid != launched_pid {
+            return Err(RuntimeError::new(
+                "tun_helper_identity",
+                "TUN pipe peer is not the launched helper process",
+            ));
+        }
+        Ok(())
     }
 
     fn upstream_choice(upstream: &TunUpstreamIdentity) -> UpstreamChoice {
@@ -358,7 +452,7 @@ mod windows {
     }
 
     struct TunHelperChild {
-        pipe: Option<File>,
+        pipe: Option<PipeTransport>,
         helper_process: Option<OwnedHandle>,
         helper_pid: u32,
         engine_pid: u32,
@@ -404,6 +498,13 @@ mod windows {
         }
 
         fn query_running_state(&mut self) -> Result<Option<TunCaptureSnapshot>, RuntimeError> {
+            self.query_running_state_inner()
+                .map_err(running_state_error)
+        }
+
+        fn query_running_state_inner(
+            &mut self,
+        ) -> Result<Option<TunCaptureSnapshot>, RuntimeError> {
             if self.stopped || !self.helper_running()? {
                 return Ok(None);
             }
@@ -550,14 +651,16 @@ mod windows {
         }
     }
 
-    pub fn helper_main() -> Result<(), String> {
-        helper_main_inner().map_err(|error| error.stage().to_string())
+    pub fn helper_main() -> Result<(), i32> {
+        helper_main_inner().map_err(|error| helper_exit_code(error.stage()))
     }
 
     fn helper_main_inner() -> Result<(), RuntimeError> {
-        if !crate::windows_process::current_process_is_elevated()? {
+        if !crate::windows_process::current_process_is_elevated().map_err(|_| {
+            RuntimeError::new("helper_elevation_query", "helper elevation query failed")
+        })? {
             return Err(RuntimeError::new(
-                "tun_helper_identity",
+                "helper_not_elevated",
                 "TUN helper is not elevated",
             ));
         }
@@ -565,8 +668,16 @@ mod windows {
         let mut pipe = connect_parent_pipe(&invocation.pipe_suffix)?;
         authenticate_parent(&pipe, &invocation)?;
         let helper_pid = unsafe { GetCurrentProcessId() };
-        let helper_created = process_creation_time(unsafe { GetCurrentProcess() })?;
-        let hello_nonce = random_hex(32)?;
+        let helper_created =
+            process_creation_time(unsafe { GetCurrentProcess() }).map_err(|_| {
+                RuntimeError::new(
+                    "helper_self_identity",
+                    "helper process identity query failed",
+                )
+            })?;
+        let hello_nonce = random_hex(32).map_err(|_| {
+            RuntimeError::new("helper_nonce", "helper challenge random source failed")
+        })?;
         write_frame(
             &mut pipe,
             &Frame::HelperHello {
@@ -577,7 +688,9 @@ mod windows {
                 nonce: hello_nonce.clone(),
             },
         )
-        .map_err(protocol_runtime_error)?;
+        .map_err(|_| {
+            RuntimeError::new("helper_hello_write", "helper hello could not be written")
+        })?;
 
         let challenge_frame = read_frame(&mut pipe).map_err(protocol_runtime_error)?;
         let mut state = ServerState::AwaitingChallenge;
@@ -852,15 +965,16 @@ mod windows {
     }
 
     fn serve_running(
-        pipe: &mut File,
+        pipe: &mut PipeTransport,
         invocation: &HelperInvocation,
         state: &mut ServerState,
         child: &mut dyn ManagedChild,
         journal: &mut TunJournal,
         capture: &CaptureExpectation,
     ) -> Result<(), RuntimeError> {
+        let parent = open_verified_parent(invocation)?;
         loop {
-            let frame = match read_frame(pipe) {
+            let frame = match pipe.read_frame_from_peer(parent.raw()) {
                 Ok(frame) => frame,
                 Err(_) => {
                     let stop = child.stop();
@@ -1404,7 +1518,7 @@ mod windows {
         Ok(value)
     }
 
-    fn create_server_pipe(suffix: &str) -> Result<File, RuntimeError> {
+    fn create_server_pipe(suffix: &str) -> Result<PipeTransport, RuntimeError> {
         pipe_suffix(suffix).map_err(protocol_runtime_error)?;
         let name = pipe_name(suffix);
         let wide = wide(&name)?;
@@ -1417,8 +1531,8 @@ mod windows {
         let handle = unsafe {
             CreateNamedPipeW(
                 wide.as_ptr(),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 1.min(PIPE_UNLIMITED_INSTANCES),
                 PIPE_BUFFER_BYTES,
                 PIPE_BUFFER_BYTES,
@@ -1431,50 +1545,17 @@ mod windows {
             "tun_helper_pipe",
             "could not create the private TUN helper pipe",
         )?;
-        Ok(unsafe { File::from_raw_handle(handle.into_raw()) })
+        Ok(PipeTransport::new(unsafe {
+            File::from_raw_handle(handle.into_raw())
+        }))
     }
 
-    fn connect_helper(pipe: &File, helper: &OwnedHandle) -> Result<(), RuntimeError> {
-        let deadline = Instant::now() + HELPER_CONNECT_TIMEOUT;
-        loop {
-            let connected = unsafe { ConnectNamedPipe(pipe.as_raw_handle(), ptr::null_mut()) };
-            if connected != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED {
-                let mode = PIPE_READMODE_BYTE | PIPE_WAIT;
-                if unsafe {
-                    SetNamedPipeHandleState(pipe.as_raw_handle(), &mode, ptr::null(), ptr::null())
-                } == 0
-                {
-                    return Err(last_error(
-                        "tun_helper_pipe",
-                        "could not switch the helper pipe to blocking mode",
-                    ));
-                }
-                return Ok(());
-            }
-            let error = unsafe { GetLastError() };
-            if error != ERROR_PIPE_LISTENING {
-                return Err(last_error(
-                    "tun_helper_pipe",
-                    "could not accept the elevated TUN helper",
-                ));
-            }
-            if unsafe { WaitForSingleObject(helper.raw(), 0) } == WAIT_OBJECT_0 {
-                return Err(RuntimeError::new(
-                    "tun_helper_pipe",
-                    "elevated TUN helper exited before authentication",
-                ));
-            }
-            if Instant::now() >= deadline {
-                return Err(RuntimeError::new(
-                    "tun_helper_pipe",
-                    "elevated TUN helper authentication timed out",
-                ));
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
+    fn connect_helper(pipe: &mut PipeTransport, helper: &OwnedHandle) -> Result<(), RuntimeError> {
+        pipe.connect(HELPER_CONNECT_TIMEOUT)
+            .map_err(|error| helper_exit_or(helper, error.into()))
     }
 
-    fn connect_parent_pipe(suffix: &str) -> Result<File, RuntimeError> {
+    fn connect_parent_pipe(suffix: &str) -> Result<PipeTransport, RuntimeError> {
         pipe_suffix(suffix).map_err(protocol_runtime_error)?;
         let wide = wide(pipe_name(suffix))?;
         let deadline = Instant::now() + HELPER_CONNECT_TIMEOUT;
@@ -1486,12 +1567,12 @@ mod windows {
                     0,
                     ptr::null(),
                     OPEN_EXISTING,
-                    0,
+                    FILE_FLAG_OVERLAPPED,
                     ptr::null_mut(),
                 )
             };
             if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
-                return Ok(unsafe { File::from_raw_handle(handle) });
+                return Ok(PipeTransport::new(unsafe { File::from_raw_handle(handle) }));
             }
             if Instant::now() >= deadline {
                 return Err(last_error(
@@ -1507,7 +1588,7 @@ mod windows {
         format!("{PIPE_PREFIX}{suffix}")
     }
 
-    fn pipe_client_pid(pipe: &File) -> Result<u32, RuntimeError> {
+    fn pipe_client_pid(pipe: &PipeTransport) -> Result<u32, RuntimeError> {
         let mut pid = 0;
         if unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut pid) } == 0 || pid == 0 {
             return Err(last_error(
@@ -1518,25 +1599,39 @@ mod windows {
         Ok(pid)
     }
 
-    fn authenticate_parent(pipe: &File, invocation: &HelperInvocation) -> Result<(), RuntimeError> {
+    fn authenticate_parent(
+        pipe: &PipeTransport,
+        invocation: &HelperInvocation,
+    ) -> Result<(), RuntimeError> {
         let mut server_pid = 0;
         if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut server_pid) } == 0
             || server_pid != invocation.parent_pid
         {
             return Err(RuntimeError::new(
-                "tun_helper_identity",
+                "helper_parent_pipe_pid",
                 "TUN helper pipe server identity was rejected",
             ));
         }
         let parent = open_verified_parent(invocation)?;
-        let image = process_image(parent.raw())?;
-        let helper = std::env::current_exe()
-            .map_err(|error| RuntimeError::new("tun_helper_identity", error.to_string()))?;
-        if image.file_name() != Some(OsStr::new(GUI_FILE_NAME)) || image.parent() != helper.parent()
-        {
+        let image = process_image(parent.raw()).map_err(|_| {
+            RuntimeError::new(
+                "helper_parent_image_query",
+                "helper parent image query failed",
+            )
+        })?;
+        let helper = std::env::current_exe().map_err(|_| {
+            RuntimeError::new("helper_self_image_query", "helper image query failed")
+        })?;
+        if image.file_name() != Some(OsStr::new(GUI_FILE_NAME)) {
             return Err(RuntimeError::new(
-                "tun_helper_identity",
+                "helper_parent_image_name",
                 "TUN helper parent image was rejected",
+            ));
+        }
+        if image.parent() != helper.parent() {
+            return Err(RuntimeError::new(
+                "helper_parent_image_directory",
+                "TUN helper parent directory was rejected",
             ));
         }
         Ok(())
@@ -1552,12 +1647,18 @@ mod windows {
         };
         let parent = OwnedHandle::new(
             parent,
-            "tun_helper_identity",
+            "helper_parent_open",
             "could not open the RouteDeck parent process",
         )?;
-        if process_creation_time(parent.raw())? != invocation.parent_created {
+        if process_creation_time(parent.raw()).map_err(|_| {
+            RuntimeError::new(
+                "helper_parent_creation_query",
+                "helper parent creation time query failed",
+            )
+        })? != invocation.parent_created
+        {
             return Err(RuntimeError::new(
-                "tun_helper_identity",
+                "helper_parent_creation_mismatch",
                 "RouteDeck parent creation time changed",
             ));
         }
@@ -2824,9 +2925,102 @@ mod windows {
         }
     }
 
-    fn protocol_runtime_error(error: impl std::fmt::Display) -> RuntimeError {
-        let _ = error;
-        RuntimeError::new("tun_helper_protocol", "TUN helper protocol was rejected")
+    impl From<crate::tun_helper_protocol::ProtocolError> for RuntimeError {
+        fn from(_: crate::tun_helper_protocol::ProtocolError) -> Self {
+            Self::new("tun_helper_protocol", "TUN helper protocol was rejected")
+        }
+    }
+
+    impl From<TransportError> for RuntimeError {
+        fn from(error: TransportError) -> Self {
+            Self::new(
+                if error == TransportError::Protocol {
+                    "tun_helper_protocol"
+                } else {
+                    "tun_helper_pipe"
+                },
+                error.to_string(),
+            )
+        }
+    }
+
+    fn protocol_runtime_error(error: impl Into<RuntimeError>) -> RuntimeError {
+        error.into()
+    }
+
+    fn running_state_error(error: RuntimeError) -> RuntimeError {
+        if matches!(error.stage(), "tun_helper_pipe" | "tun_helper_protocol") {
+            RuntimeError::new("engine_process", error.message())
+        } else {
+            error
+        }
+    }
+
+    // The helper's process handle was returned by ShellExecuteExW and its image hash
+    // held before launch. Early exit reasons travel only as finite process codes;
+    // no unauthenticated pipe frame or arbitrary stderr is trusted as diagnostics.
+    fn helper_exit_or(helper: &OwnedHandle, fallback: RuntimeError) -> RuntimeError {
+        if unsafe { WaitForSingleObject(helper.raw(), 250) } != WAIT_OBJECT_0 {
+            return fallback;
+        }
+        let mut code = 0;
+        if unsafe { GetExitCodeProcess(helper.raw(), &mut code) } == 0 {
+            return fallback;
+        }
+        RuntimeError::new(
+            "tun_helper_exit",
+            format!("{} (helper exit {code})", helper_exit_description(code)),
+        )
+    }
+
+    fn helper_exit_code(stage: &str) -> i32 {
+        match stage {
+            "helper_elevation_query" => 80,
+            "helper_not_elevated" => 81,
+            "tun_helper_arguments" => 82,
+            "tun_helper_pipe" => 83,
+            "helper_parent_pipe_pid" => 84,
+            "helper_parent_open" => 85,
+            "helper_parent_creation_query" => 86,
+            "helper_parent_creation_mismatch" => 87,
+            "helper_parent_image_query" => 88,
+            "helper_self_image_query" => 89,
+            "helper_parent_image_name" => 90,
+            "helper_parent_image_directory" => 91,
+            "helper_self_identity" => 92,
+            "helper_nonce" => 93,
+            "helper_hello_write" => 94,
+            "tun_helper_protocol" => 95,
+            "tun_helper_config" | "config_check" => 96,
+            "session_recovery" => 97,
+            "engine_integrity" | "engine_layout" => 98,
+            _ => 99,
+        }
+    }
+
+    fn helper_exit_description(code: u32) -> &'static str {
+        match code {
+            80 => "Windows could not report the helper elevation state",
+            81 => "Windows started the helper without required elevation",
+            82 => "The helper rejected its fixed startup arguments",
+            83 => "The helper could not complete its pipe transaction",
+            84 => "The helper rejected the pipe server process identity",
+            85 => "The helper could not open the exact GUI process with required rights",
+            86 => "The helper could not read the GUI process creation time",
+            87 => "The helper found a changed GUI process creation time",
+            88 => "The helper could not query the GUI executable identity",
+            89 => "The helper could not query its own executable identity",
+            90 => "The helper rejected the GUI executable file name",
+            91 => "The helper and GUI executable directory identities did not match",
+            92 => "The helper could not read its own process creation time",
+            93 => "The helper could not create a fresh authentication nonce",
+            94 => "The helper could not send its authentication hello",
+            95 => "The helper rejected the authentication or session protocol",
+            96 => "The helper rejected the protected generated configuration",
+            97 => "The helper preserved an incomplete cleanup for recovery",
+            98 => "The helper could not verify the pinned engine component",
+            _ => "The helper exited before completing the requested operation",
+        }
     }
 
     fn last_error(stage: &'static str, message: &'static str) -> RuntimeError {
@@ -2859,6 +3053,19 @@ mod windows {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn pipe_peer_must_be_the_process_returned_by_helper_launch() {
+            assert!(super::verify_launched_peer_pid(42, 42).is_ok());
+            for (peer, launched) in [(42, 43), (42, 0), (0, 0)] {
+                assert_eq!(
+                    super::verify_launched_peer_pid(peer, launched)
+                        .unwrap_err()
+                        .stage(),
+                    "tun_helper_identity"
+                );
+            }
+        }
+
         use super::*;
 
         #[test]
@@ -2898,6 +3105,58 @@ mod windows {
             let mut uppercase = good;
             uppercase[4] = OsString::from("AA".repeat(16));
             assert!(HelperInvocation::parse(uppercase).is_err());
+        }
+
+        #[test]
+        fn early_helper_exit_codes_distinguish_authentication_subcauses_without_paths() {
+            let stages = [
+                "helper_elevation_query",
+                "helper_not_elevated",
+                "tun_helper_arguments",
+                "tun_helper_pipe",
+                "helper_parent_pipe_pid",
+                "helper_parent_open",
+                "helper_parent_creation_query",
+                "helper_parent_creation_mismatch",
+                "helper_parent_image_query",
+                "helper_self_image_query",
+                "helper_parent_image_name",
+                "helper_parent_image_directory",
+                "helper_self_identity",
+                "helper_nonce",
+                "helper_hello_write",
+                "tun_helper_protocol",
+                "tun_helper_config",
+                "session_recovery",
+                "engine_integrity",
+            ];
+            for (index, stage) in stages.into_iter().enumerate() {
+                let code = helper_exit_code(stage);
+                assert_eq!(code, 80 + index as i32);
+                let message = helper_exit_description(code as u32);
+                assert!(!message.contains("\\") && !message.contains("/") && message.len() < 128);
+            }
+            assert_eq!(helper_exit_code("unclassified"), 99);
+            assert_eq!(
+                helper_exit_description(u32::MAX),
+                helper_exit_description(99)
+            );
+        }
+
+        #[test]
+        fn running_pipe_failure_preserves_finite_cause_but_is_not_startup_failure() {
+            let raw = TransportError::Io {
+                operation: "read",
+                code: 232,
+            };
+            let bootstrap: RuntimeError = raw.into();
+            assert_eq!(bootstrap.stage(), "tun_helper_pipe");
+            let running = running_state_error(bootstrap);
+            assert_eq!(running.stage(), "engine_process");
+            assert!(running.message().contains("232"));
+            let capture =
+                running_state_error(RuntimeError::new("tun_capture", "fixture capture mismatch"));
+            assert_eq!(capture.stage(), "tun_capture");
         }
 
         #[test]
@@ -3411,11 +3670,21 @@ pub(crate) fn reconcile_stale_tun_sessions(
 }
 
 #[cfg(windows)]
-pub fn helper_main() -> Result<(), String> {
+pub fn helper_main() -> Result<(), i32> {
     windows::helper_main()
 }
 
+#[cfg(windows)]
+pub fn diagnose_helper_handshake(expected_helper_sha256: Option<&str>) -> Result<(), String> {
+    windows::diagnose_helper_handshake(expected_helper_sha256)
+}
+
 #[cfg(not(windows))]
-pub fn helper_main() -> Result<(), String> {
-    Err("TUN helper is available only on Windows".into())
+pub fn diagnose_helper_handshake(_expected_helper_sha256: Option<&str>) -> Result<(), String> {
+    Err("stage=tun_helper_start cause=Windows is required".into())
+}
+
+#[cfg(not(windows))]
+pub fn helper_main() -> Result<(), i32> {
+    Err(99)
 }
