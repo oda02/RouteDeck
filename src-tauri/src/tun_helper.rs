@@ -4493,9 +4493,11 @@ mod windows {
             let sessions = root.join("sessions");
             let config = SessionConfig::create(&sessions, "{}").unwrap();
             let guard = config.revalidate_for_launch().unwrap();
+            // Hosted Windows may expose TEMP through an 8.3 alias while the
+            // handle-derived path expands it. Compare the actual directories.
             assert_eq!(
-                protected_config_directory(&guard).unwrap(),
-                config.path().parent().unwrap()
+                fs::canonicalize(protected_config_directory(&guard).unwrap()).unwrap(),
+                fs::canonicalize(config.path().parent().unwrap()).unwrap()
             );
             let mut journal = TunJournal::create(
                 config.path().parent().unwrap(),
