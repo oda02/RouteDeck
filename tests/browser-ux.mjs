@@ -12,6 +12,10 @@ let scenarios = 0;
 let page;
 try {
   page = await browser.newPage({ viewport: { width: 440, height: 760 } });
+  if (process.env.ROUTEDECK_TEST_CPU_RATE) {
+    const session = await page.context().newCDPSession(page);
+    await session.send("Emulation.setCPUThrottlingRate", { rate: Number(process.env.ROUTEDECK_TEST_CPU_RATE) });
+  }
   await page.clock.install();
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
@@ -21,7 +25,16 @@ try {
     if (url.pathname === "/src/controller.ts") return route.fulfill({ contentType: "application/javascript", body: fixtureModule });
     return route.continue();
   });
-  const nav = (name) => page.locator("nav:visible").getByText(name, { exact: true }).click();
+  const nav = async (name) => {
+    const link = page.locator("nav:visible .navigation-item").filter({ hasText: name });
+    const alreadyCurrent = await link.getAttribute("aria-current") === "page";
+    await link.click();
+    await page.waitForFunction(({ label, requireHeadingFocus }) => {
+      const current = document.querySelector('nav:where(:not([hidden])) [aria-current="page"]');
+      const heading = document.querySelector('.page-slot:not([hidden]) h1');
+      return current?.textContent?.trim() === label && (!requireHeadingFocus || heading === document.activeElement);
+    }, { label: name, requireHeadingFocus: !alreadyCurrent });
+  };
   const settle = () => page.waitForFunction(() => !window.__routeDeckFixture.snapshot().switching);
   const connected = () => page.waitForFunction(() => window.__routeDeckFixture.snapshot().phase === "connected" && !window.__routeDeckFixture.snapshot().switching);
   const checkFrame = async () => {
