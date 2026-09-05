@@ -128,4 +128,4 @@ jobs:
           name: RouteDeck-windows-x64
           path: artifacts/release/*
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1

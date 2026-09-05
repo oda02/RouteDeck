@@ -11,7 +11,8 @@
   verified against committed size/SHA-256 pins, and never run by CI.
   The pinned Playwright Chromium browser is acquired in an explicit test step.
 - The Windows artifact is `RouteDeck-<version>-windows-x64.zip` with `SHA256SUMS.txt`.
-  CI artifacts expire after seven days. They contain the controller and its exact
+  CI artifacts expire after one day; published release assets remain available.
+  They contain the controller and its exact
   helper, pinned sing-box/Cronet and Xray, dependency notices and runtime pins,
   without user state. Extract the ZIP and run `routedeck.exe`; see
   `docs/portable-full-release.txt`. Corresponding runtime source archives and an
@@ -97,7 +98,9 @@ blanket legal compliance claim or a license grant for RouteDeck's own source.
 The repository is public after a bounded scan of working source and reachable Git
 history for credentials. GitHub provides standard hosted runners free for public
 repositories, subject to concurrency, execution and service limits; larger runners
-are billed separately. This is not unlimited execution of arbitrary jobs.
+are billed separately. Artifact storage has separate plan allowances, so temporary
+CI artifacts use a one-day retention period. This is not unlimited execution of
+arbitrary jobs or unlimited temporary artifact storage.
 
 References: [GitHub Actions billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions),
 [release management](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository),
