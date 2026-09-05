@@ -111,8 +111,9 @@ for(const file of goSourceLock.files){
   if(!existsSync(p)||statSync(p).size!==file.size||sha(p)!==file.sha256) throw new Error(`Go source artifact mismatch: ${file.path}`);
   staged.push(p); if(file.path.endsWith("-NOTICES.txt")) goNoticeInputs.push(p);
 }
-const gpl=join(cache,"GPL-3.0.txt"), gplLock=sourceLock.canonicalLicenses.gpl3;
-if(!existsSync(gpl)) await download(gplLock.url,gpl,gplLock.sha256);
+// Keep the canonical, reviewed license bytes with the source so packaging does
+// not depend on the availability of GNU's web server.
+const gpl=join(ROOT,"engine/licenses/GPL-3.0.txt"), gplLock=sourceLock.canonicalLicenses.gpl3;
 if(statSync(gpl).size!==gplLock.size||sha(gpl)!==gplLock.sha256) throw new Error("canonical GPL-3.0 text mismatch");
 for (const p of staged) { const name=basename(p); if(!safeName(name)) throw new Error("unsafe source archive name"); copyFileSync(p,join(output,"sources",name)); if(existsSync(p+".omissions.json")) copyFileSync(p+".omissions.json",join(output,"sources",name+".omissions.json")); }
 const sourceText=`Source code for bundled engines\n\nThe source assets are published as individual flat assets beside the RouteDeck portable ZIP at:\nhttps://github.com/oda02/RouteDeck/releases/tag/v0.1.1\n\nThose assets contain exact pinned source for sing-box ${sing.version} (${sing.releaseCommit}), cronet-go (${sourceLock.sources.cronetGo.commit}), the complete pinned NaiveProxy tree including Chromium ${sourceLock.sources.naiveProxyChromium.chromiumVersion} (${sourceLock.sources.naiveProxyChromium.commit}), and Xray-core ${xray.version} (${xray.releaseCommit}). The sing-box and Xray Go module source bundles contain every checksum-verified linked dependency; their provenance JSON files record the executable build settings and module identities read without executing either binary.\n\nCronet's archive deliberately omits prebuilt .a, .lib, .dll, .so, .dylib, .exe and .node files; its omissions manifest records every omitted path, Git blob identity, size, and reason. Every member of the NaiveProxy/Chromium archive is verified against the exact recursive Git tree.\n`;
