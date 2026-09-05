@@ -9,8 +9,9 @@ const fixtureModule = await readFile(new URL("./fixtures/ui-runtime.mjs", import
 await mkdir(new URL("../.cache/ux-qa/", import.meta.url), { recursive: true });
 const browser = await chromium.launch({ headless: true });
 let scenarios = 0;
+let page;
 try {
-  const page = await browser.newPage({ viewport: { width: 440, height: 760 } });
+  page = await browser.newPage({ viewport: { width: 440, height: 760 } });
   await page.clock.install();
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
@@ -86,9 +87,9 @@ try {
   await serverSearch.fill("");
   await page.waitForFunction(() => {
     const search = document.querySelector('.page-slot:not([hidden]) input[type="search"]');
-    return search?.value === "" && [...document.querySelectorAll(".server-group-copy strong")].some((heading) => heading.textContent === "Основная подписка");
+    const refresh = document.querySelector('button[aria-label="Обновить подписку Основная подписка"]');
+    return search?.value === "" && refresh instanceof HTMLButtonElement && !refresh.disabled;
   });
-  await page.getByRole("button", { name: /Основная подписка/ }).first().waitFor();
   await page.getByRole("button", { name: "Обновить подписку Основная подписка", exact: true }).click();
   await settle(); await checkFrame();
   assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => /^stop_/.test(entry.command)).length), 2, "refreshing another source stopped active runtime");
@@ -533,10 +534,15 @@ try {
   assert.deepEqual(errors, []);
   console.log(`PASS: ${scenarios} browser scenarios; real frontend controller with synthetic IPC, no native networking`);
 } catch (error) {
-  await mkdir(new URL("../.cache/ux-qa/", import.meta.url), { recursive: true });
-  await page.screenshot({ path: ".cache/ux-qa/ci-failure.png", fullPage: true }).catch(() => undefined);
-  const html = await page.content().catch(() => "<!-- page content unavailable -->");
-  await writeFile(new URL("../.cache/ux-qa/ci-failure.html", import.meta.url), html, "utf8");
+  if (page) {
+    const captures = await Promise.allSettled([
+      page.screenshot({ path: ".cache/ux-qa/ci-failure.png", fullPage: true }),
+      page.content().then((html) => writeFile(new URL("../.cache/ux-qa/ci-failure.html", import.meta.url), html, "utf8")),
+    ]);
+    for (const capture of captures) {
+      if (capture.status === "rejected") console.error(`Could not capture browser failure artifact: ${capture.reason}`);
+    }
+  }
   throw error;
 } finally {
   await browser.close();
