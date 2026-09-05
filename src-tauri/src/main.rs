@@ -1,3 +1,24 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn attach_diagnostic_console() {
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+
+    // A release GUI has no console of its own. Attach only for the explicit
+    // terminal diagnostic so its existing plain-text result remains visible.
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(all(windows, not(debug_assertions))))]
+fn attach_diagnostic_console() {}
+
 fn main() {
     // Retain a plain-text provenance marker in release binaries so a portable
     // artifact can be tied to the exact reviewed source without executing it.
@@ -12,6 +33,7 @@ fn main() {
         .first()
         .is_some_and(|argument| argument == "--diagnose-tun-helper")
     {
+        attach_diagnostic_console();
         if arguments.len() != 1 {
             println!("helper_handshake=failed stage=arguments");
             std::process::exit(2);

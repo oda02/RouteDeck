@@ -1,9 +1,11 @@
 # Settings overrides
 
-- Primary action exists only when settings are not autosaved: Save changes.
-- Group settings into General, Connection, Coexistence, and collapsed Advanced.
-- Show local port ownership and Windows proxy restore policy in plain language.
-- Dangerous actions (reset state, forget proxy backup, clear logs) are separated in a
-  Danger zone and require confirmation describing the exact consequence.
-- Every numeric field includes unit, valid range, default, and inline validation.
-
+- Show only functional preferences: theme and subscription update interval. Autosave
+  with local feedback, retain failures and provide an explicit retry.
+- Periodic updates are opt-in (6 or 24 hours), run while the app is open/disconnected,
+  reuse privately stored URLs and throttle failures. Recheck activity inside the queue.
+- Collapse implementation explanations and the destructive reset section.
+- Do not present inactive tray/port controls as working settings. Ports are automatic.
+- Reset confirmation names all deleted data: servers, subscriptions, rules, preferences;
+  it stops the connection and restores only RouteDeck-owned network settings.
+- Form controls align right on wide windows and stack on narrow windows.

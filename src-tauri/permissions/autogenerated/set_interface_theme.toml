@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-interface-theme"
+description = "Enables the set_interface_theme command without any pre-configured scope."
+commands.allow = ["set_interface_theme"]
+
+[[permission]]
+identifier = "deny-set-interface-theme"
+description = "Denies the set_interface_theme command without any pre-configured scope."
+commands.deny = ["set_interface_theme"]

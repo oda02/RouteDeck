@@ -8,6 +8,8 @@ const forbiddenMarkers = [
   "203.0.113.42",
   "createDevelopmentDemoController",
   "demoController",
+  "__routeDeckFixture",
+  "Fixture diagnostics",
 ];
 
 async function productionFiles(directory) {

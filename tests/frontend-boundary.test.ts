@@ -2,13 +2,72 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+async function withPreferenceStorage(body: (storage: Map<string, string>, faults: { write: boolean }) => Promise<void>, initial: Record<string, string> = {}) {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const storage = new Map(Object.entries(initial));
+  const faults = { write: false };
+  Object.defineProperty(globalThis, "window", { configurable: true, value: {
+    addEventListener() {}, removeEventListener() {},
+    localStorage: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => { if (faults.write) throw new Error("Storage unavailable"); storage.set(key, value); },
+      removeItem: (key: string) => { if (faults.write) throw new Error("Storage unavailable"); storage.delete(key); },
+    },
+  } });
+  try { await body(storage, faults); }
+  finally { if (previous) Object.defineProperty(globalThis, "window", previous); else Reflect.deleteProperty(globalThis, "window"); }
+}
+
+async function lifecycleFixture(connected = true, protocol = "vless") {
+  const calls: Array<{ command: string; arguments_?: Record<string, unknown> }> = [];
+  let revision = 0;
+  const sourceId = "a".repeat(32);
+  let nodes = ["a", "b", "c"].map((id) => ({ id, displayName: `Server ${id}`, protocol, insecureTls: false,
+    sourceId: id === "c" ? "b".repeat(32) : sourceId, sourceName: id === "c" ? "Other" : "Subscription", sourceKind: "subscription", sourceRefreshable: true, sourceUpdatedAtMs: 100 }));
+  const hooks: { stop?: () => Promise<unknown>; start?: () => Promise<unknown>; refresh?: () => Promise<unknown> } = {};
+  const status = (phase: RuntimeStatusDto["phase"], nodeId = "a") => ({ ...runtimeStatus(++revision, phase), ...(phase === "disconnected" ? {} : { nodeId }) });
+  const transport: TauriTransport = {
+    listen: async () => () => undefined,
+    invoke: async (command, arguments_) => {
+      calls.push({ command, arguments_ });
+      if (command === "runtime_status") return status(connected ? "system_proxy_ready" : "disconnected");
+      if (command === "confirmed_nodes") return nodes;
+      if (command.startsWith("stop_")) return hooks.stop ? hooks.stop() : status("disconnected");
+      if (command.startsWith("start_")) return hooks.start ? hooks.start() : status(command === "start_tun" ? "tun_ready" : "system_proxy_ready", arguments_?.nodeId as string);
+      if (command === "refresh_source") {
+        if (hooks.refresh) return hooks.refresh();
+        nodes = nodes.map((node) => node.sourceId === sourceId ? { ...node, sourceUpdatedAtMs: 200 } : node);
+        return { imported: 2, nodeIds: ["a", "b"] };
+      }
+      if (command === "remove_source") { nodes = nodes.filter((node) => node.sourceId !== arguments_?.sourceId); return null; }
+      if (command === "retry_session_recovery") return status("disconnected");
+      if (command === "reset_local_state") { nodes = []; return null; }
+      throw new Error("Unexpected fixture command");
+    },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+  calls.length = 0;
+  return { controller, calls, hooks, status, sourceId };
+}
+
 import { toPublicActionError } from "../src/actionErrors.ts";
-import { RouteDeckError } from "../src/model.ts";
+import { defaultTrafficRules, RouteDeckError } from "../src/model.ts";
 import { selectControllerRuntime } from "../src/runtimeSelection.ts";
 import {
   ContractViolation,
   RuntimeRevisionGate,
   parsePublicError,
+  parseConfirmedNodes,
+  parseImportPreview,
+  parseDiagnostics,
   parseRunningApplications,
   parseRuntimeStatus,
   parseUnitResponse,
@@ -16,6 +75,7 @@ import {
 } from "../src/tauriContract.ts";
 import {
   TauriController,
+  validatedRouting,
   runtimePhaseToConnectionPhase,
   type TauriTransport,
 } from "../src/tauriController.ts";
@@ -33,6 +93,7 @@ function runtimeStatus(revision: number, phase: RuntimeStatusDto["phase"]): Runt
     nodeId: phase === "disconnected" ? undefined : "fixture-node",
     ports: phase === "disconnected" ? undefined : { http: 24080, socks: 24081, health: 24082 },
     routeCheckMs: ready ? 84 : undefined,
+    steadyLatencyMs: systemProxy || tun ? 42 : undefined,
     engineVersion: phase === "disconnected" ? undefined : "1.13.19",
     proofs: [
       { kind: "engine_config", state: phase === "disconnected" ? "not_run" : "passed" },
@@ -48,11 +109,20 @@ function runtimeStatus(revision: number, phase: RuntimeStatusDto["phase"]): Runt
 }
 
 function withEmptyConfirmedNodes(transport: TauriTransport): TauriTransport {
+  let confirmedNodes: unknown[] = [];
+  let previewNodes: Array<{ id: string }> = [];
   return {
     ...transport,
-    invoke: (command, arguments_) => command === "confirmed_nodes"
-      ? Promise.resolve([])
-      : transport.invoke(command, arguments_),
+    invoke: async (command, arguments_) => {
+      if (command === "confirmed_nodes") return confirmedNodes;
+      const result = await transport.invoke(command, arguments_);
+      if (command === "preview_import_content" || command === "preview_import_url") previewNodes = (result as { nodes: Array<{ id: string }> }).nodes;
+      if (command === "confirm_import") {
+        const ids = new Set((result as { nodeIds: string[] }).nodeIds);
+        confirmedNodes = [...confirmedNodes, ...previewNodes.filter((node) => ids.has(node.id))];
+      }
+      return result;
+    },
   };
 }
 
@@ -62,9 +132,73 @@ test("release selection can never choose the demo controller", () => {
   assert.equal(selectControllerRuntime({ explicitDemo: true, isDevelopment: true, tauriIpcAvailable: true }), "demo");
 });
 
+test("source metadata is complete, consistent and forbidden in import previews", () => {
+  const node = { id: "group-node", displayName: "Naive fixture", protocol: "naive", insecureTls: false,
+    sourceId: "a".repeat(32), sourceName: "Personal", sourceKind: "manual" };
+  assert.equal(parseConfirmedNodes([node])[0].sourceName, "Personal");
+  for (const sourceId of ["__proto__", "constructor", "x".repeat(32), "a".repeat(33)]) {
+    assert.throws(() => parseConfirmedNodes([{ ...node, sourceId }]), ContractViolation);
+  }
+  assert.throws(() => parseConfirmedNodes([{ ...node, sourceKind: "other" }]), ContractViolation);
+  assert.throws(() => parseConfirmedNodes([{ ...node, sourceName: undefined }]), ContractViolation);
+  assert.throws(() => parseConfirmedNodes([node, { ...node, id: "other", sourceName: "Different" }]), ContractViolation);
+  assert.throws(() => parseConfirmedNodes([{ ...node, content: "secret" }]), ContractViolation);
+  assert.throws(() => parseImportPreview({ previewId: "p", nodes: [node], rejected: [], warnings: [] }), ContractViolation);
+});
+
+test("manual import reloads the additive library and preserves the selected server", async () => {
+  const old = { id: "old-node", displayName: "Existing", protocol: "hysteria2", insecureTls: false,
+    sourceId: "0".repeat(32), sourceName: "Provider", sourceKind: "subscription" };
+  const added = { id: "new-scoped-node", displayName: "Naive", protocol: "naive", insecureTls: false,
+    sourceId: "1".repeat(32), sourceName: "Personal", sourceKind: "manual" };
+  let saved = false;
+  const controller = new TauriController(async () => ({
+    listen: async () => () => undefined,
+    invoke: async (command, args) => {
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "confirmed_nodes") return saved ? [old, added] : [old];
+      if (command === "preview_import_content") return { previewId: "p", nodes: [{ id: "raw-id", displayName: "Naive", protocol: "naive", insecureTls: false }], rejected: [], warnings: [] };
+      if (command === "confirm_import") {
+        assert.deepEqual(args, { previewId: "p", sourceName: "Personal" });
+        saved = true;
+        return { imported: 1, nodeIds: [added.id] };
+      }
+      throw new Error("unexpected fixture command");
+    },
+  }));
+  await controller.ready();
+  const preview = await controller.previewSubscription({ type: "clipboard", value: "naive+https://fixture:secret@example.invalid" });
+  await controller.commitSubscription(preview, "Personal");
+  const state = controller.getSnapshot();
+  assert.equal(state.selectedServerId, old.id);
+  assert.deepEqual(state.servers.map((server) => server.source), ["Provider", "Personal"]);
+  assert.equal(state.servers[1].detail, "Импортировано");
+  assert.doesNotMatch(JSON.stringify(state), /fixture:secret/);
+  controller.dispose();
+});
+
+test("confirmation fails closed if the backend library loses previously imported nodes", async () => {
+  let confirmed = false;
+  const controller = new TauriController(async () => ({
+    listen: async () => () => undefined,
+    invoke: async (command) => {
+      if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+      if (command === "confirmed_nodes") return [{ id: confirmed ? "new" : "old", displayName: "Fixture", protocol: "naive", insecureTls: false }];
+      if (command === "preview_import_content") return { previewId: "p", nodes: [{ id: "raw", displayName: "Fixture", protocol: "naive", insecureTls: false }], rejected: [], warnings: [] };
+      if (command === "confirm_import") { confirmed = true; return { imported: 1, nodeIds: ["new"] }; }
+      throw new Error("unexpected fixture command");
+    },
+  }));
+  await controller.ready();
+  const preview = await controller.previewSubscription({ type: "clipboard", value: "fixture" });
+  await assert.rejects(controller.commitSubscription(preview), { code: "backend-response-invalid" });
+  assert.equal(controller.getSnapshot().backendAvailable, false);
+  controller.dispose();
+});
+
 test("busy import keeps focus inside the mounted dialog", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
-  assert.match(source, /previouslyFocusedRef\.current = document\.activeElement[\s\S]*return \(\) => previouslyFocusedRef\.current\?\.focus\([\s\S]*\}, \[\]\);/);
+  assert.match(source, /previouslyFocusedRef\.current = document\.activeElement[\s\S]*return \(\) => \{[\s\S]*previouslyFocusedRef\.current\.focus\(\{ preventScroll: true \}\)/);
   assert.match(source, /data-dialog-busy-focus/);
   assert.match(source, /role="status" aria-live="polite" tabIndex=\{-1\} data-dialog-busy-focus/);
   assert.match(source, /document\.addEventListener\("focusin", onFocusIn\)/);
@@ -75,39 +209,34 @@ test("busy import keeps focus inside the mounted dialog", () => {
 test("every import failure focuses its enabled source or recovery control", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const errorTarget = source.indexOf('querySelector<HTMLElement>("[data-error-autofocus]:not(:disabled)")');
-  const genericTarget = source.indexOf('querySelector<HTMLElement>("[data-autofocus]")', errorTarget);
+  const genericTarget = source.indexOf('querySelector<HTMLElement>("[data-autofocus]:not(:disabled)")', errorTarget);
   assert.ok(errorTarget >= 0 && genericTarget > errorTarget);
   assert.match(source, /id="subscription-url"[^\n]*data-error-autofocus=\{importError \? "true" : undefined\}/);
-  assert.match(source, /focusKey="subscription-url"/);
+  assert.match(source, /focusKey=\{importPreview \? "import-preview" : importKind\}/);
   assert.match(source, /id="subscription-import-form"[^\n]*onSubmit=/);
   assert.doesNotMatch(source, /focusKey=\{[^\n]*importError/);
-  assert.match(source, /setImportError\("Вставьте ссылку на подписку\."\)[\s\S]*requestAnimationFrame\(\(\) => subscriptionInputRef\.current\?\.focus\(\)\)/);
+  assert.match(source, /requestAnimationFrame[\s\S]*subscriptionInputRef\.current : serverInputRef\.current\)\?\.focus/);
 });
 
-test("URL import is a normal editable field and one validation-plus-commit action", () => {
+test("manual and URL sources use uncontrolled secret fields and a separate confirmation", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
-  assert.match(source, /id="subscription-url" type="url" inputMode="url" autoComplete="url"/);
-  assert.match(source, /id="subscription-url"[\s\S]*defaultValue=""/);
-  assert.doesNotMatch(source, /subscriptionSource|setSubscriptionSource|value=\{subscriptionSource\}/);
-  assert.doesNotMatch(source, /type=\{subscriptionVisible|EyeIcon|Прочитать буфер обмена|Файл · скоро|Подтвердить импорт/);
-  const urlRead = source.indexOf("const subscriptionUrl = subscriptionInputRef.current?.value.trim()");
-  const previewCall = source.indexOf('controller.previewSubscription({ type: "url", value: subscriptionUrl })', urlRead);
-  const commitCall = source.indexOf("controller.commitSubscription(preview)", previewCall);
-  const clearAfterSuccess = source.indexOf("clearSubscriptionUrl();", commitCall);
-  assert.ok(urlRead >= 0 && urlRead < previewCall && previewCall < commitCall && commitCall < clearAfterSuccess);
+  assert.match(source, /id="subscription-url" type="url" inputMode="url" autoComplete="off"/);
+  assert.match(source, /textarea ref=\{serverInputRef\} id="server-content"/);
+  assert.doesNotMatch(source, /subscriptionSource|setSubscriptionSource|setServerContent/);
+  assert.match(source, /type: importKind === "subscription" \? "url" : "clipboard"/);
+  assert.match(source, /controller.commitSubscription\(preview, sourceName\)/);
+  assert.match(source, /clearSubscriptionUrl\(\);\s*setImportPreview\(preview\)/);
+  assert.match(source, /closeDisabled=\{committingImport\}/);
+  assert.match(source, /controller.cancelImportPreview\(\)/);
 });
 
-test("URL import uses automatic backend transport without a renderer selector", () => {
+test("URL import keeps automatic transport and source-labelled groups", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
-  const model = readFileSync(new URL("../src/model.ts", import.meta.url), "utf8");
-  const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
-  assert.doesNotMatch(source, /SubscriptionFetchTransport|subscriptionTransport|Транспорт HTTPS-загрузки|subscription-transport-help|current_loopback_system_proxy/);
-  assert.doesNotMatch(model, /SubscriptionFetchTransport|current_loopback_system_proxy/);
-  assert.doesNotMatch(styles, /subscription-transport/);
-  assert.match(source, /description="Вставьте ссылку от провайдера\."/);
-  assert.match(source, /importing \? "Импортируем…" : "Импортировать"/);
-  assert.doesNotMatch(source, /Источник подписки|importMethod|clipboardSource|file-adapter-note|import-preview/);
-  assert.doesNotMatch(source, /Безопасно загрузить|опасные перенаправления|заблокирует .*локальные адреса|import-help/);
+  assert.doesNotMatch(source, /SubscriptionFetchTransport|subscriptionTransport|current_loopback_system_proxy/);
+  assert.match(source, /Добавить подписку/);
+  assert.match(source, /Добавить сервер/);
+  assert.match(source, /server.sourceId \?\? server.source/);
+  assert.match(source, /aria-expanded=\{expanded\}/);
 });
 
 test("local-only readiness never maps to global Connected", () => {
@@ -150,6 +279,7 @@ test("live System Proxy transition keeps final proof summary coherent", () => {
     ...ready,
     revision: 8,
     phase: "applying_system_proxy",
+    steadyLatencyMs: undefined,
     routeCheckMs: null,
     proofs: ready.proofs.map((proof) => proof.kind === "system_proxy_ownership"
       ? { ...proof, state: "pending" }
@@ -183,18 +313,15 @@ test("TUN and System Proxy application routing state their capture boundaries", 
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
   assert.match(source, /value: "tun", label: "TUN"/);
-  assert.doesNotMatch(source, /value: "tun"[^\n]*disabled|TUN · скоро/);
-  assert.match(source, /При каждом подключении Windows покажет стандартный запрос прав/);
-  assert.match(source, /<div className="persistent-hint" data-kind="info">/);
+  assert.doesNotMatch(source, /value: "tun"[^\n]*disabled: true|TUN · скоро/);
+  assert.match(source, /Windows запросит права при подключении/);
   assert.match(source, /Добавить приложение/);
   assert.match(source, /controller\.listRunningApplications\(\)/);
   assert.match(source, /route: draft\.defaultRoute === "direct" \? "vpn" : "direct"/);
-  assert.match(source, /System Proxy: только приложения с поддержкой прокси/);
-  assert.match(source, /UDP, QUIC и системный DNS не перехватываются/);
-  assert.match(source, /TCP-трафик приложения через прокси Windows/);
-  assert.match(source, /const routeMode = snapshot\.mode === "tun" \? "TUN" : "Прокси Windows"/);
-  assert.match(source, /Маршрут и исключения для proxy-aware TCP; UDP и QUIC не перехватываются/);
-  assert.match(source, /Добавьте приложение, использующее прокси Windows/);
+  assert.match(source, /[Тт]олько TCP приложений, использующих прокси Windows/);
+  assert.match(source, /UDP и системный DNS не перехватываются/);
+  assert.match(source, /Для остальных приложений и UDP нужен TUN/);
+  assert.match(source, /Изменения сохраняются автоматически; активное соединение переподключится/);
   assert.doesNotMatch(source, /Настройки Direct и исключений применяются только в TUN|Правила приложений используются в режиме TUN|Прокси Windows: через выбранный VPN/);
   assert.doesNotMatch(source, /tun-preflight|nested|Физический адаптер|security mode|режим безопасности/i);
   assert.doesNotMatch(source, /запустите .*администратор/i);
@@ -264,11 +391,15 @@ test("cold initialization restores public nodes and follows an active TUN runtim
     name: "Restored HY2",
     country: "—",
     protocol: "Hysteria2",
-    detail: "Импортировано из подписки",
+    detail: "Импортировано",
     source: "Подписка",
+    sourceId: undefined,
+    sourceKind: undefined,
+    sourceRefreshable: undefined,
+    sourceUpdatedAtMs: undefined,
     latencyState: "ready",
-    latencyMs: 84,
-    checkedAt: "сейчас",
+    latencyMs: 42,
+    checkedAt: undefined,
   }]);
   assert.deepEqual(calls, ["runtime_status", "confirmed_nodes"]);
   assert.doesNotMatch(JSON.stringify(snapshot), /https?:\/\//);
@@ -649,7 +780,7 @@ test("known import rejection is localized instead of masked as a runtime failure
       assert.ok(error instanceof RouteDeckError);
       assert.equal(error.code, "subscription-import-rejected");
       const publicError = toPublicActionError(error);
-      assert.match(publicError.message, /не распознаны как поддерживаемая подписка/);
+      assert.match(publicError.message, /Проверьте формат ссылки или конфигурации/);
       assert.doesNotMatch(JSON.stringify(publicError), /never-display|provider\.example/);
       return true;
     },
@@ -760,7 +891,9 @@ test("routing policy remains saved while System Proxy mode is selected", async (
   assert.equal(controller.getSnapshot().runtimeScope, "system-proxy");
   await controller.applyRouting({ defaultRoute: "vpn", apps: [] });
   assert.equal(controller.getSnapshot().routing.defaultRoute, "vpn");
-  await assert.rejects(controller.saveSettings(controller.getSnapshot().settings), { code: "capability-unavailable" });
+  await controller.saveSettings({ ...controller.getSnapshot().settings, theme: "light" });
+  assert.equal(controller.getSnapshot().settings.theme, "light");
+  await assert.rejects(controller.saveSettings({ ...controller.getSnapshot().settings, httpPort: 3333 }), { code: "capability-unavailable" });
   controller.dispose();
 });
 
@@ -847,6 +980,8 @@ test("TUN controller path uses typed start and stop commands with current routin
         nodeId: "fixture-node",
         routing: {
           defaultRoute: "vpn",
+          stack: "gvisor",
+          trafficRules: [{ network: "udp", port: 443, action: "block" }],
           apps: [{ processPath: "C:\\Apps\\browser.exe", processName: "browser.exe", route: "direct" }],
         },
       },
@@ -854,6 +989,175 @@ test("TUN controller path uses typed start and stop commands with current routin
     { command: "stop_tun", arguments_: undefined },
   ]);
   controller.dispose();
+});
+
+test("TUN stack migrates to gvisor, is omitted from System Proxy, and reconnects only active TUN", async () => {
+  await withPreferenceStorage(async () => {
+    const f = await lifecycleFixture();
+    assert.equal(f.controller.getSnapshot().routing.tunStack, "gvisor");
+    await f.controller.applyRouting({ ...f.controller.getSnapshot().routing, tunStack: "gvisor" });
+    assert.deepEqual(f.calls, []);
+    await f.controller.setMode("tun");
+    assert.equal((f.calls.at(-1)?.arguments_?.routing as { stack?: string }).stack, "gvisor");
+    f.calls.length = 0;
+    await f.controller.applyRouting({ ...f.controller.getSnapshot().routing, tunStack: "system" });
+    assert.deepEqual(f.calls.map((call) => call.command), ["stop_tun", "start_tun"]);
+    assert.equal((f.calls[1].arguments_?.routing as { stack?: string }).stack, "system");
+    f.controller.dispose();
+  }, { "routedeck.routing.v1": '{"defaultRoute":"direct","apps":[]}' });
+});
+
+test("unknown persisted or submitted TUN stack fails safely", async () => {
+  await withPreferenceStorage(async () => {
+    const f = await lifecycleFixture(false);
+    assert.deepEqual(f.controller.getSnapshot().routing, { defaultRoute: "direct", tunStack: "gvisor", naiveUdpOverTcp: false, trafficRules: defaultTrafficRules(), apps: [] });
+    await assert.rejects(f.controller.applyRouting({ defaultRoute: "vpn", tunStack: "native", apps: [] } as unknown as RoutingConfig), { code: "invalid-routing" });
+    assert.deepEqual(f.calls, []);
+    f.controller.dispose();
+  }, { "routedeck.routing.v1": '{"defaultRoute":"vpn","tunStack":"native","apps":[]}' });
+});
+
+test("gvisor is the fresh default while an explicit saved system stack is retained", () => {
+  assert.equal(validatedRouting({ defaultRoute: "direct", apps: [] }).tunStack, "gvisor");
+  assert.equal(validatedRouting({ defaultRoute: "direct", apps: [], tunStack: "system" }).tunStack, "system");
+});
+
+test("Naive UoT is opt-in, persisted, typed and restarts only a relevant protocol", async () => {
+  await withPreferenceStorage(async () => {
+    const ordinary = await lifecycleFixture();
+    await ordinary.controller.applyRouting({ ...ordinary.controller.getSnapshot().routing, naiveUdpOverTcp: true });
+    assert.deepEqual(ordinary.calls, [], "unrelated VLESS session remains running");
+    ordinary.controller.dispose();
+    const naive = await lifecycleFixture(true, "naive");
+    assert.equal(naive.controller.getSnapshot().routing.naiveUdpOverTcp, true);
+    await naive.controller.applyRouting({ ...naive.controller.getSnapshot().routing, naiveUdpOverTcp: false });
+    assert.deepEqual(naive.calls.map((call) => call.command), ["stop_system_proxy", "start_system_proxy"]);
+    await naive.controller.setMode("tun"); naive.calls.length = 0;
+    await naive.controller.applyRouting({ ...naive.controller.getSnapshot().routing, naiveUdpOverTcp: true });
+    assert.deepEqual(naive.calls.map((call) => call.command), ["stop_tun", "start_tun"]);
+    assert.equal((naive.calls.at(-1)?.arguments_?.routing as any).naiveUdpOverTcp, true);
+    naive.controller.dispose();
+  });
+  assert.equal(validatedRouting({ defaultRoute: "direct", apps: [] }).naiveUdpOverTcp, false);
+  for (const naiveUdpOverTcp of ["true", 1, null, {}, []]) assert.throws(() => validatedRouting({ defaultRoute: "direct", apps: [], naiveUdpOverTcp }), { code: "invalid-routing" });
+});
+
+test("selected server and mode survive restart without automatically connecting", async () => {
+  await withPreferenceStorage(async (storage) => {
+    const f = await lifecycleFixture(false);
+    await f.controller.selectServer("b"); await f.controller.setMode("tun");
+    assert.deepEqual(f.calls, []);
+    assert.deepEqual(JSON.parse(storage.get("routedeck.selection.v1")!), { version: 1, selectedServerId: "b", mode: "tun" });
+    const restored = await lifecycleFixture(false);
+    assert.equal(restored.controller.getSnapshot().selectedServerId, "b");
+    assert.equal(restored.controller.getSnapshot().mode, "tun");
+    assert.equal(restored.controller.getSnapshot().phase, "disconnected");
+    assert.deepEqual(restored.calls, []);
+    const active = await lifecycleFixture(true);
+    assert.equal(active.controller.getSnapshot().selectedServerId, "a", "actual runtime takes precedence over saved intent");
+    assert.equal(active.controller.getSnapshot().mode, "proxy");
+    await restored.controller.resetLocalState();
+    assert.equal(storage.has("routedeck.selection.v1"), false);
+    f.controller.dispose(); restored.controller.dispose(); active.controller.dispose();
+  });
+});
+
+test("invalid and missing saved selection falls back to an existing server", async () => {
+  for (const stored of ['null', '{"version":1,"selectedServerId":"missing","mode":"tun"}', '{"version":1,"selectedServerId":"b","mode":"other"}', '{"version":1,"selectedServerId":"b","mode":"tun","extra":true}', '{"version":1,"selectedServerId":4,"mode":"tun"}']) {
+    await withPreferenceStorage(async () => {
+      const f = await lifecycleFixture(false);
+      assert.equal(f.controller.getSnapshot().selectedServerId, "a");
+      assert.deepEqual(f.calls, []);
+      f.controller.dispose();
+    }, { "routedeck.selection.v1": stored });
+  }
+});
+
+test("selection persistence failure cannot disrupt a working connection", async () => {
+  await withPreferenceStorage(async (_storage, faults) => {
+    const f = await lifecycleFixture(); faults.write = true;
+    await assert.rejects(f.controller.selectServer("b"), { code: "preferences-save-failed" });
+    await assert.rejects(f.controller.setMode("tun"), { code: "preferences-save-failed" });
+    assert.equal(f.controller.getSnapshot().selectedServerId, "a");
+    assert.equal(f.controller.getSnapshot().mode, "proxy");
+    assert.deepEqual(f.calls, []); f.controller.dispose();
+  });
+});
+
+test("traffic rules migrate once and explicit removal survives loading", async () => {
+  await withPreferenceStorage(async () => {
+    const f = await lifecycleFixture(false);
+    assert.deepEqual(f.controller.getSnapshot().routing.trafficRules, defaultTrafficRules());
+    await f.controller.applyRouting({ ...f.controller.getSnapshot().routing, trafficRules: [] });
+    const restored = await lifecycleFixture(false);
+    assert.deepEqual(restored.controller.getSnapshot().routing.trafficRules, []);
+    assert.deepEqual(f.calls, []);
+    f.controller.dispose(); restored.controller.dispose();
+  }, { "routedeck.routing.v1": '{"defaultRoute":"direct","apps":[]}' });
+});
+
+test("traffic rule boundary rejects malformed, excessive and ambiguous input", () => {
+  const base = { defaultRoute: "direct", apps: [] };
+  const rule = defaultTrafficRules()[0];
+  const invalid = [null, {}, "rules", Array.from({ length: 33 }, (_, i) => ({ ...rule, id: String(i) })),
+    [rule, rule], [null], [{ ...rule, id: "" }], [{ ...rule, id: "x".repeat(129) }],
+    [{ ...rule, enabled: 1 }], [{ ...rule, network: "quic" }], [{ ...rule, network: ["udp"] }],
+    [{ ...rule, port: "443" }], [{ ...rule, port: 0 }], [{ ...rule, port: 53 }],
+    [{ ...rule, port: 65536 }], [{ ...rule, port: 443.5 }], [{ ...rule, port: NaN }],
+    [{ ...rule, action: "drop" }], [{ ...rule, outbound: "selected" }], [{ ...rule, inbound: ["health-in"] }]];
+  for (const trafficRules of invalid) assert.throws(() => validatedRouting({ ...base, trafficRules }), { code: "invalid-routing" });
+  for (const port of [1, 443, 65535]) {
+    assert.equal(validatedRouting({ ...base, trafficRules: [{ ...rule, port }] }).trafficRules[0].port, port);
+  }
+});
+
+test("traffic edits reconnect only TUN, preserve order, and omit disabled rows and UI fields from IPC", async () => {
+  const f = await lifecycleFixture();
+  const block = defaultTrafficRules()[0];
+  const direct = { ...block, id: "direct-443", action: "direct" as const };
+  await f.controller.applyRouting({ ...f.controller.getSnapshot().routing, trafficRules: [direct, block] });
+  assert.deepEqual(f.calls, [], "System Proxy ignores TUN rules");
+  await f.controller.setMode("tun");
+  assert.deepEqual((f.calls.at(-1)?.arguments_?.routing as any).trafficRules, [
+    { network: "udp", port: 443, action: "direct" }, { network: "udp", port: 443, action: "block" },
+  ]);
+  f.calls.length = 0;
+  await f.controller.applyRouting({ ...f.controller.getSnapshot().routing, trafficRules: [block, direct] });
+  assert.deepEqual(f.calls.map((call) => call.command), ["stop_tun", "start_tun"], "first-match order is significant");
+  f.calls.length = 0;
+  await f.controller.applyRouting({ ...f.controller.getSnapshot().routing, trafficRules: [{ ...block, enabled: false }, direct] });
+  assert.deepEqual((f.calls.at(-1)?.arguments_?.routing as any).trafficRules, [{ network: "udp", port: 443, action: "direct" }]);
+  f.calls.length = 0;
+  await f.controller.applyRouting({ ...f.controller.getSnapshot().routing, trafficRules: [{ ...block, enabled: false, port: 80 }, { ...direct, id: "renamed" }] });
+  assert.deepEqual(f.calls, [], "disabled edits and UI identity do not restart TUN");
+  await f.controller.setMode("proxy");
+  assert.equal(Object.hasOwn(f.calls.at(-1)?.arguments_?.routing as object, "trafficRules"), false);
+  f.controller.dispose();
+});
+
+test("traffic rules persist before restart and preserve working TUN on storage failure", async () => {
+  await withPreferenceStorage(async (_storage, faults) => {
+    const f = await lifecycleFixture();
+    await f.controller.setMode("tun");
+    f.calls.length = 0;
+    faults.write = true;
+    await assert.rejects(f.controller.applyRouting({ ...f.controller.getSnapshot().routing, trafficRules: [] }), { code: "preferences-save-failed" });
+    assert.deepEqual(f.calls, []);
+    assert.deepEqual(f.controller.getSnapshot().routing.trafficRules, defaultTrafficRules());
+    f.controller.dispose();
+  });
+});
+
+test("failed TUN stop prevents traffic-rule restart and retains saved pending changes", async () => {
+  const f = await lifecycleFixture();
+  await f.controller.setMode("tun");
+  f.calls.length = 0;
+  f.hooks.stop = async () => { throw { code: "runtime_failure", stage: "cleanup", message: "fixture failure" }; };
+  await assert.rejects(f.controller.applyRouting({ ...f.controller.getSnapshot().routing, trafficRules: [] }));
+  assert.deepEqual(f.calls.map((call) => call.command), ["stop_tun"]);
+  assert.deepEqual(f.controller.getSnapshot().routing.trafficRules, []);
+  assert.equal(f.controller.getSnapshot().routingPending, true);
+  f.controller.dispose();
 });
 
 test("ordinary TUN privilege failure maps to plain finite copy", async () => {
@@ -1042,7 +1346,7 @@ test("malformed diagnostics always clears the running flag and fails closed", as
     listen: async () => () => undefined,
     invoke: async (command) => command === "runtime_status"
       ? runtimeStatus(1, "disconnected")
-      : { status: { ...runtimeStatus(2, "disconnected"), unexpected: true }, lines: [] },
+      : { status: { ...runtimeStatus(2, "disconnected"), unexpected: true }, lines: [], systemProxy: { state: "disabled", endpoint: null, detail: "", cleanupToken: null } },
   };
   const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
@@ -1057,7 +1361,7 @@ test("runtime diagnostics is labelled as a received snapshot, not a fresh proof 
     listen: async () => () => undefined,
     invoke: async (command) => command === "runtime_status"
       ? runtimeStatus(1, "disconnected")
-      : { status: runtimeStatus(2, "disconnected"), lines: ["sanitized"] },
+      : { status: runtimeStatus(2, "disconnected"), lines: ["sanitized"], systemProxy: { state: "disabled", endpoint: null, detail: "Прокси отключён.", cleanupToken: null } },
   };
   const controller = new TauriController(async () => withEmptyConfirmedNodes(transport));
   await controller.ready();
@@ -1067,5 +1371,524 @@ test("runtime diagnostics is labelled as a received snapshot, not a fresh proof 
   assert.equal(diagnostics.running, false);
   assert.ok(diagnostics.steps.every((proof) => proof.checkedAt === undefined));
   assert.deepEqual(diagnostics.sanitizedLog, ["sanitized"]);
+  controller.dispose();
+});
+
+test("system proxy diagnostics accepts only sanitized loopback endpoints and stale cleanup tokens", () => {
+  const status = runtimeStatus(2, "disconnected");
+  const token = "a".repeat(64);
+  assert.equal(parseDiagnostics({ status, lines: [], systemProxy: { state: "stale", endpoint: "127.0.0.1:10808", detail: "Локальный порт не отвечает.", cleanupToken: token } }).systemProxy.cleanupToken, token);
+  assert.equal(parseDiagnostics({ status, lines: [], systemProxy: { state: "owned", endpoint: "[::1]:2080", detail: "Порт отвечает.", cleanupToken: null } }).systemProxy.endpoint, "[::1]:2080");
+  assert.equal(parseDiagnostics({ status, lines: [], systemProxy: { state: "stale", endpoint: "127.0.0.1:10808", detail: "Очистка временно недоступна.", cleanupToken: null } }).systemProxy.cleanupToken, null);
+  for (const systemProxy of [
+    { state: "stale", endpoint: "example.com:1080", detail: "", cleanupToken: token },
+    { state: "stale", endpoint: "127.0.0.1:1080", detail: "https://user:secret@example.invalid", cleanupToken: token },
+    { state: "stale", endpoint: "127.0.0.1:1080", detail: "", cleanupToken: "short" },
+    { state: "owned", endpoint: "127.0.0.1:1080", detail: "", cleanupToken: token },
+    { state: "stale", endpoint: null, detail: "", cleanupToken: token },
+  ]) assert.throws(() => parseDiagnostics({ status, lines: [], systemProxy }), ContractViolation);
+});
+
+test("stale proxy cleanup is typed, single-use, and publishes the returned diagnostic snapshot", async () => {
+  const token = "b".repeat(64);
+  const calls: Array<{ command: string; arguments_?: Record<string, unknown> }> = [];
+  const stale = { state: "stale", endpoint: "127.0.0.1:10808", detail: "Локальный порт не отвечает.", cleanupToken: token };
+  const disabled = { state: "disabled", endpoint: null, detail: "Прокси отключён.", cleanupToken: null };
+  const transport: TauriTransport = { listen: async () => () => undefined, invoke: async (command, arguments_) => {
+    calls.push({ command, arguments_ });
+    if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+    if (command === "confirmed_nodes") return [];
+    if (command === "runtime_diagnostics") return { status: runtimeStatus(2, "disconnected"), lines: [], systemProxy: stale };
+    if (command === "clear_stale_system_proxy") return { status: runtimeStatus(3, "disconnected"), lines: ["cleaned"], systemProxy: disabled };
+    throw new Error("unexpected command");
+  } };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+  await controller.runDiagnostics();
+  await controller.clearStaleSystemProxy(token);
+  assert.deepEqual(calls.at(-1), { command: "clear_stale_system_proxy", arguments_: { token } });
+  assert.deepEqual(controller.getSnapshot().diagnostics.systemProxy, disabled);
+  await assert.rejects(controller.clearStaleSystemProxy(token), { code: "backend-response-invalid" });
+  controller.dispose();
+});
+
+test("diagnostic refresh invalidates its prior token and ignores an older response", async () => {
+  const first = deferred<unknown>();
+  let diagnosticsCalls = 0;
+  const stale = (token: string, detail: string) => ({ status: runtimeStatus(1, "disconnected"), lines: [detail], systemProxy: { state: "stale", endpoint: "127.0.0.1:10808", detail, cleanupToken: token } });
+  const transport: TauriTransport = { listen: async () => () => undefined, invoke: async (command) => {
+    if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+    if (command === "confirmed_nodes") return [];
+    if (command === "runtime_diagnostics") return ++diagnosticsCalls === 1 ? first.promise : stale("c".repeat(64), "new");
+    throw new Error("unexpected command");
+  } };
+  const controller = new TauriController(async () => transport); await controller.ready();
+  const old = controller.runDiagnostics();
+  assert.equal(controller.getSnapshot().diagnostics.systemProxy.cleanupToken, null);
+  await controller.runDiagnostics();
+  first.resolve(stale("d".repeat(64), "old"));
+  await old;
+  assert.equal(controller.getSnapshot().diagnostics.systemProxy.cleanupToken, "c".repeat(64));
+  assert.deepEqual(controller.getSnapshot().diagnostics.sanitizedLog, ["new"]);
+  controller.dispose();
+});
+
+test("cleanup rejects duplicate direct calls and consumes the token after failure", async () => {
+  const token = "f".repeat(64);
+  const cleanup = deferred<unknown>();
+  const transport: TauriTransport = { listen: async () => () => undefined, invoke: async (command) => {
+    if (command === "runtime_status") return runtimeStatus(1, "disconnected");
+    if (command === "confirmed_nodes") return [];
+    if (command === "runtime_diagnostics") return { status: runtimeStatus(1, "disconnected"), lines: [], systemProxy: { state: "stale", endpoint: "127.0.0.1:10808", detail: "stale", cleanupToken: token } };
+    if (command === "clear_stale_system_proxy") return cleanup.promise;
+    throw new Error("unexpected command");
+  } };
+  const controller = new TauriController(async () => transport); await controller.ready(); await controller.runDiagnostics();
+  const pending = controller.clearStaleSystemProxy(token);
+  await assert.rejects(controller.clearStaleSystemProxy(token), { code: "capability-unavailable" });
+  cleanup.reject({ code: "runtime_failure", stage: "system_proxy_restore", message: "failed" });
+  await assert.rejects(pending, { code: "runtime-failure" });
+  assert.equal(controller.getSnapshot().diagnostics.systemProxy.cleanupToken, null);
+  controller.dispose();
+});
+
+test("offline selections never start a runtime", async () => {
+  const f = await lifecycleFixture(false);
+  await f.controller.selectServer("b");
+  await f.controller.setMode("tun");
+  assert.equal(f.controller.getSnapshot().selectedServerId, "b");
+  assert.equal(f.controller.getSnapshot().mode, "tun");
+  assert.equal(f.calls.length, 0);
+  f.controller.dispose();
+});
+
+test("connected server and mode changes stop the actual mode before starting the target", async () => {
+  const f = await lifecycleFixture();
+  await f.controller.selectServer("b");
+  await f.controller.setMode("tun");
+  await f.controller.setMode("proxy");
+  assert.deepEqual(f.calls.map((call) => call.command), ["stop_system_proxy", "start_system_proxy", "stop_system_proxy", "start_tun", "stop_tun", "start_system_proxy"]);
+  assert.equal(f.controller.getSnapshot().activeServerId, "b");
+  assert.equal(f.controller.getSnapshot().activeMode, "proxy");
+  assert.equal(f.controller.getSnapshot().switching, false);
+  f.controller.dispose();
+});
+
+test("rapid changes coalesce while stop is pending and preserve actual versus desired selection", async () => {
+  const f = await lifecycleFixture();
+  const stopped = deferred<unknown>();
+  const entered = deferred();
+  f.hooks.stop = async () => { entered.resolve(); return stopped.promise; };
+  const first = f.controller.selectServer("b");
+  await entered.promise;
+  const second = f.controller.selectServer("c");
+  const mode = f.controller.setMode("tun");
+  assert.equal(f.controller.getSnapshot().activeServerId, "a");
+  assert.equal(f.controller.getSnapshot().activeMode, "proxy");
+  assert.equal(f.controller.getSnapshot().selectedServerId, "c");
+  assert.equal(f.controller.getSnapshot().mode, "tun");
+  stopped.resolve(f.status("disconnected"));
+  await Promise.all([first, second, mode]);
+  assert.deepEqual(f.calls.map((call) => call.command), ["stop_system_proxy", "start_tun"]);
+  assert.equal(f.calls[1].arguments_?.nodeId, "c");
+  f.controller.dispose();
+});
+
+test("disconnect cancels a reconnect waiting for verified stop", async () => {
+  const f = await lifecycleFixture();
+  const stopped = deferred<unknown>();
+  const entered = deferred();
+  f.hooks.stop = async () => { entered.resolve(); return stopped.promise; };
+  const switching = f.controller.selectServer("b");
+  await entered.promise;
+  const disconnecting = f.controller.disconnect();
+  stopped.resolve(f.status("disconnected"));
+  await Promise.all([switching, disconnecting]);
+  assert.deepEqual(f.calls.map((call) => call.command), ["stop_system_proxy"]);
+  assert.equal(f.controller.getSnapshot().phase, "disconnected");
+  f.controller.dispose();
+});
+
+test("disconnect during startup waits for completion and tears down that exact runtime", async () => {
+  const f = await lifecycleFixture(false);
+  const started = deferred<unknown>();
+  const entered = deferred();
+  f.hooks.start = async () => { entered.resolve(); return started.promise; };
+  await f.controller.setMode("tun");
+  const connecting = f.controller.connect();
+  await entered.promise;
+  const disconnecting = f.controller.disconnect();
+  started.resolve(f.status("tun_ready"));
+  await Promise.all([connecting, disconnecting]);
+  assert.deepEqual(f.calls.map((call) => call.command), ["start_tun", "stop_tun"]);
+  assert.equal(f.controller.getSnapshot().phase, "disconnected");
+  f.controller.dispose();
+});
+
+test("retained runtime after stop failure prevents every queued restart", async () => {
+  const f = await lifecycleFixture();
+  f.hooks.stop = async () => ({ ...f.status("system_proxy_ready"), phase: "recovery_required", steadyLatencyMs: undefined, error: { code: "recovery_required", stage: "system_proxy_restore", message: "Recovery required" } });
+  await assert.rejects(f.controller.selectServer("b"), { code: "runtime-failure" });
+  await assert.rejects(f.controller.connect(), { code: "runtime-failure" });
+  assert.equal(f.calls.some((call) => call.command.startsWith("start_")), false);
+  assert.equal(f.controller.getSnapshot().phase, "failed");
+  f.controller.dispose();
+});
+
+test("cancelled UAC never starts a fallback or retries by itself", async () => {
+  const f = await lifecycleFixture();
+  f.hooks.start = async () => { throw { code: "runtime_failure", stage: "start", message: "Operation failed", detail: "TUN permission request was cancelled" }; };
+  await assert.rejects(f.controller.setMode("tun"), { code: "tun-uac-cancelled" });
+  await f.controller.selectServer("c");
+  assert.deepEqual(f.calls.map((call) => call.command), ["stop_system_proxy", "start_tun"]);
+  assert.equal(f.controller.getSnapshot().switching, false);
+  f.controller.dispose();
+});
+
+test("duplicate connect actions share one active runtime", async () => {
+  const f = await lifecycleFixture(false);
+  await Promise.all([f.controller.connect(), f.controller.connect(), f.controller.connect()]);
+  assert.deepEqual(f.calls.map((call) => call.command), ["start_system_proxy"]);
+  f.controller.dispose();
+});
+
+test("explicit retry re-establishes an existing connection instead of becoming a no-op", async () => {
+  const f = await lifecycleFixture();
+  await f.controller.retry();
+  assert.deepEqual(f.calls.map((call) => call.command), ["stop_system_proxy", "start_system_proxy"]);
+  assert.equal(f.controller.getSnapshot().phase, "connected");
+  f.controller.dispose();
+});
+
+test("retry cannot start a new runtime if stopping the previous one fails", async () => {
+  const f = await lifecycleFixture();
+  f.hooks.stop = async () => { throw { code: "runtime_failure", stage: "system_proxy_restore", message: "Fixture restoration failure" }; };
+  await assert.rejects(f.controller.retry(), { code: "runtime-failure" });
+  assert.equal(f.calls.some((call) => call.command.startsWith("start_")), false);
+  f.controller.dispose();
+});
+
+test("refresh active subscription stops, reloads authoritative nodes and reconnects", async () => {
+  const f = await lifecycleFixture();
+  await f.controller.refreshSource(f.sourceId);
+  assert.deepEqual(f.calls.map((call) => call.command), ["stop_system_proxy", "refresh_source", "confirmed_nodes", "start_system_proxy"]);
+  assert.equal(f.controller.getSnapshot().servers[0].sourceUpdatedAtMs, 200);
+  assert.equal(f.controller.getSnapshot().activeServerId, "a");
+  f.controller.dispose();
+});
+
+test("refresh failure retains the source and restores the previous connection", async () => {
+  const f = await lifecycleFixture();
+  f.hooks.refresh = async () => { throw { code: "subscription_fetch_failed", stage: "subscription_fetch", message: "subscription.fetch_failed" }; };
+  await assert.rejects(f.controller.refreshSource(f.sourceId), { code: "subscription-fetch-failed" });
+  assert.deepEqual(f.calls.map((call) => call.command), ["stop_system_proxy", "refresh_source", "start_system_proxy"]);
+  assert.equal(f.controller.getSnapshot().servers.length, 3);
+  assert.equal(f.controller.getSnapshot().servers[0].sourceUpdatedAtMs, 100);
+  f.controller.dispose();
+});
+
+test("disconnect during refresh failure prevents restoration", async () => {
+  const f = await lifecycleFixture();
+  const refresh = deferred<unknown>();
+  const entered = deferred();
+  f.hooks.refresh = async () => { entered.resolve(); return refresh.promise; };
+  const refreshing = f.controller.refreshSource(f.sourceId);
+  await entered.promise;
+  const disconnecting = f.controller.disconnect();
+  const rejected = assert.rejects(refreshing, { code: "subscription-fetch-failed" });
+  refresh.reject({ code: "subscription_fetch_failed", stage: "subscription_fetch", message: "subscription.fetch_failed" });
+  await Promise.all([rejected, disconnecting]);
+  assert.equal(f.calls.some((call) => call.command.startsWith("start_")), false);
+  f.controller.dispose();
+});
+
+test("deleting active source stops and selects remaining server without connecting", async () => {
+  const f = await lifecycleFixture();
+  await f.controller.removeSource(f.sourceId);
+  assert.deepEqual(f.calls.map((call) => call.command), ["stop_system_proxy", "remove_source", "confirmed_nodes"]);
+  assert.equal(f.controller.getSnapshot().selectedServerId, "c");
+  assert.equal(f.controller.getSnapshot().activeServerId, undefined);
+  assert.equal(f.controller.getSnapshot().servers.length, 1);
+  f.controller.dispose();
+});
+
+test("source changes outside active group leave the runtime untouched", async () => {
+  const f = await lifecycleFixture();
+  await f.controller.removeSource("b".repeat(32));
+  assert.deepEqual(f.calls.map((call) => call.command), ["remove_source", "confirmed_nodes"]);
+  assert.equal(f.controller.getSnapshot().activeServerId, "a");
+  f.controller.dispose();
+});
+
+test("source refresh metadata rejects malformed values and mismatched group revisions", () => {
+  const node = { id: "a", displayName: "A", protocol: "naive", insecureTls: false, sourceId: "a".repeat(32), sourceName: "Group", sourceKind: "subscription", sourceRefreshable: true, sourceUpdatedAtMs: 100 };
+  assert.equal(parseConfirmedNodes([node])[0].sourceUpdatedAtMs, 100);
+  for (const patch of [{ sourceRefreshable: "true" }, { sourceUpdatedAtMs: -1 }, { sourceUpdatedAtMs: 0.1 }, { sourceUpdatedAtMs: Number.MAX_SAFE_INTEGER + 1 }, { sourceKind: "manual" }]) {
+    assert.throws(() => parseConfirmedNodes([{ ...node, ...patch }]), ContractViolation);
+  }
+  assert.throws(() => parseConfirmedNodes([node, { ...node, id: "b", sourceUpdatedAtMs: 101 }]), ContractViolation);
+});
+
+test("selection changing during startup finishes teardown before starting the latest target", async () => {
+  const f = await lifecycleFixture(false);
+  const started = deferred<unknown>();
+  const entered = deferred();
+  f.hooks.start = async () => { entered.resolve(); return started.promise; };
+  const connecting = f.controller.connect();
+  await entered.promise;
+  const selection = f.controller.selectServer("c");
+  const mode = f.controller.setMode("tun");
+  f.hooks.start = undefined;
+  started.resolve(f.status("system_proxy_ready"));
+  await Promise.all([connecting, selection, mode]);
+  assert.deepEqual(f.calls.map((call) => call.command), ["start_system_proxy", "stop_system_proxy", "start_tun"]);
+  assert.equal(f.controller.getSnapshot().activeServerId, "c");
+  f.controller.dispose();
+});
+
+test("rejected teardown prevents source mutation and preserves its visible nodes", async () => {
+  const f = await lifecycleFixture();
+  f.hooks.stop = async () => { throw { code: "runtime_failure", stage: "stop_engine", message: "Stop failed" }; };
+  await assert.rejects(f.controller.refreshSource(f.sourceId), { code: "runtime-failure" });
+  await assert.rejects(f.controller.removeSource(f.sourceId), { code: "runtime-failure" });
+  assert.deepEqual(f.calls.map((call) => call.command), ["stop_system_proxy", "stop_system_proxy"]);
+  assert.equal(f.controller.getSnapshot().servers.length, 3);
+  f.controller.dispose();
+});
+
+test("stale stop response cannot authorize a new start", async () => {
+  const f = await lifecycleFixture();
+  f.hooks.stop = async () => runtimeStatus(0, "disconnected");
+  await assert.rejects(f.controller.selectServer("b"), { code: "runtime-failure" });
+  assert.deepEqual(f.calls.map((call) => call.command), ["stop_system_proxy"]);
+  assert.equal(f.controller.getSnapshot().activeServerId, "a");
+  f.controller.dispose();
+});
+
+test("replacement subscription URL is passed only to typed IPC and never retained in public state", async () => {
+  const f = await lifecycleFixture(false);
+  const url = "https://fixture.invalid/subscription?token=private-fixture";
+  await f.controller.refreshSource(f.sourceId, url);
+  assert.deepEqual(f.calls[0], { command: "refresh_source", arguments_: { sourceId: f.sourceId, url } });
+  assert.doesNotMatch(JSON.stringify(f.controller.getSnapshot()), /private-fixture|fixture\.invalid/);
+  assert.doesNotMatch(f.controller.getSanitizedReport(), /private-fixture|fixture\.invalid/);
+  f.controller.dispose();
+});
+
+test("incomplete source refresh uses localized copy and keeps the prior library", async () => {
+  const f = await lifecycleFixture(false);
+  f.hooks.refresh = async () => { throw { code: "import_rejected", stage: "import", message: "subscription.refresh_incomplete" }; };
+  await assert.rejects(f.controller.refreshSource(f.sourceId), { code: "subscription-refresh-incomplete" });
+  assert.match(toPublicActionError(new RouteDeckError("subscription-refresh-incomplete")).message, /Прежние серверы сохранены/);
+  assert.equal(f.controller.getSnapshot().servers[0].sourceUpdatedAtMs, 100);
+  f.controller.dispose();
+});
+
+test("a start reply for a different mode or node never enters an automatic restart loop", async () => {
+  for (const mismatch of ["mode", "node"] as const) {
+    const f = await lifecycleFixture(false);
+    f.hooks.start = async () => f.status(mismatch === "mode" ? "local_proxy_ready" : "system_proxy_ready", mismatch === "node" ? "b" : "a");
+    await assert.rejects(f.controller.connect(), { code: "runtime-failure" });
+    assert.deepEqual(f.calls.map((call) => call.command), ["start_system_proxy"]);
+    f.controller.dispose();
+  }
+});
+
+test("routing autosave persists offline edits and restores inherit rows without touching runtime", async () => {
+  await withPreferenceStorage(async (storage) => {
+    const f = await lifecycleFixture(false);
+    await f.controller.applyRouting({ defaultRoute: "vpn", apps: [{ id: "app", name: " App ", path: "C:/Apps/App.exe", route: "inherit" }] });
+    assert.deepEqual(f.calls, []);
+    assert.deepEqual(JSON.parse(storage.get("routedeck.routing.v1")!), { defaultRoute: "vpn", tunStack: "gvisor", naiveUdpOverTcp: false, trafficRules: defaultTrafficRules(), apps: [{ id: "app", name: "App", path: "C:\\Apps\\App.exe", route: "inherit" }] });
+    const restored = await lifecycleFixture(false);
+    assert.deepEqual(restored.controller.getSnapshot().routing, f.controller.getSnapshot().routing);
+    f.controller.dispose(); restored.controller.dispose();
+  });
+});
+
+test("routing autosave while connected restarts once with the latest saved edits", async () => {
+  const f = await lifecycleFixture();
+  const stopped = deferred<unknown>(); const entered = deferred();
+  f.hooks.stop = async () => { entered.resolve(); return stopped.promise; };
+  const first = f.controller.applyRouting({ defaultRoute: "vpn", apps: [] });
+  await entered.promise;
+  const finalRouting = { defaultRoute: "direct" as const, apps: [{ id: "browser", name: "Browser", path: "C:\\Apps\\browser.exe", route: "vpn" as const }] };
+  const second = f.controller.applyRouting(finalRouting);
+  assert.equal(f.controller.getSnapshot().routingPending, true);
+  assert.deepEqual(f.controller.getSnapshot().routing, { ...finalRouting, tunStack: "gvisor", naiveUdpOverTcp: false, trafficRules: defaultTrafficRules() });
+  stopped.resolve(f.status("disconnected"));
+  await Promise.all([first, second]);
+  assert.deepEqual(f.calls.map((call) => call.command), ["stop_system_proxy", "start_system_proxy"]);
+  assert.deepEqual(f.calls[1].arguments_?.routing, { defaultRoute: "direct", apps: [{ processPath: "C:\\Apps\\browser.exe", processName: "browser.exe", route: "vpn" }] });
+  assert.equal(f.controller.getSnapshot().routingPending, false);
+  f.controller.dispose();
+});
+
+test("routing edits arriving during startup are applied after exact teardown", async () => {
+  const f = await lifecycleFixture(false);
+  const started = deferred<unknown>(); const entered = deferred();
+  f.hooks.start = async () => { entered.resolve(); return started.promise; };
+  const connecting = f.controller.connect(); await entered.promise;
+  const editing = f.controller.applyRouting({ defaultRoute: "vpn", apps: [] });
+  f.hooks.start = undefined; started.resolve(f.status("system_proxy_ready"));
+  await Promise.all([connecting, editing]);
+  assert.deepEqual(f.calls.map((call) => call.command), ["start_system_proxy", "stop_system_proxy", "start_system_proxy"]);
+  assert.equal((f.calls[2].arguments_?.routing as { defaultRoute: string }).defaultRoute, "vpn");
+  f.controller.dispose();
+});
+
+test("disconnect during routing autosave preserves the saved edit without reconnecting", async () => {
+  const f = await lifecycleFixture();
+  const stopped = deferred<unknown>(); const entered = deferred();
+  f.hooks.stop = async () => { entered.resolve(); return stopped.promise; };
+  const editing = f.controller.applyRouting({ defaultRoute: "vpn", apps: [] }); await entered.promise;
+  const disconnecting = f.controller.disconnect(); stopped.resolve(f.status("disconnected"));
+  await Promise.all([editing, disconnecting]);
+  assert.deepEqual(f.calls.map((call) => call.command), ["stop_system_proxy"]);
+  assert.equal(f.controller.getSnapshot().routing.defaultRoute, "vpn");
+  f.controller.dispose();
+});
+
+test("failed routing restart keeps saved edits and marks old active rules pending", async () => {
+  await withPreferenceStorage(async (storage) => {
+    const f = await lifecycleFixture();
+    f.hooks.stop = async () => ({ ...f.status("system_proxy_ready"), phase: "recovery_required", steadyLatencyMs: undefined, error: { code: "recovery_required", stage: "system_proxy_restore", message: "Recovery required" } });
+    await assert.rejects(f.controller.applyRouting({ defaultRoute: "vpn", apps: [] }), { code: "runtime-failure" });
+    assert.equal(f.controller.getSnapshot().routing.defaultRoute, "vpn");
+    assert.equal(f.controller.getSnapshot().routingPending, true);
+    assert.equal(JSON.parse(storage.get("routedeck.routing.v1")!).defaultRoute, "vpn");
+    assert.equal(f.calls.some((call) => call.command.startsWith("start_")), false);
+    f.controller.dispose();
+  });
+});
+
+test("routing write failure preserves the active runtime and previous saved selection", async () => {
+  await withPreferenceStorage(async (_storage, faults) => {
+    const f = await lifecycleFixture(); faults.write = true;
+    await assert.rejects(f.controller.applyRouting({ defaultRoute: "vpn", apps: [] }), { code: "preferences-save-failed" });
+    assert.deepEqual(f.calls, []);
+    assert.equal(f.controller.getSnapshot().routing.defaultRoute, "direct");
+    assert.equal(f.controller.getSnapshot().activeServerId, "a");
+    f.controller.dispose();
+  });
+});
+
+test("display-only routing edits do not restart an active runtime", async () => {
+  const f = await lifecycleFixture();
+  await f.controller.applyRouting({ defaultRoute: "direct", apps: [{ id: "app", name: "Inherited", path: "C:\\Apps\\app.exe", route: "inherit" }] });
+  assert.deepEqual(f.calls, []);
+  assert.equal(f.controller.getSnapshot().routingPending, false);
+  f.controller.dispose();
+});
+
+test("invalid routing paths, duplicate identities and unsupported fields are rejected before saving", async () => {
+  const f = await lifecycleFixture();
+  const app = { id: "app", name: "App", path: "C:\\Apps\\app.exe", route: "vpn" as const };
+  for (const apps of [[{ ...app, path: "  " }], [{ ...app, path: "app.exe" }], [{ ...app, path: "C:\\App\n.exe" }], [app, { ...app, id: "other", path: "c:/apps/APP.exe" }], [app, { ...app, path: "C:\\Apps\\other.exe" }], [{ ...app, unexpected: true }]]) {
+    await assert.rejects(f.controller.applyRouting({ defaultRoute: "direct", apps }), { code: "invalid-routing" });
+  }
+  assert.deepEqual(f.calls, []);
+  f.controller.dispose();
+});
+
+test("theme and scheduled refresh preference persist without restarting the connection", async () => {
+  await withPreferenceStorage(async (storage) => {
+    const f = await lifecycleFixture();
+    assert.equal(f.controller.getSnapshot().settings.subscriptionRefreshHours, 0);
+    await f.controller.saveSettings({ ...f.controller.getSnapshot().settings, theme: "system", subscriptionRefreshHours: 6 });
+    assert.deepEqual(JSON.parse(storage.get("routedeck.preferences.v1")!), { version: 1, theme: "system", subscriptionRefreshHours: 6 });
+    assert.deepEqual(f.calls, []);
+    const restored = await lifecycleFixture(false);
+    assert.equal(restored.controller.getSnapshot().settings.theme, "system");
+    assert.equal(restored.controller.getSnapshot().settings.subscriptionRefreshHours, 6);
+    f.controller.dispose(); restored.controller.dispose();
+  });
+});
+
+test("malformed stored rules and preferences use defaults without interpreting extra fields", async () => {
+  for (const preferences of ["{", '{"version":2,"theme":"light","subscriptionRefreshHours":6}', '{"version":1,"theme":"light","subscriptionRefreshHours":2}', '{"version":1,"theme":"light","subscriptionRefreshHours":6,"httpPort":1234}']) {
+    await withPreferenceStorage(async () => {
+      const f = await lifecycleFixture(false);
+      assert.equal(f.controller.getSnapshot().settings.theme, "dark");
+      assert.equal(f.controller.getSnapshot().settings.subscriptionRefreshHours, 0);
+      assert.deepEqual(f.controller.getSnapshot().routing, { defaultRoute: "direct", tunStack: "gvisor", naiveUdpOverTcp: false, trafficRules: defaultTrafficRules(), apps: [] });
+      f.controller.dispose();
+    }, { "routedeck.preferences.v1": preferences, "routedeck.routing.v1": '{"defaultRoute":"vpn","apps":[],"unknown":true}' });
+  }
+});
+
+test("failed preference write does not publish optimistic settings", async () => {
+  await withPreferenceStorage(async (_storage, faults) => {
+    const f = await lifecycleFixture(false); faults.write = true;
+    await assert.rejects(f.controller.saveSettings({ ...f.controller.getSnapshot().settings, theme: "light", subscriptionRefreshHours: 24 }), { code: "preferences-save-failed" });
+    assert.equal(f.controller.getSnapshot().settings.theme, "dark");
+    assert.equal(f.controller.getSnapshot().settings.subscriptionRefreshHours, 0);
+    f.controller.dispose();
+  });
+});
+
+test("background refresh skips active and newly requested connections inside the queue", async () => {
+  const active = await lifecycleFixture();
+  await active.controller.refreshSource(active.sourceId, undefined, true);
+  assert.deepEqual(active.calls, []); active.controller.dispose();
+  const f = await lifecycleFixture(false);
+  const refreshing = f.controller.refreshSource(f.sourceId, undefined, true);
+  const connecting = f.controller.connect();
+  await Promise.all([refreshing, connecting]);
+  assert.deepEqual(f.calls.map((call) => call.command), ["start_system_proxy"]);
+  f.controller.dispose();
+});
+
+test("background refresh updates only an idle subscription without starting a runtime", async () => {
+  const f = await lifecycleFixture(false);
+  await f.controller.refreshSource(f.sourceId, undefined, true);
+  assert.deepEqual(f.calls.map((call) => call.command), ["refresh_source", "confirmed_nodes"]);
+  assert.equal(f.controller.getSnapshot().phase, "disconnected");
+  f.controller.dispose();
+});
+
+test("reset removes persisted rules and refresh preferences before restoring defaults", async () => {
+  await withPreferenceStorage(async (storage) => {
+    const f = await lifecycleFixture(false);
+    await f.controller.applyRouting({ defaultRoute: "vpn", apps: [] });
+    await f.controller.saveSettings({ ...f.controller.getSnapshot().settings, theme: "light", subscriptionRefreshHours: 24 });
+    await f.controller.resetLocalState();
+    assert.equal(storage.has("routedeck.preferences.v1"), false);
+    assert.equal(storage.has("routedeck.routing.v1"), false);
+    assert.equal(f.controller.getSnapshot().settings.theme, "dark");
+    assert.equal(f.controller.getSnapshot().settings.subscriptionRefreshHours, 0);
+    assert.equal(f.controller.getSnapshot().routing.defaultRoute, "direct");
+    f.controller.dispose();
+  });
+});
+
+
+test("steady response is optional, bounded and cannot replace connection proof", () => {
+  const ready = runtimeStatus(1, "system_proxy_ready");
+  assert.equal(parseRuntimeStatus({ ...ready, steadyLatencyMs: 42 }).steadyLatencyMs, 42);
+  assert.equal(parseRuntimeStatus({ ...ready, steadyLatencyMs: undefined }).steadyLatencyMs, undefined);
+  for (const value of [-1, 0.5, Infinity, NaN, "42", Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => parseRuntimeStatus({ ...ready, steadyLatencyMs: value }), ContractViolation);
+  }
+  assert.throws(() => parseRuntimeStatus({ ...runtimeStatus(2, "disconnected"), steadyLatencyMs: 42 }), ContractViolation);
+  assert.throws(() => parseRuntimeStatus({ ...ready, phase: "degraded", steadyLatencyMs: 42 }), ContractViolation);
+  assert.throws(() => parseRuntimeStatus({ ...ready, routeCheckMs: undefined, steadyLatencyMs: 42 }), ContractViolation);
+});
+
+test("a missing steady sample never falls back to cold HTTPS time or clears a proven connection", async () => {
+  let emit!: (payload: unknown) => void;
+  const ready = { ...runtimeStatus(1, "system_proxy_ready"), steadyLatencyMs: undefined };
+  const transport: TauriTransport = {
+    listen: async (_event, handler) => { emit = handler; return () => undefined; },
+    invoke: async (command) => command === "runtime_status" ? ready : [{ id: "fixture-node", displayName: "Fixture", protocol: "vless", insecureTls: false }],
+  };
+  const controller = new TauriController(async () => transport); await controller.ready();
+  assert.equal(controller.getSnapshot().phase, "connected");
+  assert.equal(controller.getSnapshot().servers[0].latencyMs, undefined);
+  emit({ ...ready, revision: 2, steadyLatencyMs: 21 });
+  assert.equal(controller.getSnapshot().servers[0].latencyMs, 21);
+  emit({ ...ready, revision: 3 });
+  assert.equal(controller.getSnapshot().servers[0].latencyMs, undefined);
+  assert.equal(controller.getSnapshot().phase, "connected");
   controller.dispose();
 });

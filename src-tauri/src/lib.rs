@@ -1,3 +1,5 @@
+mod app_instance;
+mod app_updates;
 pub mod application;
 pub mod commands;
 pub mod config;
@@ -15,6 +17,7 @@ pub mod tun_helper;
 mod tun_helper_protocol;
 #[cfg(windows)]
 mod tun_helper_transport;
+pub mod window_appearance;
 #[cfg(windows)]
 mod windows_process;
 pub mod xray_config;
@@ -37,13 +40,17 @@ pub fn run(expected_tun_helper_sha256: Option<&'static str>) {
                 sink,
                 expected_tun_helper_sha256,
             )?);
+            app.manage(Arc::new(app_updates::AppUpdateChecker::default()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::set_interface_theme,
             commands::preview_import_content,
             commands::preview_import_url,
             commands::discard_import_preview,
             commands::confirm_import,
+            commands::refresh_source,
+            commands::remove_source,
             commands::start_local_proxy,
             commands::start_system_proxy,
             commands::start_tun,
@@ -55,7 +62,11 @@ pub fn run(expected_tun_helper_sha256: Option<&'static str>) {
             commands::stop_tun,
             commands::retry_session_recovery,
             commands::runtime_diagnostics,
+            commands::clear_stale_system_proxy,
             commands::list_running_applications,
+            commands::get_app_version,
+            commands::check_app_update,
+            commands::open_app_releases,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build RouteDeck");

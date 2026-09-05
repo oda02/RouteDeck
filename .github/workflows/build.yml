@@ -1,0 +1,88 @@
+name: Windows build
+
+on:
+  workflow_call:
+    inputs:
+      release-tag:
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TERM_COLOR: always
+      npm_config_ignore_scripts: 'true'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.19.0'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Set up pinned Rust
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'Rust installation failed' }
+          rustup override set 1.98.0
+          if ($LASTEXITCODE -ne 0) { throw 'Rust override failed' }
+          rustc --version
+      - name: Validate version and tag
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          if ($env:RELEASE_TAG) { node scripts/release-version.mjs check $env:RELEASE_TAG }
+          else { node scripts/release-version.mjs check }
+          if ($LASTEXITCODE -ne 0) { throw 'Version validation failed' }
+      - name: Install locked frontend dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+      - name: Frontend and release boundary tests
+        run: node --test tests/*.test.ts tests/*.test.mjs
+      - name: Controller packaging fixtures
+        run: ./scripts/test-package-controller.ps1
+      - name: Acquire the pinned test browser
+        run: node node_modules/playwright/cli.js install chromium
+      - name: Browser scenarios with synthetic IPC and blocked external requests
+        run: npm --ignore-scripts run test:browser-ui
+      - name: Prepare frontend
+        run: npm --ignore-scripts run build
+      - name: Fetch locked Rust dependencies
+        run: cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+      - name: Offline native tests
+        run: cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib -- --test-threads=1
+      - name: Compile every native target
+        run: cargo check --locked --offline --manifest-path src-tauri/Cargo.toml --all-targets
+      - name: Build GUI and exact pinned helper
+        env:
+          CARGO_NET_OFFLINE: 'true'
+        run: ./scripts/build-local-portable.ps1
+      - name: Collect controller dependency notices
+        run: node scripts/collect-controller-notices.mjs artifacts/notices
+      - name: Package controller portable ZIP
+        run: ./scripts/package-controller.ps1
+      - name: Verify source remains clean
+        run: |
+          $changes = @(git status --porcelain --untracked-files=all)
+          if ($LASTEXITCODE -ne 0 -or $changes.Count -ne 0) { throw 'Build changed tracked source or lock files' }
+      - name: Upload verified controller archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: RouteDeck-windows-x64
+          path: |
+            artifacts/RouteDeck-*-windows-x64.zip
+            artifacts/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,27 @@
+RouteDeck for Windows x64 — portable controller
+
+UPDATING AN EXISTING PORTABLE INSTALLATION
+1. Close RouteDeck normally and wait for it to disconnect.
+2. Extract this archive to a new folder. Copy the existing engine and xray
+   folders into it. Keep the old folder until you have tested the new version.
+3. Launch routedeck.exe. Replace the GUI and TUN helper together, never one alone.
+   Server library and preferences remain in your Windows user application data.
+
+FIRST-TIME SETUP
+The VPN engines are separately distributed by their upstream projects. This ZIP
+contains only the RouteDeck GUI and helper. Obtain the exact versions recorded
+in runtime-pins/sing-box.lock.json and runtime-pins/xray-core.lock.json from:
+  https://github.com/SagerNet/sing-box/releases
+  https://github.com/XTLS/Xray-core/releases
+Place sing-box.exe, libcronet.dll and upstream LICENSE under engine\.
+For VLESS REALITY, place xray.exe and upstream LICENSE under xray\.
+RouteDeck verifies the pinned runtime hashes before execution. A different engine
+version will be rejected; do not mix engine files from unrelated releases.
+
+UPDATES
+Settings → RouteDeck updates checks stable GitHub releases. Preview releases are
+available on GitHub but are not offered by the automatic stable update check.
+The download button opens GitHub. Automatic in-place installation is not enabled.
+
+The checksum file protects against accidental download corruption; it does not
+replace a trusted update signature. Controller dependency notices are included.

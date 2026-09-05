@@ -22,7 +22,10 @@ Windows also exposes only one effective System Proxy configuration per user. A s
 ## Consequences
 
 - System Proxy mode is genuinely portable and should not trigger UAC.
-- TUN activation may prompt for UAC each time until a separately reviewed service design is adopted.
+- The initial one-shot helper prompts for UAC on every TUN activation, including
+  profile changes that stop and restart the engine. A separately reviewed helper
+  scoped to a continuous TUN session could avoid repeated prompts without installing
+  a service or elevating the UI; this is not implemented yet.
 - A crash between elevation and cleanup needs a durable recovery journal and a startup reconciliation flow.
 - Per-app routing is reliable in TUN mode. In System Proxy mode it applies only to applications that use the configured proxy or that RouteDeck launches with an explicit proxy; the UI must state this limitation.
 - Testing must cover concurrent proxy changes, stale ownership markers, partial startup, denied UAC, crashed children, and shutdown with another VPN active.

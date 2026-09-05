@@ -105,6 +105,7 @@ export interface RuntimeStatusDto {
   nodeId?: string;
   ports?: { http: number; socks: number; health: number };
   routeCheckMs?: number;
+  steadyLatencyMs?: number;
   engineVersion?: string;
   proofs: RuntimeProofDto[];
   error?: PublicErrorDto;
@@ -128,7 +129,13 @@ export interface ImportPreviewDto {
   warnings: string[];
 }
 
-export type ConfirmedNodeDto = ImportPreviewDto["nodes"][number];
+export type ConfirmedNodeDto = ImportPreviewDto["nodes"][number] & {
+  sourceId?: string;
+  sourceName?: string;
+  sourceKind?: "manual" | "subscription";
+  sourceRefreshable?: boolean;
+  sourceUpdatedAtMs?: number;
+};
 
 export interface ConfirmedImportDto {
   imported: number;
@@ -138,6 +145,14 @@ export interface ConfirmedImportDto {
 export interface DiagnosticsDto {
   status: RuntimeStatusDto;
   lines: string[];
+  systemProxy: SystemProxyDiagnosticDto;
+}
+
+export interface SystemProxyDiagnosticDto {
+  state: "disabled" | "owned" | "foreignActive" | "stale" | "conflict" | "unavailable";
+  endpoint: string | null;
+  detail: string;
+  cleanupToken: string | null;
 }
 
 export class ContractViolation extends Error {
@@ -225,7 +240,7 @@ export function parseRuntimeStatus(value: unknown): RuntimeStatusDto {
   const input = record(value);
   exactKeys(
     input,
-    ["revision", "sessionId", "scope", "mode", "phase", "nodeId", "ports", "routeCheckMs", "engineVersion", "proofs", "error"],
+    ["revision", "sessionId", "scope", "mode", "phase", "nodeId", "ports", "routeCheckMs", "steadyLatencyMs", "engineVersion", "proofs", "error"],
     ["revision", "scope", "mode", "phase", "proofs"],
   );
   if (!Array.isArray(input.proofs) || input.proofs.length > proofKinds.length) throw new ContractViolation();
@@ -262,6 +277,7 @@ export function parseRuntimeStatus(value: unknown): RuntimeStatusDto {
     nodeId: optionalIdentifier(input.nodeId, 256),
     ports,
     routeCheckMs: optionalDuration(input.routeCheckMs),
+    steadyLatencyMs: optionalDuration(input.steadyLatencyMs),
     engineVersion: optionalString(input.engineVersion, 128),
     proofs,
     error: input.error === undefined || input.error === null ? undefined : parsePublicError(input.error),
@@ -284,6 +300,8 @@ const allProofKinds = [...readyProofKinds, "system_proxy_ownership"] as const;
 
 function validateRuntimeRelationships(status: RuntimeStatusDto): void {
   if (status.scope !== status.mode) throw new ContractViolation();
+  if (status.steadyLatencyMs !== undefined && (!["system_proxy_ready", "tun_ready"].includes(status.phase)
+    || status.error || status.routeCheckMs === undefined || !status.sessionId || !status.nodeId)) throw new ContractViolation();
   const systemOnlyPhases: RuntimePhaseDto[] = [
     "applying_system_proxy",
     "system_proxy_ready",
@@ -427,17 +445,31 @@ export function parseRunningApplications(value: unknown): RunningApplicationDto[
   return applications;
 }
 
-function parseConfirmedNodeArray(value: unknown): ConfirmedNodeDto[] {
+function parseConfirmedNodeArray(value: unknown, allowSource = false): ConfirmedNodeDto[] {
   if (!Array.isArray(value) || value.length > 2000) throw new ContractViolation();
   const nodes = value.map((entry): ConfirmedNodeDto => {
     const node = record(entry);
-    exactKeys(node, ["id", "displayName", "protocol", "insecureTls"]);
+    const baseKeys = ["id", "displayName", "protocol", "insecureTls"];
+    exactKeys(node, [...baseKeys, ...(allowSource ? ["sourceId", "sourceName", "sourceKind", "sourceRefreshable", "sourceUpdatedAtMs"] : [])], baseKeys);
     if (typeof node.insecureTls !== "boolean") throw new ContractViolation();
+    const hasSource = ["sourceId", "sourceName", "sourceKind"].some((key) => node[key] !== undefined);
+    const source = hasSource ? {
+      sourceId: boundedString(node.sourceId, 80),
+      sourceName: boundedString(node.sourceName, 160),
+      sourceKind: member(node.sourceKind, ["manual", "subscription"] as const),
+    } : {};
+    if (source.sourceId !== undefined && !/^[a-f0-9]{32}$/.test(source.sourceId)) throw new ContractViolation();
+    if (node.sourceRefreshable !== undefined && (typeof node.sourceRefreshable !== "boolean" || !source.sourceId)) throw new ContractViolation();
+    if (node.sourceUpdatedAtMs !== undefined && (!Number.isSafeInteger(node.sourceUpdatedAtMs) || (node.sourceUpdatedAtMs as number) < 0 || !source.sourceId)) throw new ContractViolation();
+    if (source.sourceKind === "manual" && node.sourceRefreshable === true) throw new ContractViolation();
     return {
       id: boundedString(node.id, 256),
       displayName: boundedString(node.displayName, 512),
       protocol: member(node.protocol, protocols),
       insecureTls: node.insecureTls,
+      ...source,
+      ...(node.sourceRefreshable === undefined ? {} : { sourceRefreshable: node.sourceRefreshable as boolean }),
+      ...(node.sourceUpdatedAtMs === undefined ? {} : { sourceUpdatedAtMs: node.sourceUpdatedAtMs as number }),
     };
   });
   if (new Set(nodes.map((node) => node.id)).size !== nodes.length) throw new ContractViolation();
@@ -445,7 +477,15 @@ function parseConfirmedNodeArray(value: unknown): ConfirmedNodeDto[] {
 }
 
 export function parseConfirmedNodes(value: unknown): ConfirmedNodeDto[] {
-  return parseConfirmedNodeArray(value);
+  const nodes = parseConfirmedNodeArray(value, true);
+  const groups = new Map<string, string>();
+  for (const node of nodes) {
+    if (!node.sourceId) continue;
+    const metadata = JSON.stringify([node.sourceName, node.sourceKind, node.sourceRefreshable, node.sourceUpdatedAtMs]);
+    if (groups.has(node.sourceId) && groups.get(node.sourceId) !== metadata) throw new ContractViolation();
+    groups.set(node.sourceId, metadata);
+  }
+  return nodes;
 }
 
 export function parseImportPreview(value: unknown): ImportPreviewDto {
@@ -485,12 +525,29 @@ export function parseConfirmedImport(value: unknown): ConfirmedImportDto {
 
 export function parseDiagnostics(value: unknown): DiagnosticsDto {
   const input = record(value);
-  exactKeys(input, ["status", "lines"]);
+  exactKeys(input, ["status", "lines", "systemProxy"]);
   if (!Array.isArray(input.lines) || input.lines.length > 256) throw new ContractViolation();
   return {
     status: parseRuntimeStatus(input.status),
     lines: input.lines.map((line) => boundedString(line, 8192, true)),
+    systemProxy: parseSystemProxyDiagnostic(input.systemProxy),
   };
+}
+
+export function parseSystemProxyDiagnostic(value: unknown): SystemProxyDiagnosticDto {
+  const input = record(value);
+  exactKeys(input, ["state", "endpoint", "detail", "cleanupToken"]);
+  if (!["disabled", "owned", "foreignActive", "stale", "conflict", "unavailable"].includes(input.state as string)) throw new ContractViolation();
+  const endpoint = input.endpoint === null ? null : boundedString(input.endpoint, 64);
+  if (endpoint !== null) {
+    const match = /^(?:127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})|\[::1\]):([1-9]\d{0,4})$/.exec(endpoint);
+    if (!match || match.slice(1, 4).some((part) => part !== undefined && Number(part) > 255) || Number(match[4]) > 65535) throw new ContractViolation();
+  }
+  const detail = boundedString(input.detail, 512, true);
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(detail) || /(?:https?|ftp):\/\//i.test(detail) || /\b(?:vless|hysteria2|naive):/i.test(detail) || /\S+@\S+/.test(detail)) throw new ContractViolation();
+  const cleanupToken = input.cleanupToken === null ? null : boundedString(input.cleanupToken, 64);
+  if ((cleanupToken !== null && (!/^[a-f0-9]{64}$/.test(cleanupToken) || input.state !== "stale" || endpoint === null))) throw new ContractViolation();
+  return { state: input.state as SystemProxyDiagnosticDto["state"], endpoint, detail, cleanupToken };
 }
 
 /** Rust unit responses serialize as JSON null. */

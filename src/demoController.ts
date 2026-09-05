@@ -1,4 +1,5 @@
-import { RouteDeckError } from "./model";
+import { defaultTrafficRules, RouteDeckError } from "./model";
+import { effectiveRoutingKey, effectiveTunKey, validatedRouting } from "./tauriController";
 import type {
   AppNotice,
   ConnectionMode,
@@ -9,6 +10,7 @@ import type {
   ProofState,
   RouteDeckController,
   RoutingConfig,
+  Server,
   SettingsConfig,
   SubscriptionImportSource,
   SubscriptionPreview,
@@ -30,7 +32,7 @@ const baseProofs = (): ConnectionProof[] => [
   { id: "core", label: "Ядро", state: "idle", summary: "Не запущено" },
   { id: "local-ingress", label: "Локальный прокси", state: "idle", summary: "Не проверялся" },
   { id: "windows-mode", label: "Режим Windows", state: "idle", summary: "Не применён" },
-  { id: "outbound-proof", label: "VPN-маршрут", state: "idle", summary: "Не проверялся" },
+  { id: "outbound-proof", label: "Доступность интернета", state: "idle", summary: "Не проверялся" },
   { id: "egress-ip", label: "VPN egress IP", state: "skipped", summary: "Не проверялся" },
 ];
 
@@ -104,6 +106,8 @@ const initialSnapshot: ControllerSnapshot = {
   proofs: /* @__PURE__ */ demoProofs(),
   routing: {
     defaultRoute: "direct",
+    tunStack: "gvisor", naiveUdpOverTcp: false,
+    trafficRules: defaultTrafficRules(),
     apps: [
       {
         id: "firefox",
@@ -132,11 +136,12 @@ const initialSnapshot: ControllerSnapshot = {
     socksPort: 2081,
     proxyConflictPolicy: "never-overwrite",
     theme: "dark",
+    subscriptionRefreshHours: 0,
   },
   environment: {
-    otherVpnDetected: true,
+    otherVpnDetected: false,
     otherVpnName: "Активный VPN",
-    systemProxyOwner: "external",
+    systemProxyOwner: "none",
     externalProxyEndpoint: "127.0.0.1:10808",
     physicalAdapters: [
       { id: "wifi-intel", label: "Wi-Fi · Intel AX211" },
@@ -151,15 +156,45 @@ const initialSnapshot: ControllerSnapshot = {
       "Обнаружен внешний владелец системного прокси: loopback:10808.",
       "Секреты и адрес подписки удалены из отчёта.",
     ],
+    systemProxy: { state: "stale", endpoint: "127.0.0.1:10808", detail: "Прокси Windows включён, но локальный порт не отвечает.", cleanupToken: "d".repeat(64) },
   },
   subscriptionName: "DEMO provider",
   subscriptionUpdatedAt: "12 мин назад",
 };
 
 class DevelopmentDemoController implements RouteDeckController {
-  private snapshot = initialSnapshot;
+  private snapshot: ControllerSnapshot = { ...initialSnapshot, servers: initialSnapshot.servers.map((server) => ({ ...server,
+    source: server.protocol === "Naive" ? "Личные серверы" : "Demo subscription",
+    sourceId: server.protocol === "Naive" ? "demo-manual" : "demo-subscription",
+    sourceKind: server.protocol === "Naive" ? "manual" : "subscription",
+    sourceRefreshable: server.protocol !== "Naive", sourceUpdatedAtMs: Date.now(),
+  })) };
   private readonly listeners = new Set<() => void>();
   private operation = 0;
+  private lifecycleTail: Promise<void> = Promise.resolve();
+  private wantsConnection = false;
+  private pendingOperations = 0;
+  private routingRevision = 0;
+  private activeRoutingRevision = 0;
+
+  private enqueue(operation: () => Promise<void>): Promise<void> {
+    this.pendingOperations += 1;
+    this.publish({ switching: true });
+    const result = this.lifecycleTail.then(operation);
+    this.lifecycleTail = result.catch(() => undefined);
+    return result.finally(() => { this.pendingOperations -= 1; this.publish({ switching: this.pendingOperations > 0 }); });
+  }
+
+  private async reconcile(tunPath?: TunPathChoice): Promise<void> {
+    for (;;) {
+      if (!this.wantsConnection) { await this.stopDemo(); return; }
+      if (this.snapshot.phase === "connected" && this.snapshot.activeMode === this.snapshot.mode && this.snapshot.activeServerId === this.snapshot.selectedServerId && this.routingRevision === this.activeRoutingRevision) return;
+      if (this.snapshot.phase !== "disconnected") await this.stopDemo();
+      if (!this.wantsConnection) return;
+      await this.startDemo(tunPath);
+      if (this.snapshot.phase !== "connected") { this.wantsConnection = false; return; }
+    }
+  }
 
   getSnapshot = () => this.snapshot;
 
@@ -190,19 +225,28 @@ class DevelopmentDemoController implements RouteDeckController {
     this.publish({ notice });
   }
 
-  setMode = (mode: ConnectionMode) => {
-    if (this.snapshot.phase !== "disconnected") return;
+  setMode = async (mode: ConnectionMode) => {
     this.publish({ mode, notice: undefined });
+    if (this.wantsConnection || this.pendingOperations) await this.enqueue(() => this.reconcile());
   };
 
-  selectServer = (serverId: string) => {
+  selectServer = async (serverId: string) => {
     if (!this.snapshot.servers.some((server) => server.id === serverId)) return;
     this.publish({ selectedServerId: serverId });
+    if (this.wantsConnection || this.pendingOperations) await this.enqueue(() => this.reconcile());
   };
 
   connect = async (tunPath?: TunPathChoice) => {
+    this.wantsConnection = true;
+    await this.enqueue(() => this.reconcile(tunPath));
+  };
+
+  private startDemo = async (tunPath?: TunPathChoice) => {
     if (!["disconnected", "failed", "blocked-by-conflict", "degraded"].includes(this.snapshot.phase)) return;
     const token = ++this.operation;
+    const activeServerId = this.snapshot.selectedServerId;
+    const activeMode = this.snapshot.mode;
+    const routingRevision = this.routingRevision;
     const isCurrent = () => token === this.operation;
     this.publish({ proofs: demoProofs(), notice: undefined });
 
@@ -266,14 +310,21 @@ class DevelopmentDemoController implements RouteDeckController {
     if (!(await step("verifying-outbound", "outbound-proof", "Проверяем HTTPS через выбранный сервер…", "Маршрут подтверждён", "HTTPS · 842 ms"))) return;
     this.updateProof("egress-ip", "pass", "IP через выбранный outbound", "203.0.113.42 (демо)", 118);
     this.setPhase("connected");
+    this.activeRoutingRevision = routingRevision;
+    this.publish({ activeServerId, activeMode, routingPending: this.routingRevision !== routingRevision });
   };
 
   disconnect = async () => {
+    this.wantsConnection = false;
+    await this.enqueue(() => this.stopDemo());
+  };
+
+  private stopDemo = async () => {
     if (this.snapshot.phase === "disconnected" || this.snapshot.phase === "disconnecting") return;
     ++this.operation;
     this.setPhase("disconnecting");
     await wait(320);
-    this.publish({ phase: "disconnected", proofs: demoProofs(), notice: undefined });
+    this.publish({ phase: "disconnected", activeMode: undefined, activeServerId: undefined, routingPending: false, proofs: demoProofs(), notice: undefined });
   };
 
   retry = async () => this.connect();
@@ -293,6 +344,28 @@ class DevelopmentDemoController implements RouteDeckController {
         checkedAt: now(),
       })),
       subscriptionUpdatedAt: "только что",
+    });
+  };
+
+  refreshSource = async (sourceId: string, _url?: string, background = false) => {
+    await this.enqueue(async () => {
+      if (background && (this.wantsConnection || this.snapshot.phase !== "disconnected" || !this.snapshot.servers.some((server) => server.sourceId === sourceId && server.sourceRefreshable))) return;
+      const active = this.snapshot.servers.find((server) => server.id === this.snapshot.activeServerId)?.sourceId === sourceId;
+      if (active) await this.stopDemo();
+      await wait(420);
+      this.publish({ servers: this.snapshot.servers.map((server) => server.sourceId === sourceId ? { ...server, sourceUpdatedAtMs: Date.now() } : server) });
+      if (active) await this.reconcile();
+    });
+  };
+
+  removeSource = async (sourceId: string) => {
+    await this.enqueue(async () => {
+      if (this.snapshot.servers.find((server) => server.id === this.snapshot.activeServerId)?.sourceId === sourceId) {
+        this.wantsConnection = false;
+        await this.stopDemo();
+      }
+      const servers = this.snapshot.servers.filter((server) => server.sourceId !== sourceId);
+      this.publish({ servers, selectedServerId: servers.some((server) => server.id === this.snapshot.selectedServerId) ? this.snapshot.selectedServerId : servers[0]?.id ?? "" });
     });
   };
 
@@ -326,10 +399,16 @@ class DevelopmentDemoController implements RouteDeckController {
 
   cancelImportPreview = () => undefined;
 
-  commitSubscription = async (preview: SubscriptionPreview) => {
+  commitSubscription = async (preview: SubscriptionPreview, sourceName?: string) => {
     if (!preview.token.startsWith("dev-preview-")) throw new RouteDeckError("stale-subscription-preview");
     await wait(280);
-    this.publish({ subscriptionName: "DEMO imported provider", subscriptionUpdatedAt: "только что" });
+    const sourceId = preview.token;
+    const added = preview.nodeNames.map((name, index): Server => ({
+      id: `${sourceId}-${index}`, name, country: "—", protocol: preview.supported[index % preview.supported.length]?.protocol ?? "Naive",
+      detail: "Демо", source: sourceName?.trim() || "Импортировано вручную", sourceId,
+      sourceKind: preview.sourceLabel === "Буфер обмена" ? "manual" : "subscription", sourceRefreshable: preview.sourceLabel !== "Буфер обмена", sourceUpdatedAtMs: Date.now(), latencyState: "unavailable",
+    }));
+    this.publish({ servers: [...this.snapshot.servers, ...added], subscriptionName: "Мои серверы", subscriptionUpdatedAt: "только что" });
   };
 
   listRunningApplications = async () => this.snapshot.routing.apps.map((app) => ({
@@ -339,13 +418,20 @@ class DevelopmentDemoController implements RouteDeckController {
   }));
 
   applyRouting = async (routing: RoutingConfig) => {
-    await wait(240);
-    this.publish({ routing });
+    const saved = validatedRouting(routing);
+    const tunChanged = effectiveTunKey(saved) !== effectiveTunKey(this.snapshot.routing);
+    const naiveChanged = saved.naiveUdpOverTcp !== this.snapshot.routing.naiveUdpOverTcp
+      && this.snapshot.servers.some((server) => server.protocol === "Naive" && (server.id === this.snapshot.activeServerId || server.id === this.snapshot.selectedServerId));
+    const changed = effectiveRoutingKey(saved) !== effectiveRoutingKey(this.snapshot.routing)
+      || (tunChanged && (this.snapshot.activeMode === "tun" || (this.wantsConnection && this.snapshot.mode === "tun"))) || naiveChanged;
+    if (changed) this.routingRevision += 1;
+    this.publish({ routing: saved, routingPending: this.snapshot.phase === "connected" && this.routingRevision !== this.activeRoutingRevision });
+    if (changed && (this.wantsConnection || this.pendingOperations)) await this.enqueue(() => this.reconcile());
   };
 
   saveSettings = async (settings: SettingsConfig) => {
-    await wait(220);
-    this.publish({ settings });
+    if (!["dark", "light", "system"].includes(settings.theme) || ![0, 6, 24].includes(settings.subscriptionRefreshHours)) throw new RouteDeckError("preferences-save-failed");
+    this.publish({ settings: { ...this.snapshot.settings, theme: settings.theme, subscriptionRefreshHours: settings.subscriptionRefreshHours } });
   };
 
   runDiagnostics = async () => {
@@ -358,7 +444,7 @@ class DevelopmentDemoController implements RouteDeckController {
       { id: "core", label: "Ядро", state: "pass", summary: "Mock-контроллер отвечает", checkedAt: now(), durationMs: 22 },
       { id: "local-ingress", label: "Локальный ingress", state: "pass", summary: "HTTP 127.0.0.1:2080", checkedAt: now(), durationMs: 12 },
       { id: "windows-mode", label: "Режим Windows", state: "warn", summary: "Обнаружен внешний прокси", value: "loopback:10808", checkedAt: now(), durationMs: 7 },
-      { id: "outbound-proof", label: "VPN-маршрут", state: "pass", summary: "Выбранный outbound подтверждён", checkedAt: now(), durationMs: 842 },
+      { id: "outbound-proof", label: "Доступность интернета", state: "pass", summary: "Выбранный outbound подтверждён", checkedAt: now(), durationMs: 842 },
       { id: "egress-ip", label: "VPN egress IP", state: "warn", summary: "Демо-значение", value: "203.0.113.42", checkedAt: now(), durationMs: 118 },
     ];
     this.publish({
@@ -369,6 +455,12 @@ class DevelopmentDemoController implements RouteDeckController {
         steps,
       },
     });
+  };
+
+  clearStaleSystemProxy = async (token: string) => {
+    if (token !== this.snapshot.diagnostics.systemProxy.cleanupToken) throw new RouteDeckError("backend-response-invalid");
+    await wait(220);
+    this.publish({ diagnostics: { ...this.snapshot.diagnostics, snapshotReceivedAt: now(), systemProxy: { state: "disabled", endpoint: null, detail: "Прокси Windows отключён.", cleanupToken: null } } });
   };
 
   resetLocalState = async () => {

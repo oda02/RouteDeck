@@ -44,6 +44,10 @@ export interface Server {
   protocol: Protocol;
   detail: string;
   source: string;
+  sourceId?: string;
+  sourceKind?: "manual" | "subscription";
+  sourceRefreshable?: boolean;
+  sourceUpdatedAtMs?: number;
   latencyState: LatencyState;
   latencyMs?: number;
   checkedAt?: string;
@@ -59,8 +63,23 @@ export interface AppRule {
   route: AppRouteChoice;
 }
 
+export interface TrafficRule {
+  id: string;
+  enabled: boolean;
+  network: "tcp" | "udp";
+  port: number;
+  action: "block" | "direct" | "vpn";
+}
+
+export const defaultTrafficRules = (): TrafficRule[] => [
+  { id: "quic-compatibility", enabled: true, network: "udp", port: 443, action: "block" },
+];
+
 export interface RoutingConfig {
   defaultRoute: DefaultRoute;
+  tunStack: "system" | "gvisor";
+  naiveUdpOverTcp: boolean;
+  trafficRules: TrafficRule[];
   apps: AppRule[];
 }
 
@@ -81,6 +100,7 @@ export interface SettingsConfig {
   socksPort: number;
   proxyConflictPolicy: ProxyConflictPolicy;
   theme: ThemePreference;
+  subscriptionRefreshHours: 0 | 6 | 24;
 }
 
 export type NoticeKind = "info" | "warning" | "error" | "success";
@@ -110,6 +130,16 @@ export interface DiagnosticsState {
   snapshotReceivedAt?: string;
   steps: ConnectionProof[];
   sanitizedLog: string[];
+  systemProxy: SystemProxyDiagnostic;
+}
+
+export type SystemProxyDiagnosticState = "disabled" | "owned" | "foreignActive" | "stale" | "conflict" | "unavailable";
+
+export interface SystemProxyDiagnostic {
+  state: SystemProxyDiagnosticState;
+  endpoint: string | null;
+  detail: string;
+  cleanupToken: string | null;
 }
 
 export interface ControllerSnapshot {
@@ -117,12 +147,16 @@ export interface ControllerSnapshot {
   runtimeScope: "demo" | "system-proxy" | "tun" | "local-only" | "unavailable";
   backendAvailable: boolean;
   phase: ConnectionPhase;
+  switching?: boolean;
+  activeServerId?: string;
+  activeMode?: ConnectionMode;
   mode: ConnectionMode;
   selectedServerId: string;
   servers: Server[];
   proofs: ConnectionProof[];
   notice?: AppNotice;
   routing: RoutingConfig;
+  routingPending?: boolean;
   settings: SettingsConfig;
   environment: EnvironmentInfo;
   diagnostics: DiagnosticsState;
@@ -151,6 +185,14 @@ export type RouteDeckErrorCode =
   | "runtime-failure"
   | "node-not-selected"
   | "subscription-import-rejected"
+  | "invalid-source-name"
+  | "server-library-full"
+  | "import-requires-disconnect"
+  | "library-reload-failed"
+  | "subscription-refresh-incomplete"
+  | "source-changed"
+  | "preferences-save-failed"
+  | "invalid-routing"
   | "invalid-subscription-url"
   | "insecure-subscription-url"
   | "subscription-policy-blocked"
@@ -176,20 +218,23 @@ export class RouteDeckError extends Error {
 export interface RouteDeckController {
   getSnapshot: () => ControllerSnapshot;
   subscribe: (listener: () => void) => () => void;
-  setMode: (mode: ConnectionMode) => void;
-  selectServer: (serverId: string) => void;
+  setMode: (mode: ConnectionMode) => Promise<void>;
+  selectServer: (serverId: string) => Promise<void>;
   connect: (tunPath?: TunPathChoice) => Promise<void>;
   disconnect: () => Promise<void>;
   retry: () => Promise<void>;
   dismissNotice: () => void;
   refreshServers: () => Promise<void>;
+  refreshSource: (sourceId: string, url?: string, background?: boolean) => Promise<void>;
+  removeSource: (sourceId: string) => Promise<void>;
   previewSubscription: (source: SubscriptionImportSource) => Promise<SubscriptionPreview>;
   cancelImportPreview: () => void;
-  commitSubscription: (preview: SubscriptionPreview) => Promise<void>;
+  commitSubscription: (preview: SubscriptionPreview, sourceName?: string) => Promise<void>;
   listRunningApplications: () => Promise<RunningApplication[]>;
   applyRouting: (routing: RoutingConfig) => Promise<void>;
   saveSettings: (settings: SettingsConfig) => Promise<void>;
   runDiagnostics: () => Promise<void>;
+  clearStaleSystemProxy: (token: string) => Promise<void>;
   resetLocalState: () => Promise<void>;
   getSanitizedReport: () => string;
   dispose?: () => void;
