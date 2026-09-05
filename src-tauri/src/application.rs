@@ -6187,13 +6187,20 @@ mod tests {
     #[test]
     fn periodic_proof_degrades_after_two_failures_and_recovers_on_success() {
         let proof_enabled = Arc::new(AtomicBool::new(true));
-        let (controller, _, _) =
+        let (controller, stops, alive) =
             controller_with_prober(Arc::new(ToggleProber(proof_enabled.clone())));
         let node = import_node(&controller);
         controller
             .start_local_proxy(&node, DefaultRoute::Vpn)
             .unwrap();
         let ready = controller.status();
+        let original_session = controller
+            .lock_state()
+            .active
+            .as_ref()
+            .unwrap()
+            .session_id
+            .clone();
         proof_enabled.store(false, Ordering::SeqCst);
         controller.lock_state().active.as_mut().unwrap().last_probe =
             Instant::now() - Duration::from_secs(11);
@@ -6226,6 +6233,12 @@ mod tests {
         controller.monitor_tick();
         assert_eq!(controller.status().phase, RuntimePhase::LocalProxyReady);
         assert!(controller.status().error.is_none());
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert!(alive.load(Ordering::SeqCst));
+        assert_eq!(
+            controller.lock_state().active.as_ref().unwrap().session_id,
+            original_session
+        );
     }
 
     #[test]

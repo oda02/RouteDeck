@@ -472,6 +472,7 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
   const [pickerSearch, setPickerSearch] = useState("");
   const [pickerError, setPickerError] = useState("");
   const [runningApplications, setRunningApplications] = useState<RunningApplication[]>([]);
+  const [pickerSelections, setPickerSelections] = useState<Map<string, RunningApplication>>(new Map());
   const [trafficEditor, setTrafficEditor] = useState<TrafficRule | null>(null);
   const [trafficEditorOriginalId, setTrafficEditorOriginalId] = useState<string | null>(null);
   const [trafficEditorError, setTrafficEditorError] = useState("");
@@ -493,11 +494,9 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
     apps: draft.apps.map((app) => app.id === id ? { ...app, route } : app),
   });
 
-  const openApplicationPicker = () => {
+  const loadRunningApplications = () => {
     if (pickerLoading) return;
-    setPickerOpen(true);
     setPickerLoading(true);
-    setPickerSearch("");
     setPickerError("");
     void controller.listRunningApplications()
       .then(setRunningApplications)
@@ -505,19 +504,43 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
       .finally(() => setPickerLoading(false));
   };
 
-  const addApplication = (application: RunningApplication) => {
+  const openApplicationPicker = () => {
+    if (pickerLoading) return;
+    setPickerOpen(true);
+    setPickerSearch("");
+    setPickerSelections(new Map());
+    loadRunningApplications();
+  };
+
+  const closeApplicationPicker = () => {
+    setPickerOpen(false);
+    setPickerSelections(new Map());
+  };
+
+  const toggleApplication = (application: RunningApplication) => {
     const canonicalPath = application.executablePath.replaceAll("/", "\\").toLocaleLowerCase("en-US");
     if (selectedPaths.has(canonicalPath)) return;
-    const name = application.displayName.replace(/\.exe$/i, "") || application.displayName;
+    setPickerSelections((current) => {
+      const next = new Map(current);
+      if (next.has(canonicalPath)) next.delete(canonicalPath);
+      else next.set(canonicalPath, application);
+      return next;
+    });
+  };
+
+  const saveApplicationPicker = () => {
+    if (pickerSelections.size === 0) { closeApplicationPicker(); return; }
+    const additions = Array.from(pickerSelections, ([canonicalPath, application]) => ({
+      id: canonicalPath,
+      name: application.displayName.replace(/\.exe$/i, "") || application.displayName,
+      path: application.executablePath,
+      route: draft.defaultRoute === "direct" ? "vpn" : "direct",
+    } as const));
     onDraftChange({
       ...draft,
-      apps: [...draft.apps, {
-        id: canonicalPath,
-        name,
-        path: application.executablePath,
-        route: draft.defaultRoute === "direct" ? "vpn" : "direct",
-      }],
+      apps: [...draft.apps, ...additions],
     });
+    closeApplicationPicker();
   };
 
   const matchingApps = draft.apps.filter((app) => `${app.name} ${app.path}`.toLocaleLowerCase("ru-RU").includes(search.trim().toLocaleLowerCase("ru-RU")));
@@ -613,12 +636,12 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
 
       {pickerOpen ? (
         <Dialog
-          title="Добавить приложение"
-          description="Выберите приложение из запущенных сейчас."
+          title="Добавить приложения"
+          description="Отметьте нужные приложения. Весь список применится после сохранения."
           focusKey="application-picker-search"
-          onClose={() => setPickerOpen(false)}
+          onClose={closeApplicationPicker}
           busy={pickerLoading}
-          actions={<><button className="text-button" type="button" disabled={pickerLoading} onClick={openApplicationPicker}><RefreshIcon size={16} />Обновить список</button><button className="secondary-button" type="button" onClick={() => setPickerOpen(false)}>Готово · {draft.apps.length}</button></>}
+          actions={<><button className="text-button" type="button" disabled={pickerLoading} onClick={loadRunningApplications}><RefreshIcon size={16} />Обновить список</button><button className="secondary-button" type="button" onClick={closeApplicationPicker}>Отмена</button><button className="primary-button dialog-primary" type="button" disabled={pickerSelections.size === 0} onClick={saveApplicationPicker}>Сохранить и закрыть · {pickerSelections.size}</button></>}
         >
           {pickerLoading ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><LoaderIcon size={17} />Ищем запущенные приложения…</p> : (
             <>
@@ -631,11 +654,12 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
                 {filteredApplications.length > 0 ? filteredApplications.map((application) => {
                   const canonicalPath = application.executablePath.replaceAll("/", "\\").toLocaleLowerCase("en-US");
                   const added = selectedPaths.has(canonicalPath);
+                  const selected = pickerSelections.has(canonicalPath);
                   return (
-                    <button className="application-picker-row" type="button" disabled={added} onClick={() => addApplication(application)} key={canonicalPath}>
+                    <button className="application-picker-row" type="button" disabled={added} aria-pressed={selected} onClick={() => toggleApplication(application)} key={canonicalPath}>
                       <span className="app-monogram" aria-hidden="true">{application.displayName.slice(0, 1).toUpperCase()}</span>
                       <span className="app-copy"><strong>{application.displayName}</strong><span title={application.executablePath}>{application.executablePath}</span></span>
-                      <span className="picker-row-state">{added ? "Добавлено" : draft.defaultRoute === "direct" ? "Через VPN" : "Напрямую"}</span>
+                      <span className="picker-row-state">{added ? "Добавлено" : selected ? "Выбрано" : draft.defaultRoute === "direct" ? "Через VPN" : "Напрямую"}</span>
                     </button>
                   );
                 }) : <div className="empty-state compact-empty"><SearchIcon size={22} /><strong>Приложения не найдены</strong><span>{pickerSearch ? "Измените запрос." : "Запустите приложение и откройте список снова."}</span></div>}
