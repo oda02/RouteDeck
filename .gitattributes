@@ -1,0 +1,5 @@
+# Keep reviewed upstream license bytes identical on Windows and hosted runners.
+licenses/controller/texts/** -text
+engine/licenses/** -text
+.github/** text eol=lf
+licenses/controller/overrides.json text eol=lf
