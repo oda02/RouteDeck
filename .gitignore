@@ -12,3 +12,5 @@ src-tauri/gen/
 !.env.example
 .cache/
 artifacts/
+__pycache__/
+*.py[cod]

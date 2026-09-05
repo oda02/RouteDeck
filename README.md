@@ -1,5 +1,15 @@
 # RouteDeck
 
+## Download and run
+
+Download `RouteDeck-<version>-windows-x64.zip` from
+[GitHub Releases](https://github.com/oda02/RouteDeck/releases/latest), extract the
+whole archive, and launch `routedeck.exe`. The full portable includes the pinned
+sing-box/Cronet and Xray runtimes; no separate engine setup is required. The other
+source-code assets on the release page are optional downloads for source inspection.
+Keep `engine` and `xray` beside the application. See
+[portable instructions](docs/portable-full-release.txt) for updating an existing copy.
+
 [![CI](https://github.com/oda02/RouteDeck/actions/workflows/ci.yml/badge.svg)](https://github.com/oda02/RouteDeck/actions/workflows/ci.yml)
 
 See [CI, release tags and portable updates](docs/releases.md) for versioning,

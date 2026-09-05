@@ -1,7 +1,7 @@
 {
   "name": "routedeck",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "engines": {
     "node": ">=22.12.0",
@@ -12,7 +12,8 @@
     "build": "tsc && vite build && node tests/assert-production-bundle.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test:browser-ui": "node scripts/test-browser-ui.mjs"
+    "test:browser-ui": "node scripts/test-browser-ui.mjs",
+    "test:engine-distribution": "node scripts/test-collect-engine-distribution.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",

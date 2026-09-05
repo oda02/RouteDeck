@@ -1,0 +1,26 @@
+RouteDeck для Windows x64 — portable
+
+ПЕРВЫЙ ЗАПУСК
+1. Распакуйте весь архив в отдельную папку.
+2. Запустите routedeck.exe и добавьте свой сервер или подписку.
+3. Выберите системный прокси или TUN и подключитесь.
+
+sing-box, Cronet и Xray уже включены. Сохраните структуру папок engine и xray.
+Устанавливать движки отдельно и запускать их вручную не требуется.
+Обычное окно приложения работает без повышения прав; TUN запрашивает UAC.
+
+ОБНОВЛЕНИЕ
+Закройте старый RouteDeck обычным способом, дождитесь отключения и распакуйте
+новую версию в отдельную папку. Запустите новый routedeck.exe. Библиотека
+серверов и настройки хранятся в данных пользователя Windows и сохраняются.
+Сохраните старую папку, пока не проверите новую версию.
+
+В Настройках есть проверка обновлений: при запуске и раз в 6 часов, только
+стабильные версии. Кнопка скачивания открывает GitHub. Автоматическая замена
+работающих файлов пока не выполняется.
+
+LICENSES AND SOURCE
+Upstream runtime license files are preserved beside each engine. Controller
+and engine third-party notices are included. SOURCE-CODE.txt identifies the
+corresponding source materials available with this same GitHub release.
+SHA256SUMS.txt checks download integrity; it is not an independent signature.

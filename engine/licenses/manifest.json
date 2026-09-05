@@ -6,7 +6,7 @@
     "cronetGoCommit": "ec9a39c5ba3b4a8d625ede04deaf3c9020afb916",
     "naiveProxyCommit": "510717a833c95a17218efc550fe6cac02414cad5"
   },
-  "portableAssemblyStatus": "blocked",
+  "portableAssemblyStatus": "source-and-notice-bundle-required",
   "legalComplianceClaim": false,
   "requiredNoticeFiles": [
     {
@@ -35,18 +35,10 @@
       "sourceUrl": "https://raw.githubusercontent.com/SagerNet/naiveproxy/510717a833c95a17218efc550fe6cac02414cad5/src/LICENSE"
     }
   ],
-  "blockers": [
-    {
-      "id": "chromium-windows-third-party-notices",
-      "description": "No dependency-filtered third-party notice bundle for the Windows //components/cronet:cronet DLL was found in the pinned release or source trees."
-    },
-    {
-      "id": "sing-box-go-transitive-notices",
-      "description": "The release exposes go.mod/go.sum but no reviewed SBOM or complete notice inventory for dependencies linked into sing-box.exe."
-    },
-    {
-      "id": "corresponding-source-review",
-      "description": "Pinned source repositories are identified, but no conclusion has been made about corresponding-source or source-offer obligations for redistribution."
-    }
-  ]
+  "distributionEvidence": {
+    "sourceLock": "engine/source-distribution.lock.json",
+    "collector": "scripts/collect-engine-distribution.mjs",
+    "policy": "Publish the generated conservative notice and source bundle beside every full portable ZIP; this manifest is evidence, not a blanket legal opinion."
+  },
+  "blockers": []
 }

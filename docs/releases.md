@@ -7,15 +7,22 @@
 - CI verifies synchronized versions, deterministic frontend/native tests, all
   native targets, isolated browser scenarios, production frontend boundaries, GUI/helper provenance and ZIP
   packaging. Dependency installation uses lock files and disables npm lifecycle
-  scripts. VPN engines are not downloaded or run by CI.
+  scripts. Reviewed VPN engines are acquired only in an explicit packaging step,
+  verified against committed size/SHA-256 pins, and never run by CI.
   The pinned Playwright Chromium browser is acquired in an explicit test step.
 - The Windows artifact is `RouteDeck-<version>-windows-x64.zip` with `SHA256SUMS.txt`.
-  CI artifacts expire after seven days. They contain the controller and its exact
-  helper, dependency notices/source material and runtime pins, without user state
-  or external engines. For new installations see `docs/portable-release.txt`.
+  CI artifacts expire after one day; published release assets remain available.
+  They contain the controller and its exact
+  helper, pinned sing-box/Cronet and Xray, dependency notices and runtime pins,
+  without user state. Extract the ZIP and run `routedeck.exe`; see
+  `docs/portable-full-release.txt`. Corresponding runtime source archives and an
+  inventory are published alongside it. Source downloads are optional for users
+  who only want to run the application.
 - A pushed `vX.Y.Z` tag runs the same build and publishes a stable GitHub Release
   only after it succeeds. `vX.Y.Z-alpha.N`, `-beta.N`, and `-rc.N` publish GitHub
-  prereleases and do not become the stable latest release.
+  prereleases and do not become the stable latest release. The first public full
+  portable is prepared as 0.1.1; the earlier 0.1.0 controller-only workflow was
+  cancelled before publication. Its existing tag is preserved.
 - A tag must exactly match the versions in npm, Cargo and Tauri. Existing releases
   and assets are never overwritten by the publishing script. To fix a published
   binary, use a new version and tag. Do not move a release tag.
@@ -65,10 +72,10 @@ was found. No GitHub token is stored in the application.
 
 The current download button opens the fixed GitHub Releases page. It does not
 disconnect the VPN, download code automatically or overwrite a running portable
-folder. Keep the old folder until the new one works; move/copy the existing reviewed
-`engine` and `xray` directories into the new folder as the archive README describes.
-If runtime pins change, obtain the matching upstream files instead of retaining
-an incompatible version. Preferences/subscriptions remain in Windows user data.
+folder. Extract the full new archive into a new folder and keep the old folder
+until the new one works. Matching `engine` and `xray` files are already included;
+do not mix files from different versions. Preferences/subscriptions remain in
+Windows user data.
 
 ## Next installation phase
 
@@ -80,17 +87,20 @@ VPN teardown, replacement after process exit and rollback on failure. Checksums
 in the current release are integrity evidence, not independent update signatures.
 No private signing key or update-install privilege was introduced in this phase.
 
-External engine redistribution remains separate from controller packaging; see
-`docs/portable-compliance-plan.md`. The controller notice inventory records supplied
-and reviewed upstream texts, its scope and provenance; it is not a blanket legal
-compliance claim or a license grant for RouteDeck's own source.
+Runtime acquisition is separate from dependency installation and frontend builds.
+Only the exact reviewed files are packaged, together with upstream notices and
+directions to corresponding source materials; see `docs/portable-compliance-plan.md`.
+Notice inventories record supplied texts, scope and provenance; they are not a
+blanket legal compliance claim or a license grant for RouteDeck's own source.
 
 ## Hosting and verification
 
 The repository is public after a bounded scan of working source and reachable Git
 history for credentials. GitHub provides standard hosted runners free for public
 repositories, subject to concurrency, execution and service limits; larger runners
-are billed separately. This is not unlimited execution of arbitrary jobs.
+are billed separately. Artifact storage has separate plan allowances, so temporary
+CI artifacts use a one-day retention period. This is not unlimited execution of
+arbitrary jobs or unlimited temporary artifact storage.
 
 References: [GitHub Actions billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions),
 [release management](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository),

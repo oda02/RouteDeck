@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "files": [
+    { "path": "sing-box-go-modules-source.zip", "size": 115712494, "sha256": "7dc37a6d4ef55040e76cd811365532725e1c6c500831676929125668a03c0ca3" },
+    { "path": "sing-box-go-modules-NOTICES.txt", "size": 356030, "sha256": "3d3460dfe5f0c3a77d853a2d8e5c415c4ecedb9a5a1a6759de99353256a10475" },
+    { "path": "sing-box-go-modules-provenance.json", "size": 62891, "sha256": "39daf0d3511feb37991ab009488b88b66c77552dfc74f067ae6f1d1594a3e6b8" },
+    { "path": "xray-go-modules-source.zip", "size": 116965116, "sha256": "9f875e7b33703f6d249a47c95a443d1297ab6eef0e6cdc4f28b3b8d5ee24390c" },
+    { "path": "xray-go-modules-NOTICES.txt", "size": 207731, "sha256": "1fb2c9a756bffce0d697d79fcdc45445f70bfe093eba44a5f2da127f7541d13b" },
+    { "path": "xray-go-modules-provenance.json", "size": 21587, "sha256": "9053ce6d1750252dea7fb1b0c9f17cbbaa20a76eb742adc023934c055366e204" }
+  ]
+}

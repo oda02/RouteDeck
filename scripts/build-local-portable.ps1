@@ -32,6 +32,9 @@ if ($LASTEXITCODE -ne 0 -or $trackedChanges.Count -ne 0) {
   throw 'Portable build metadata requires a clean tracked source tree'
 }
 $buildMetadata = "RouteDeckBuildCommit=$sourceCommit"
+$versionJson = & node (Join-Path $PSScriptRoot 'release-version.mjs') check
+if ($LASTEXITCODE -ne 0) { throw 'Application versions disagree before portable build' }
+$applicationVersion = ($versionJson | ConvertFrom-Json).version
 
 function Assert-BuildMetadata([string] $Path) {
   $binaryText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($Path))
@@ -141,6 +144,7 @@ $helperItem = Get-Item -LiteralPath $helperPath -Force
 $guiHash = (Get-FileHash -LiteralPath $guiPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $manifest = [ordered] @{
   schemaVersion = 2
+  applicationVersion = $applicationVersion
   sourceCommit = $sourceCommit
   buildMetadata = $buildMetadata
   files = @(

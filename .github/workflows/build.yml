@@ -14,7 +14,7 @@ permissions:
 jobs:
   windows:
     runs-on: windows-2022
-    timeout-minutes: 45
+    timeout-minutes: 60
     defaults:
       run:
         shell: pwsh
@@ -53,6 +53,16 @@ jobs:
         run: node --test tests/*.test.ts tests/*.test.mjs
       - name: Controller packaging fixtures
         run: ./scripts/test-package-controller.ps1
+      - name: Reviewed runtime download and portable input fixtures (no network)
+        run: |
+          ./scripts/test-fetch-reviewed-runtimes.ps1
+          ./scripts/test-portable-inputs.ps1
+      - name: Runtime source and notice fixtures (no network)
+        run: |
+          node scripts/test-collect-engine-distribution.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Engine distribution fixtures failed' }
+          python scripts/test-collect-go-runtime-sources.py
+          if ($LASTEXITCODE -ne 0) { throw 'Go source fixtures failed' }
       - name: Release publishing boundary fixtures (no GitHub writes)
         run: ./scripts/test-publish-release.ps1
       - name: Acquire the pinned test browser
@@ -91,8 +101,20 @@ jobs:
         run: ./scripts/build-local-portable.ps1
       - name: Collect controller dependency notices
         run: node scripts/collect-controller-notices.mjs artifacts/notices
-      - name: Package controller portable ZIP
-        run: ./scripts/package-controller.ps1
+      - name: Fetch hash-pinned upstream runtime archives without execution
+        run: ./scripts/fetch-reviewed-runtimes.ps1 -DestinationRoot artifacts/runtimes
+      - name: Acquire source for the exact linked Go dependencies without executing runtimes
+        run: |
+          python scripts/collect-go-runtime-sources.py artifacts/runtimes/engine/sing-box.exe --output artifacts/go-cache/sing-box --bundle-root artifacts/go-runtime-sources --engine sing-box > artifacts/sing-box-source-provenance.log
+          if ($LASTEXITCODE -ne 0) { throw 'sing-box linked source collection failed' }
+          python scripts/collect-go-runtime-sources.py artifacts/runtimes/xray/xray.exe --output artifacts/go-cache/xray --bundle-root artifacts/go-runtime-sources --engine xray > artifacts/xray-source-provenance.log
+          if ($LASTEXITCODE -ne 0) { throw 'Xray linked source collection failed' }
+      - name: Collect runtime notices and corresponding source materials
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/collect-engine-distribution.mjs artifacts/engine-distribution
+      - name: Package complete portable ZIP and source assets
+        run: ./scripts/package-controller.ps1 -IncludeRuntimes -OutputRoot artifacts/release
       - name: Verify source remains clean
         run: |
           $changes = @(git status --porcelain --untracked-files=all)
@@ -100,12 +122,10 @@ jobs:
             $changes | ForEach-Object { Write-Output $_ }
             throw 'Build changed tracked source or lock files'
           }
-      - name: Upload verified controller archive
+      - name: Upload verified portable archive and corresponding sources
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: RouteDeck-windows-x64
-          path: |
-            artifacts/RouteDeck-*-windows-x64.zip
-            artifacts/SHA256SUMS.txt
+          path: artifacts/release/*
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
