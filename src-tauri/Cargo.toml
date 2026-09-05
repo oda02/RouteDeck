@@ -1,6 +1,6 @@
 [package]
 name = "routedeck"
-version = "0.1.0"
+version = "0.1.1"
 description = "Portable-first Windows client for sing-box"
 authors = ["RouteDeck contributors"]
 edition = "2021"

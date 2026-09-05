@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "sources": {
+    "singBox": { "repository": "SagerNet/sing-box", "commit": "628cb31ffa79cffffd34c2f9cde6cae044e4fc12", "archiveName": "sing-box-1.13.21-source.zip", "url": "https://github.com/SagerNet/sing-box/archive/628cb31ffa79cffffd34c2f9cde6cae044e4fc12.zip", "sha256": "8fde5ac286157352a2acb2b10c766877e72d11700b2733a996d84018269e6bf7" },
+    "cronetGo": { "repository": "SagerNet/cronet-go", "commit": "ec9a39c5ba3b4a8d625ede04deaf3c9020afb916", "archiveName": "cronet-go-ec9a39c5-source-only.zip", "size": 808388, "sha256": "783829d40ac618f4664d18650960416e221498f3c03346e1156bb4353dde92c5", "expectedSubmodules": { "naiveproxy": "510717a833c95a17218efc550fe6cac02414cad5" }, "selection": "complete Git tree excluding prebuilt binary suffixes; pinned submodule source is supplied separately" },
+    "naiveProxyChromium": { "repository": "SagerNet/naiveproxy", "commit": "510717a833c95a17218efc550fe6cac02414cad5", "chromiumVersion": "150.0.7871.63", "archiveName": "naiveproxy-510717a8-chromium-150.0.7871.63-full-source.zip", "url": "https://codeload.github.com/SagerNet/naiveproxy/zip/510717a833c95a17218efc550fe6cac02414cad5", "size": 79573008, "sha256": "fdf11a1c667ff2631a8ad999c3219b0e777432868efddb7a49d8ae39685ea160", "selection": "complete exact Git source tree, including vendored Chromium source" },
+    "xray": { "repository": "XTLS/Xray-core", "commit": "d2758a023cd7f4174a5a5fa4ff66e487d4342ba0", "archiveName": "xray-core-26.3.27-source.zip", "url": "https://github.com/XTLS/Xray-core/archive/d2758a023cd7f4174a5a5fa4ff66e487d4342ba0.zip", "sha256": "768528fdbd6f8c2b3fb3d3b04a5df88bcd8722216f3b1ca81ae69cdfaad28299", "selection": "complete Git source tree" }
+  },
+  "canonicalLicenses": { "gpl3": { "url": "https://www.gnu.org/licenses/gpl-3.0.txt", "size": 35149, "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986" } }
+}
