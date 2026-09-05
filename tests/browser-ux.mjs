@@ -1,6 +1,6 @@
 // Run against `npm run dev`. No native app, engines or Windows networking APIs.
 import assert from "node:assert/strict";
-import { readFile, mkdir } from "node:fs/promises";
+import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.ROUTEDECK_PLAYWRIGHT_PATH || "playwright");
@@ -81,7 +81,14 @@ try {
   assert.deepEqual(sequence, ["start_system_proxy", "stop_system_proxy", "start_tun", "stop_tun", "start_tun"]);
   scenarios += 3;
 
-  await nav("Серверы"); await page.getByRole("searchbox").fill("");
+  await nav("Серверы");
+  const serverSearch = page.getByRole("searchbox");
+  await serverSearch.fill("");
+  await page.waitForFunction(() => {
+    const search = document.querySelector('.page-slot:not([hidden]) input[type="search"]');
+    return search?.value === "" && [...document.querySelectorAll(".server-group-copy strong")].some((heading) => heading.textContent === "Основная подписка");
+  });
+  await page.getByRole("button", { name: /Основная подписка/ }).first().waitFor();
   await page.getByRole("button", { name: "Обновить подписку Основная подписка", exact: true }).click();
   await settle(); await checkFrame();
   assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => /^stop_/.test(entry.command)).length), 2, "refreshing another source stopped active runtime");
@@ -525,6 +532,12 @@ try {
 
   assert.deepEqual(errors, []);
   console.log(`PASS: ${scenarios} browser scenarios; real frontend controller with synthetic IPC, no native networking`);
+} catch (error) {
+  await mkdir(new URL("../.cache/ux-qa/", import.meta.url), { recursive: true });
+  await page.screenshot({ path: ".cache/ux-qa/ci-failure.png", fullPage: true }).catch(() => undefined);
+  const html = await page.content().catch(() => "<!-- page content unavailable -->");
+  await writeFile(new URL("../.cache/ux-qa/ci-failure.html", import.meta.url), html, "utf8");
+  throw error;
 } finally {
   await browser.close();
 }

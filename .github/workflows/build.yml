@@ -53,10 +53,23 @@ jobs:
         run: node --test tests/*.test.ts tests/*.test.mjs
       - name: Controller packaging fixtures
         run: ./scripts/test-package-controller.ps1
+      - name: Release publishing boundary fixtures (no GitHub writes)
+        run: ./scripts/test-publish-release.ps1
       - name: Acquire the pinned test browser
         run: node node_modules/playwright/cli.js install chromium
       - name: Browser scenarios with synthetic IPC and blocked external requests
         run: npm --ignore-scripts run test:browser-ui
+      - name: Preserve fixture-only browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: RouteDeck-ui-failure
+          path: |
+            .cache/ux-qa/ci-failure.png
+            .cache/ux-qa/ci-failure.html
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Prepare frontend
         run: npm --ignore-scripts run build
       - name: Fetch locked Rust dependencies
