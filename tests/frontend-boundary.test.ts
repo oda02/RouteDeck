@@ -315,7 +315,7 @@ test("TUN and System Proxy application routing state their capture boundaries", 
   assert.match(source, /value: "tun", label: "TUN"/);
   assert.doesNotMatch(source, /value: "tun"[^\n]*disabled: true|TUN · скоро/);
   assert.match(source, /Windows запросит права при подключении/);
-  assert.match(source, /Добавить приложение/);
+  assert.match(source, /Добавить приложения/);
   assert.match(source, /controller\.listRunningApplications\(\)/);
   assert.match(source, /route: draft\.defaultRoute === "direct" \? "vpn" : "direct"/);
   assert.match(source, /[Тт]олько TCP приложений, использующих прокси Windows/);

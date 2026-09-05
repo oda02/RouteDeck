@@ -194,12 +194,58 @@ try {
   await page.evaluate(() => { window.__routeDeckFixture.failStop = false; });
   await page.getByRole("button", { name: "Отключить", exact: true }).click(); await settle();
   await checkFrame(); scenarios += 2;
-  // Twenty application rules: compact list, batch add and autosave across navigation.
+  // Picker changes stay local until one explicit batch save, including while connected.
+  await nav("Главная"); await page.getByRole("button", { name: "Подключить", exact: true }).click(); await connected();
+  await page.evaluate(() => {
+    window.fixtureRoutingWrites = 0;
+    window.fixturePickerSetItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (key, value) {
+      if (key === "routedeck.routing.v1") window.fixtureRoutingWrites += 1;
+      return window.fixturePickerSetItem.call(this, key, value);
+    };
+  });
   await nav("Правила");
   await page.getByRole("button", { name: "Добавить", exact: true }).click();
   await page.locator(".application-picker-row").nth(19).waitFor();
-  for (let index = 0; index < 20; index++) await page.locator(".application-picker-row").nth(index).click();
-  await page.getByRole("button", { name: "Готово · 20", exact: true }).click();
+  for (let index = 0; index < 3; index++) await page.locator(".application-picker-row").nth(index).click();
+  // Cross the 500 ms autosave debounce: an immediate assertion would miss the old bug.
+  await page.waitForTimeout(750);
+  assert.equal(await page.evaluate(() => window.fixtureRoutingWrites), 0, "picker selection persisted before explicit save");
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps.length), 0, "picker selection mutated controller routing");
+  await page.getByRole("button", { name: "Обновить список", exact: true }).click();
+  await page.locator(".application-picker-row").nth(19).waitFor();
+  assert.equal(await page.locator('.application-picker-row[aria-pressed="true"]').count(), 3, "refresh discarded staged selections");
+  await page.locator(".application-picker-row").nth(2).click();
+  assert.equal(await page.locator('.application-picker-row[aria-pressed="true"]').count(), 2, "selection could not be undone");
+  await page.locator(".application-picker-row").nth(2).click();
+  await page.setViewportSize({ width: 360, height: 560 }); await checkFrame();
+  await page.setViewportSize({ width: 1000, height: 900 });
+  const pickerStarts = await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command.startsWith("start_")).length);
+  await page.getByRole("button", { name: "Сохранить и закрыть · 3", exact: true }).click();
+  await page.waitForFunction(() => window.__routeDeckFixture.snapshot().routing.apps.length === 3);
+  await connected();
+  assert.equal(await page.evaluate(() => window.fixtureRoutingWrites), 1, "three selected apps were not persisted in one routing write");
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command.startsWith("start_")).length), pickerStarts + 1, "batch save restarted TUN more than once");
+
+  await page.getByRole("button", { name: "Добавить", exact: true }).click();
+  await page.locator(".application-picker-row").nth(4).click();
+  await page.getByRole("button", { name: "Отмена", exact: true }).click();
+  assert.equal(await page.evaluate(() => window.fixtureRoutingWrites), 1, "cancel persisted a staged app");
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps.length), 3, "cancel mutated controller routing");
+  await page.getByRole("button", { name: "Добавить", exact: true }).click();
+  await page.locator(".application-picker-row").nth(4).click();
+  await page.getByRole("button", { name: "Закрыть окно", exact: true }).click();
+  await page.getByRole("button", { name: "Добавить", exact: true }).click();
+  await page.locator(".application-picker-row").nth(4).click();
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(750);
+  assert.equal(await page.evaluate(() => window.fixtureRoutingWrites), 1, "X or Escape persisted a staged app");
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps.length), 3, "X or Escape mutated controller routing");
+
+  // Fill the long-list fixture and keep the existing compact-list coverage.
+  await page.getByRole("button", { name: "Добавить", exact: true }).click();
+  for (let index = 3; index < 20; index++) await page.locator(".application-picker-row").nth(index).click();
+  await page.getByRole("button", { name: "Сохранить и закрыть · 17", exact: true }).click();
   await nav("Главная");
   await page.waitForFunction(() => window.__routeDeckFixture.snapshot().routing.apps.length === 20);
   await nav("Правила");
@@ -215,6 +261,7 @@ try {
   await page.getByRole("searchbox", { name: "Найти правило" }).fill("");
   await page.getByLabel("Пути", { exact: true }).uncheck();
   await page.getByText("Сохранено", { exact: true }).waitFor(); scenarios += 3;
+  await page.evaluate(() => { Storage.prototype.setItem = window.fixturePickerSetItem; });
   for (const size of [{ width: 360, height: 560 }, { width: 1000, height: 900 }]) {
     await page.setViewportSize(size); await checkFrame();
     await page.locator("main").evaluate((element) => { element.scrollTop = 0; });
