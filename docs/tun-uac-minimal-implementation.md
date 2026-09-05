@@ -56,9 +56,13 @@ name, service name, shell command, or environment value.
 
 The GUI creates the pipe before UAC. The pipe has one instance,
 `FILE_FLAG_FIRST_PIPE_INSTANCE`, `PIPE_REJECT_REMOTE_CLIENTS`, bounded messages and an
-explicit DACL for the launching user, Administrators and SYSTEM. Both sides verify peer
-PID, process creation time, fixed sibling image identity and exact build-pinned SHA-256 before
-accepting a frame.
+explicit DACL for the launching user, Administrators and SYSTEM. Peer authentication
+uses PID, process creation time and fixed sibling image identity. The GUI additionally
+verifies the helper's exact build-pinned SHA-256. The helper does not verify a pinned
+GUI hash; this is not mutual binary authentication. Its elevated configuration boundary
+therefore independently rejects unknown nested fields, file-output options and unsupported
+protocol capabilities before launching the engine. Native code already running as the
+same user remains outside the portable application's isolation guarantee.
 
 Version 3 messages are a length-prefixed, size-limited JSON schema with
 `deny_unknown_fields`:

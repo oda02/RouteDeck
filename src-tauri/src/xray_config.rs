@@ -310,6 +310,7 @@ mod tests {
             listen_port: 19191,
             tun_upstream: Some(TunUpstream {
                 interface_alias: "Wi-Fi 2".into(),
+                ipv4_dns_server: None,
             }),
         })
         .unwrap();
@@ -338,6 +339,7 @@ mod tests {
             listen_port: 19191,
             tun_upstream: Some(TunUpstream {
                 interface_alias: "Ethernet".into(),
+                ipv4_dns_server: None,
             }),
         })
         .unwrap();

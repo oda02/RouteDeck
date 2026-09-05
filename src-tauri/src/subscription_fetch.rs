@@ -234,7 +234,7 @@ fn remaining_budget(started: Instant) -> Result<Duration, SubscriptionFetchError
         .ok_or_else(timeout_error)
 }
 
-fn validate_url(raw_url: &str) -> Result<Url, SubscriptionFetchError> {
+pub(crate) fn validate_url(raw_url: &str) -> Result<Url, SubscriptionFetchError> {
     if raw_url.is_empty() || raw_url.len() > MAX_URL_BYTES {
         return Err(url_error());
     }

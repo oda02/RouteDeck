@@ -173,7 +173,9 @@ fn generated_rules() -> Result<(serde_json::Value, serde_json::Value), &'static 
         insecure_approval: None,
         tun_upstream: Some(config::TunUpstream {
             interface_alias: "Fixture Ethernet".into(),
+            ipv4_dns_server: None,
         }),
+        naive_udp_over_tcp: false,
     })
     .map_err(|_| "generate_fixture")?;
     let value: serde_json::Value =

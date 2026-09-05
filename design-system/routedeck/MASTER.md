@@ -26,6 +26,13 @@ motion rather than external fonts or full-page animation libraries.
 
 ## Visual language
 
+- Center width-limited pages within the main content viewport at every window size.
+  Navigation remains outside that viewport; only main content and dialogs scroll.
+- Keep native window, WebView and document fills aligned with the selected theme.
+  Scrollbars use the theme's subdued green with native high-contrast fallback.
+- Browser navigation/printing context menus are suppressed; application context
+  handlers and keyboard editing remain available. Packaged launches have no console.
+
 - Style: quiet, technical minimalism; dark-first with an accessible light mapping.
 - Shape: restrained 6/10/14 px radii. No pill containers around every element.
 - Icons: one outline SVG family (Lucide), 1.75 px stroke, 18/20/24 px glyph tokens.
@@ -184,4 +191,3 @@ at least 4.5:1, large text and non-text control boundaries at least 3:1.
   footers covering content.
 - No remote font dependency, GSAP/page overlay transition, decorative motion, or glow.
 - No raw subscription secrets in the UI, clipboard action, or diagnostic export.
-

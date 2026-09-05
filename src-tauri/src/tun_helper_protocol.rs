@@ -86,6 +86,7 @@ pub(crate) enum UpstreamChoice {
         interface_luid: u64,
         interface_index: u32,
         interface_alias: String,
+        ipv4_dns_server: Option<std::net::Ipv4Addr>,
     },
 }
 
@@ -231,6 +232,7 @@ pub(crate) fn validate_frame(frame: &Frame) -> Result<(), ProtocolError> {
                     interface_luid,
                     interface_index,
                     interface_alias,
+                    ipv4_dns_server,
                 } => {
                     nonzero(*interface_luid)?;
                     nonzero(*interface_index as u64)?;
@@ -240,6 +242,16 @@ pub(crate) fn validate_frame(frame: &Frame) -> Result<(), ProtocolError> {
                     {
                         return Err(ProtocolError::new(
                             "helper upstream interface identity is invalid",
+                        ));
+                    }
+                    if ipv4_dns_server.is_some_and(|address| {
+                        address.is_unspecified()
+                            || address.is_loopback()
+                            || address.is_multicast()
+                            || address == std::net::Ipv4Addr::BROADCAST
+                    }) {
+                        return Err(ProtocolError::new(
+                            "helper upstream DNS identity is invalid",
                         ));
                     }
                 }
@@ -430,6 +442,7 @@ mod tests {
                 interface_luid: 7,
                 interface_index: 9,
                 interface_alias: "Ethernet".into(),
+                ipv4_dns_server: None,
             },
         }
     }
@@ -532,6 +545,21 @@ mod tests {
             *interface_alias = "Ethernet\nspoofed".into();
         }
         assert!(validate_frame(&frame).is_err());
+
+        for invalid in ["0.0.0.0", "127.0.0.1", "224.0.0.1", "255.255.255.255"] {
+            let mut frame = start(2);
+            if let Frame::StartTun {
+                upstream_choice:
+                    UpstreamChoice::Physical {
+                        ipv4_dns_server, ..
+                    },
+                ..
+            } = &mut frame
+            {
+                *ipv4_dns_server = Some(invalid.parse().unwrap());
+            }
+            assert!(validate_frame(&frame).is_err());
+        }
 
         let mut frame = start(2);
         if let Frame::StartTun {

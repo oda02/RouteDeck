@@ -9,7 +9,12 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import { controller } from "./controller";
+import { syncWindowTheme } from "./windowAppearance";
+import { useAutoSave } from "./useAutoSave";
+import { nextSubscriptionRefresh } from "./subscriptionRefresh";
+import { appUpdateMonitor } from "./appUpdates";
 import { toPublicActionError, type PublicActionError } from "./actionErrors";
 import {
   ActivityIcon,
@@ -22,6 +27,7 @@ import {
   InfoIcon,
   LoaderIcon,
   PlusIcon,
+  RefreshIcon,
   RoutingIcon,
   SearchIcon,
   ServersIcon,
@@ -43,10 +49,14 @@ import {
   type Destination,
   type RoutingConfig,
   type RunningApplication,
+  type Server,
   type SettingsConfig,
+  type SubscriptionPreview,
+  type TrafficRule,
 } from "./model";
 
-type DialogKind = "import" | "mode-change" | "reset" | null;
+type DialogKind = "import" | "refresh-source" | "remove-source" | "reset" | "latency-info" | "clear-stale-proxy" | null;
+type ImportKind = "manual" | "subscription";
 type ToastKind = "success" | "info" | "warning";
 type ToastState = { message: string; kind: ToastKind };
 type ActionFailure = { page: Destination; notice: AppNotice; retry?: () => void };
@@ -104,6 +114,10 @@ const proofStateLabels = {
 
 function useController() {
   return useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
+}
+
+function useAppUpdates() {
+  return useSyncExternalStore(appUpdateMonitor.subscribe, appUpdateMonitor.getSnapshot, appUpdateMonitor.getSnapshot);
 }
 
 function ProofStateIcon({ proof }: { proof: ConnectionProof }) {
@@ -259,150 +273,151 @@ function SegmentedControl<T extends string>({ label, value, options, onChange, d
   );
 }
 
-function HomePage({ snapshot, headingRef, onNavigate, onModeChange, onConnect, onDisconnect, onRetry, actionFailure, onClearFailure }: {
+function HomePage({ snapshot, libraryBusy, headingRef, onNavigate, onModeChange, onConnect, onDisconnect, onRetry, onLatencyInfo, actionFailure, onClearFailure }: {
   snapshot: ControllerSnapshot;
+  libraryBusy: boolean;
   headingRef: React.RefObject<HTMLHeadingElement | null>;
   onNavigate: (destination: Destination) => void;
   onModeChange: (mode: ConnectionMode) => void;
   onConnect: () => void;
   onDisconnect: () => void;
   onRetry: () => void;
+  onLatencyInfo: () => void;
   actionFailure: ActionFailure | null;
   onClearFailure: () => void;
 }) {
-  const localDiagnostic = snapshot.runtimeScope === "local-only";
   const server = snapshot.servers.find((item) => item.id === snapshot.selectedServerId);
-  const pending = pendingPhases.includes(snapshot.phase);
-  const hasLiveCore = ["connected", "degraded", "blocked-by-conflict"].includes(snapshot.phase);
-  const buttonLabel = pending
-    ? phaseLabels[snapshot.phase]
-    : hasLiveCore
-      ? localDiagnostic ? "Остановить локальный прокси" : "Отключить"
-      : snapshot.phase === "failed" ? "Повторить" : "Подключить";
-  const boundaryNotice = snapshot.notice?.id === "backend-unavailable" || snapshot.notice?.id === "backend-response-invalid";
-  const vpnApps = snapshot.routing.apps.filter((app) => app.route === "vpn");
-  const directApps = snapshot.routing.apps.filter((app) => app.route === "direct");
-  const routeMode = snapshot.mode === "tun" ? "TUN" : "Прокси Windows";
-  const routeSummary = snapshot.routing.defaultRoute === "direct"
-    ? `${routeMode}: напрямую · ${vpnApps.length} ${vpnApps.length === 1 ? "исключение" : "исключений"} через VPN`
-    : `${routeMode}: через VPN · ${directApps.length} исключений напрямую`;
-
+  const activeServer = snapshot.servers.find((item) => item.id === snapshot.activeServerId);
+  const pending = (Boolean(snapshot.switching) && !libraryBusy) || pendingPhases.includes(snapshot.phase);
+  const connected = snapshot.phase === "connected" && !pending;
+  const active = Boolean(snapshot.activeServerId) || ["connected", "degraded", "blocked-by-conflict"].includes(snapshot.phase);
+  const mode = snapshot.activeMode ?? snapshot.mode;
+  const liveLatency = connected && activeServer?.latencyState === "ready" ? activeServer.latencyMs : undefined;
+  const status = pending ? "Переключаемся" : phaseLabels[snapshot.phase];
+  const boundaryNotice = !snapshot.backendAvailable && !snapshot.isDemo;
   return (
     <div className="page home-page">
-      <div className="page-title-row">
-        <div>
-          <p className="overline">Управление соединением</p>
-          <h1 ref={headingRef} tabIndex={-1}>Главная</h1>
-        </div>
-        <span className="mode-readout">{localDiagnostic ? "Локальная диагностика" : snapshot.mode === "proxy" ? "System Proxy" : "TUN"}</span>
-      </div>
-
+      <h1 className="sr-only" ref={headingRef} tabIndex={-1}>Главная</h1>
       <ActionFailureNotice failure={actionFailure} page="home" onClear={onClearFailure} />
-
-      <button className="selection-card" type="button" onClick={() => onNavigate("servers")}>
-        <span className="selection-leading"><ServersIcon size={20} /></span>
-        <span className="selection-copy">
-          <span className="selection-label">Выбранный сервер</span>
-          <strong>{server ? `${server.country} · ${server.name}` : "Сервер не выбран"}</strong>
-          <span>{server ? `${server.protocol} · ${server.detail}` : "Импортируйте подписку"}</span>
-        </span>
-        <ChevronRightIcon size={20} />
-      </button>
-
-      <section className="card mode-card" aria-labelledby="connection-mode-title">
-        <div className="section-heading compact-heading">
-          <div>
-            <p className="overline">Перехват трафика</p>
-            <h2 id="connection-mode-title">Режим</h2>
-          </div>
+      <section className="connection-hero" data-state={connected ? "connected" : pending ? "pending" : snapshot.phase === "failed" ? "failed" : "idle"} aria-label="Подключение">
+        <div className="hero-topline"><span className="eyebrow">ВАШЕ ПОДКЛЮЧЕНИЕ</span><span className="connection-live-dot" aria-hidden="true" /></div>
+        <div className="hero-status-row">
+          <span className="hero-symbol">{pending ? <LoaderIcon size={32} /> : <ShieldIcon size={32} />}</span>
+          <div className="hero-status-copy"><h2 aria-live="polite">{status}</h2><p>{pending ? phaseLabels[snapshot.phase] : connected ? `${mode === "tun" ? "TUN" : "Системный прокси"} · маршрут проверен` : active ? "Соединение требует внимания" : "Готов к подключению"}</p></div>
         </div>
-        <SegmentedControl
-          label="Режим подключения"
-          value={snapshot.mode}
-          options={[{ value: "proxy", label: "Системный прокси" }, { value: "tun", label: "TUN" }]}
-          onChange={onModeChange}
-          disabled={pending || localDiagnostic}
-        />
-        <div className="persistent-hint" data-kind="info">
-          {snapshot.mode === "proxy" ? <InfoIcon size={18} /> : <ShieldIcon size={18} />}
-          <p>
-            {localDiagnostic
-              ? "Диагностическая сессия проверяет локальные HTTP/SOCKS-порты и не меняет настройки Windows."
-              : snapshot.mode === "tun"
-                ? "Перехватывает весь IP-трафик через виртуальный адаптер. При каждом подключении Windows покажет стандартный запрос прав."
-                : "Применяет общий маршрут и исключения к TCP-трафику приложений, которые используют прокси Windows."}
-          </p>
+        <div className="connection-current">
+          <span>{activeServer ? "Сейчас используется" : "Сервер для подключения"}</span>
+          <strong>{activeServer?.name ?? server?.name ?? "Добавьте первый сервер"}</strong>
+          <span>{activeServer?.source ?? server?.source ?? "Подписка или отдельная ссылка"}</span>
+        </div>
+        <button className={`primary-button connection-button${active || pending ? " disconnect-button" : ""}`} type="button"
+          disabled={boundaryNotice || (!server && !active && !pending) || snapshot.phase === "disconnecting"}
+          onClick={active || pending ? onDisconnect : onConnect}>
+          {active || pending ? <XCircleIcon size={23} /> : <ShieldIcon size={23} />}
+          <span>{snapshot.phase === "disconnecting" ? "Отключаем…" : pending ? "Отменить подключение" : active ? "Отключить" : "Подключить"}</span>
+        </button>
+        <div className="connection-metrics">
+          <button type="button" className="latency-metric" onClick={onLatencyInfo} aria-label="Как измеряется отклик через VPN"><ActivityIcon size={16} /><strong>{liveLatency !== undefined ? `${liveLatency} мс` : "—"}</strong><span>Отклик · Google</span><InfoIcon size={14} /></button>
+          <span>{connected ? liveLatency === undefined ? "Ожидаем замер" : "Обновляется автоматически" : "Замер после подключения"}</span>
         </div>
       </section>
-
-      <button
-        className={`primary-button connection-button${hasLiveCore ? " disconnect-button" : ""}`}
-        type="button"
-        disabled={pending || !server}
-        aria-busy={pending}
-        onClick={hasLiveCore ? onDisconnect : onConnect}
-      >
-        {pending ? <LoaderIcon size={20} /> : hasLiveCore ? <XCircleIcon size={20} /> : <ShieldIcon size={20} />}
-        <span>{buttonLabel}</span>
-      </button>
-
-      {snapshot.notice ? (
-        <OpaqueNotice
-          notice={snapshot.notice}
-          onClose={boundaryNotice ? undefined : controller.dismissNotice}
-          primaryAction={boundaryNotice ? undefined : { label: "Повторить проверку", onClick: onRetry }}
-          secondaryAction={{ label: "Открыть диагностику", onClick: () => onNavigate("diagnostics") }}
-        />
-      ) : null}
-
-      <button className="summary-card" type="button" onClick={() => onNavigate("routing")}>
-        <span className="summary-icon"><RoutingIcon size={20} /></span>
-        <span className="selection-copy">
-          <span className="selection-label">Маршрутизация</span>
-          <strong>{routeSummary}</strong>
-          <span>{snapshot.mode === "tun" ? "Общий маршрут и исключения для приложений" : "Маршрут и исключения для proxy-aware TCP; UDP и QUIC не перехватываются"}</span>
-        </span>
+      <button className="selection-card server-choice" type="button" onClick={() => onNavigate("servers")}>
+        <span className="selection-leading"><ServersIcon size={20} /></span>
+        <span className="selection-copy"><span className="selection-label">{pending ? "Переключаем на" : "Выбранный сервер"}</span><strong>{server?.name ?? "Выбрать сервер"}</strong><span>{server ? `${server.protocol} · ${server.source}` : "Добавить или выбрать из библиотеки"}</span></span>
         <ChevronRightIcon size={20} />
       </button>
+      <section className="mode-section" aria-labelledby="connection-mode-title">
+        <div className="section-heading compact-heading"><h2 id="connection-mode-title">Режим подключения</h2><span className="field-help">Автопереключение</span></div>
+        <SegmentedControl label="Режим подключения" value={snapshot.mode} options={[{ value: "proxy", label: "Системный прокси" }, { value: "tun", label: "TUN" }]} onChange={onModeChange} disabled={boundaryNotice} />
+        <p className="mode-explanation">{snapshot.mode === "tun" ? "Трафик устройства через TUN. Windows запросит права при подключении." : "Для приложений с поддержкой прокси Windows. UDP и системный DNS не перехватываются."}</p>
+      </section>
+      {snapshot.notice && actionFailure?.page !== "home" ? <OpaqueNotice notice={snapshot.notice} onClose={boundaryNotice ? undefined : controller.dismissNotice} primaryAction={boundaryNotice ? undefined : { label: "Повторить", onClick: onRetry }} secondaryAction={{ label: "Диагностика", onClick: () => onNavigate("diagnostics") }} /> : null}
+      <button className="summary-card routing-shortcut" type="button" onClick={() => onNavigate("routing")}><RoutingIcon size={19} /><span className="selection-copy"><strong>Правила маршрутизации</strong><span>{snapshot.routing.defaultRoute === "vpn" ? "По умолчанию через VPN" : "По умолчанию напрямую"} · исключений: {snapshot.routing.apps.filter((app) => app.route !== "inherit" && app.route !== snapshot.routing.defaultRoute).length}</span></span><ChevronRightIcon size={18} /></button>
     </div>
   );
 }
 
-function ServersPage({ snapshot, headingRef, search, onSearch, onImport, actionFailure, onClearFailure }: {
+function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onSelect, picking, onBack, onRefresh, onRemove, sourceBusy, actionFailure, onClearFailure }: {
   snapshot: ControllerSnapshot;
   headingRef: React.RefObject<HTMLHeadingElement | null>;
   search: string;
   onSearch: (value: string) => void;
-  onImport: () => void;
+  onImport: (kind: ImportKind) => void;
+  onSelect: (id: string) => void;
+  picking: boolean;
+  onBack: () => void;
+  onRefresh: (server: Server) => void;
+  onRemove: (server: Server) => void;
+  sourceBusy: boolean;
   actionFailure: ActionFailure | null;
   onClearFailure: () => void;
 }) {
   const filtered = useMemo(() => {
     const query = search.trim().toLocaleLowerCase("ru-RU");
-    return snapshot.servers.filter((server) => !query || `${server.country} ${server.name} ${server.protocol}`.toLocaleLowerCase("ru-RU").includes(query));
+    return snapshot.servers.filter((server) => !query || `${server.country} ${server.name} ${server.protocol} ${server.source}`.toLocaleLowerCase("ru-RU").includes(query));
   }, [search, snapshot.servers]);
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
+  const [visibleCounts, setVisibleCounts] = useState<Record<string, number>>({});
+  const groupIdPrefix = useId();
+  useEffect(() => {
+    setCollapsedGroups(new Set());
+    setVisibleCounts({});
+  }, [search]);
+  const groups = useMemo(() => {
+    const result = new Map<string, { name: string; kind: ImportKind; servers: typeof filtered }>();
+    for (const server of filtered) {
+      const id = server.sourceId ?? server.source;
+      const group = result.get(id) ?? { name: server.source, kind: server.sourceKind ?? "subscription", servers: [] };
+      group.servers.push(server);
+      result.set(id, group);
+    }
+    return [...result.entries()];
+  }, [filtered]);
 
   return (
     <div className="page">
       <div className="page-title-row">
-        <div><p className="overline">Узлы подписки</p><h1 ref={headingRef} tabIndex={-1}>Серверы</h1></div>
+        <div><p className="overline">{picking ? "Выбор подключения" : "Моя библиотека"}</p><h1 ref={headingRef} tabIndex={-1}>{picking ? "Выбрать сервер" : "Серверы"}</h1></div>
         <span className="count-badge">{snapshot.servers.length}</span>
       </div>
+      {picking ? <button type="button" className="text-button picker-back" onClick={onBack}>← Назад к подключению</button> : null}
       <ActionFailureNotice failure={actionFailure} page="servers" onClear={onClearFailure} />
-      <button className="primary-button" type="button" onClick={onImport}><ImportIcon size={20} />Импортировать подписку</button>
+      <div className="server-add-actions">
+        <button className="primary-button" type="button" disabled={sourceBusy} onClick={() => onImport("manual")}><PlusIcon size={20} />Добавить сервер</button>
+        <button className="secondary-button" type="button" disabled={sourceBusy} onClick={() => onImport("subscription")}><ImportIcon size={20} />Подписка</button>
+      </div>
       <div className="toolbar">
         <label className="search-field">
           <span className="sr-only">Поиск серверов</span>
           <SearchIcon size={18} />
-          <input value={search} type="search" placeholder="Поиск по имени или протоколу" onChange={(event) => onSearch(event.target.value)} />
+          <input value={search} type="search" placeholder="Имя, протокол или группа" onChange={(event) => onSearch(event.target.value)} />
         </label>
       </div>
       <div className="subscription-meta">
-        <span><strong>{snapshot.subscriptionName}</strong> · обновлено {snapshot.subscriptionUpdatedAt}</span>
-        <span>VLESS · Hysteria2 · Naive</span>
+        <span>{filtered.length} из {snapshot.servers.length} серверов</span>
+        <span>{snapshot.switching ? "Переподключение…" : sourceBusy ? "Обновление библиотеки…" : picking ? "После выбора вернёмся на главную" : "Выбор применяется автоматически"}</span>
       </div>
       <div className="server-list" role="radiogroup" aria-label="Выбор сервера">
-        {filtered.length ? filtered.map((server) => {
+        {filtered.length ? groups.map(([groupId, group], index) => {
+          const expanded = !collapsedGroups.has(groupId);
+          const visibleCount = Object.hasOwn(visibleCounts, groupId) ? visibleCounts[groupId] : 100;
+          const panelId = `${groupIdPrefix}-${index}`;
+          return <section className="server-group" key={groupId}>
+            <div className="source-heading"><h2><button className="server-group-toggle" type="button" aria-expanded={expanded} aria-controls={panelId} onClick={() => setCollapsedGroups((current) => {
+              const next = new Set(current);
+              if (next.has(groupId)) next.delete(groupId); else next.add(groupId);
+              return next;
+            })}>
+              <ChevronRightIcon size={18} />
+              <span className="server-group-copy"><strong>{group.name}</strong><span>{group.kind === "manual" ? "Добавлено вручную" : group.servers[0].sourceUpdatedAtMs ? `Обновлено ${new Date(group.servers[0].sourceUpdatedAtMs).toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" })}` : "Подписка"}</span></span>
+              <span className="count-badge">{group.servers.length}</span>
+            </button></h2>
+            {group.servers[0].sourceId ? <div className="source-actions">
+              {group.kind === "subscription" ? <button className="icon-button" type="button" disabled={sourceBusy} aria-label={`Обновить подписку ${group.name}`} title="Обновить подписку" onClick={() => onRefresh(group.servers[0])}><RefreshIcon size={18} /></button> : null}
+              <button className="icon-button" type="button" disabled={sourceBusy} aria-label={`Удалить группу ${group.name}`} title="Удалить группу" onClick={() => onRemove(group.servers[0])}><TrashIcon size={18} /></button>
+            </div> : null}</div>
+            <div id={panelId} className="server-group-rows" hidden={!expanded}>
+            {group.servers.slice(0, visibleCount).map((server) => {
           const selected = server.id === snapshot.selectedServerId;
           const latency = server.latencyState === "pending" ? "Проверка…" : server.latencyState === "timeout" ? "Тайм-аут" : server.latencyState === "unavailable" ? "—" : `${server.latencyMs} мс`;
           return (
@@ -411,45 +426,56 @@ function ServersPage({ snapshot, headingRef, search, onSearch, onImport, actionF
               data-selected={selected}
               key={server.id}
             >
-              <input className="control-input" type="radio" name="selected-server" value={server.id} checked={selected} onChange={() => controller.selectServer(server.id)} />
+              <input className="control-input" type="radio" name="selected-server" value={server.id} checked={selected} onClick={() => { if (selected) onSelect(server.id); }} onChange={() => onSelect(server.id)} />
               <span className="radio-indicator" aria-hidden="true"><span /></span>
-              <span className="country-code">{server.country}</span>
+              <span className="protocol-mark" aria-hidden="true">{server.protocol.slice(0, 1)}</span>
               <span className="server-copy">
-                <strong>{server.name}</strong>
-                <span>{server.protocol} · {server.detail} · {server.source}</span>
+                <strong title={server.name}>{server.name}</strong>
+                <span>{server.protocol}{server.protocol === "Naive" ? snapshot.routing.naiveUdpOverTcp ? " · UoT v2 включён" : " · TCP без UDP" : ""}{server.id === snapshot.activeServerId ? " · Активен" : ""}</span>
               </span>
               <span className="latency" data-state={server.latencyState}>
                 <strong>{latency}</strong>
-                <span>{server.checkedAt ? `проверено ${server.checkedAt}` : "ещё не проверено"}</span>
+                <span title="Отклик Google через выбранный VPN на установленном соединении">{server.latencyMs !== undefined && server.latencyState === "ready" ? "Google" : "не измерено"}</span>
               </span>
             </label>
           );
-        }) : <div className="empty-state"><SearchIcon size={24} /><strong>Ничего не найдено</strong><span>Измените запрос или обновите подписку.</span></div>}
+            })}
+            {group.servers.length > visibleCount ? <button className="secondary-button" type="button" onClick={() => setVisibleCounts((current) => ({ ...current, [groupId]: visibleCount + 100 }))}>Показать ещё · осталось {group.servers.length - visibleCount}</button> : null}
+            </div>
+          </section>;
+        }) : <div className="empty-state"><ServersIcon size={24} /><strong>{snapshot.servers.length ? "Ничего не найдено" : "Добавьте первый сервер"}</strong><span>{snapshot.servers.length ? "Попробуйте другое имя, протокол или группу." : "Вставьте ссылку сервера или добавьте подписку от провайдера."}</span></div>}
       </div>
     </div>
   );
 }
 
-function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onToast, runAsyncAction, actionFailure, onClearFailure }: {
+type SaveFeedback = { pending: boolean; error: string; retry: () => void };
+
+function SaveState({ state, unapplied = false }: { state: SaveFeedback; unapplied?: boolean }) {
+  return <div className="save-feedback" data-error={Boolean(state.error)}>
+    <span role="status" aria-live="polite">{state.error ? "Не сохранено или не применено" : state.pending ? "Сохраняем…" : unapplied ? "Сохранено · ожидает подключения" : "Сохранено"}</span>
+    {state.error ? <><p role="alert">{state.error}</p><button className="text-button" type="button" onClick={state.retry}>Повторить</button></> : null}
+  </div>;
+}
+
+function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: {
   snapshot: ControllerSnapshot;
   headingRef: React.RefObject<HTMLHeadingElement | null>;
   draft: RoutingConfig;
   onDraftChange: (routing: RoutingConfig) => void;
-  onApply: () => Promise<void>;
-  onToast: (message: string, kind?: ToastKind) => void;
-  runAsyncAction: RunAsyncAction;
-  actionFailure: ActionFailure | null;
-  onClearFailure: () => void;
+  saveState: SaveFeedback;
 }) {
-  const [applying, setApplying] = useState(false);
+  const [search, setSearch] = useState("");
+  const [showPaths, setShowPaths] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerLoading, setPickerLoading] = useState(false);
   const [pickerSearch, setPickerSearch] = useState("");
   const [pickerError, setPickerError] = useState("");
   const [runningApplications, setRunningApplications] = useState<RunningApplication[]>([]);
+  const [trafficEditor, setTrafficEditor] = useState<TrafficRule | null>(null);
+  const [trafficEditorOriginalId, setTrafficEditorOriginalId] = useState<string | null>(null);
+  const [trafficEditorError, setTrafficEditorError] = useState("");
   const deferredPickerSearch = useDeferredValue(pickerSearch);
-  const connectionActive = snapshot.phase !== "disconnected" && snapshot.phase !== "failed";
-  const dirty = JSON.stringify(draft) !== JSON.stringify(snapshot.routing);
   const summary = draft.defaultRoute === "direct"
     ? `По умолчанию напрямую · ${draft.apps.filter((app) => app.route === "vpn").length} исключений через VPN`
     : `По умолчанию через VPN · ${draft.apps.filter((app) => app.route === "direct").length} исключений напрямую`;
@@ -467,20 +493,8 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
     apps: draft.apps.map((app) => app.id === id ? { ...app, route } : app),
   });
 
-  const apply = () => {
-    if (!dirty || applying) return;
-    void runAsyncAction({
-      page: "routing",
-      title: "Не удалось применить маршрутизацию",
-      setBusy: setApplying,
-      action: onApply,
-      retry: apply,
-      onSuccess: () => onToast("Правила маршрутизации применены", "success"),
-    });
-  };
-
   const openApplicationPicker = () => {
-    if (connectionActive || pickerLoading) return;
+    if (pickerLoading) return;
     setPickerOpen(true);
     setPickerLoading(true);
     setPickerSearch("");
@@ -506,69 +520,96 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
     });
   };
 
+  const matchingApps = draft.apps.filter((app) => `${app.name} ${app.path}`.toLocaleLowerCase("ru-RU").includes(search.trim().toLocaleLowerCase("ru-RU")));
+  const openTrafficEditor = (rule?: TrafficRule) => {
+    setTrafficEditorOriginalId(rule?.id ?? null);
+    setTrafficEditor(rule ? { ...rule } : { id: `traffic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, enabled: true, network: "udp", port: 443, action: "block" });
+    setTrafficEditorError("");
+  };
+  const closeTrafficEditor = () => { setTrafficEditor(null); setTrafficEditorOriginalId(null); setTrafficEditorError(""); };
+  const applyTrafficEditor = () => {
+    if (!trafficEditor) return;
+    if (!Number.isInteger(trafficEditor.port) || trafficEditor.port < 1 || trafficEditor.port > 65535) { setTrafficEditorError("Укажите целый порт от 1 до 65535."); return; }
+    if (trafficEditor.port === 53) { setTrafficEditorError("Порт 53 зарезервирован для защищённой обработки DNS."); return; }
+    const trafficRules = trafficEditorOriginalId
+      ? draft.trafficRules.map((rule) => rule.id === trafficEditorOriginalId ? trafficEditor : rule)
+      : [...draft.trafficRules, trafficEditor];
+    onDraftChange({ ...draft, trafficRules });
+    closeTrafficEditor();
+  };
+  const moveTrafficRule = (index: number, direction: -1 | 1) => {
+    const target = index + direction;
+    if (target < 0 || target >= draft.trafficRules.length) return;
+    const trafficRules = [...draft.trafficRules];
+    [trafficRules[index], trafficRules[target]] = [trafficRules[target], trafficRules[index]];
+    onDraftChange({ ...draft, trafficRules });
+  };
+  const blocksQuic = draft.trafficRules.find((rule) => rule.enabled && rule.network === "udp" && rule.port === 443)?.action === "block";
   return (
-    <div className="page">
+    <div className="page routing-page">
       <div className="page-title-row">
-        <div><p className="overline">Политика трафика</p><h1 ref={headingRef} tabIndex={-1}>Маршрутизация</h1></div>
-        {dirty ? <span className="quiet-badge warning-badge">Не сохранено</span> : <span className="quiet-badge">Готово</span>}
+        <h1 ref={headingRef} tabIndex={-1}>Правила</h1>
+        <SaveState state={saveState} unapplied={snapshot.routingPending} />
       </div>
-      <ActionFailureNotice failure={actionFailure} page="routing" onClear={onClearFailure} />
-      <section className="card">
-        <div className="section-heading compact-heading"><div><p className="overline">Общая политика</p><h2>Маршрут по умолчанию</h2></div></div>
-        <SegmentedControl
-          label="Маршрут по умолчанию"
-          value={draft.defaultRoute}
-          options={[{ value: "direct", label: "Напрямую" }, { value: "vpn", label: "Через VPN" }]}
-          onChange={(defaultRoute) => onDraftChange({ ...draft, defaultRoute })}
-          disabled={connectionActive}
-        />
-        <p className="effective-summary"><RoutingIcon size={18} />{summary}</p>
+      <section className="card route-default">
+        <label htmlFor="default-route"><strong>Остальной трафик</strong><small>Приложения ниже — исключения</small></label>
+        <select id="default-route" value={draft.defaultRoute} onChange={(event) => onDraftChange({ ...draft, defaultRoute: event.target.value as RoutingConfig["defaultRoute"] })}>
+          <option value="vpn">Через VPN</option><option value="direct">Напрямую</option>
+        </select>
       </section>
 
-      <OpaqueNotice notice={snapshot.mode === "tun"
-        ? { id: "tun-routing-scope", kind: "info", title: "Правила применятся при следующем подключении", body: "TUN использует общий маршрут для трафика Windows, а выбранные приложения — как исключения." }
-        : { id: "proxy-routing-scope", kind: "info", title: "System Proxy: только приложения с поддержкой прокси", body: "Правила действуют для TCP-трафика приложений, которые используют прокси Windows. Программы, обходящие системный прокси, а также UDP, QUIC и системный DNS не перехватываются; для полного охвата используйте TUN." }} />
-
-      <section className="card app-rules-card">
-        <div className="section-heading">
-          <div><p className="overline">Исключения</p><h2>Приложения</h2></div>
-          <button className="secondary-button compact-action" type="button" disabled={connectionActive || pickerLoading} onClick={openApplicationPicker} title={connectionActive ? "Сначала отключитесь, чтобы изменить правила" : undefined}>
-            {pickerLoading ? <LoaderIcon size={18} /> : <PlusIcon size={18} />}Добавить приложение
-          </button>
+      <details className="routing-scope"><summary>{snapshot.mode === "tun" ? "TUN · трафик Windows" : "Системный прокси · ограниченный охват"}</summary><p>{snapshot.mode === "tun" ? "Правила охватывают трафик Windows." : "Только TCP приложений, использующих прокси Windows. Для остальных приложений и UDP нужен TUN."} Изменения сохраняются автоматически; активное соединение переподключится.</p></details>
+      <section className="card rules-table">
+        <div className="rules-toolbar">
+          <h2>Приложения <span className="quiet-count">{draft.apps.length}</span></h2>
+          <button className="secondary-button compact-action" type="button" disabled={pickerLoading} onClick={openApplicationPicker}><PlusIcon size={17} />Добавить</button>
         </div>
+        {draft.apps.length > 0 ? <div className="rules-filter">
+          <label className="search-field"><SearchIcon size={17} /><input type="search" aria-label="Найти правило" placeholder="Найти приложение" value={search} onChange={(event) => setSearch(event.target.value)} /></label>
+          <label className="paths-toggle"><input type="checkbox" checked={showPaths} onChange={(event) => setShowPaths(event.target.checked)} />Пути</label>
+        </div> : null}
         <div className="app-rule-list">
-          {draft.apps.length > 0 ? draft.apps.map((app) => (
-            <div className="app-rule" key={app.id}>
-              <div className="app-rule-heading">
-                <span className="app-monogram" aria-hidden="true">{app.name.slice(0, 1).toUpperCase()}</span>
-                <span className="app-copy"><strong>{app.name}</strong><span title={app.path}>{app.path}</span></span>
-                <button className="icon-button" type="button" disabled={connectionActive} aria-label={`Удалить правило ${app.name}`} title="Удалить правило" onClick={() => onDraftChange({ ...draft, apps: draft.apps.filter((item) => item.id !== app.id) })}><TrashIcon size={18} /></button>
-              </div>
-              <SegmentedControl
-                label={`Маршрут для ${app.name}`}
-                value={app.route}
-                options={[{ value: "direct", label: "Напрямую" }, { value: "vpn", label: "Через VPN" }]}
-                onChange={(route) => updateApp(app.id, route)}
-                disabled={connectionActive}
-              />
-              <p className="rule-effective">
-                {snapshot.mode === "tun"
-                  ? `В TUN: трафик приложения ${app.route === "direct" ? "напрямую" : "через VPN"}`
-                  : `В System Proxy: TCP-трафик приложения через прокси Windows ${app.route === "direct" ? "напрямую" : "через VPN"}`}
-              </p>
-            </div>
-          )) : (
-            <div className="empty-state">
-              <RoutingIcon size={24} />
-              <strong>Исключений пока нет</strong>
-              <span>{snapshot.mode === "tun" ? "Добавьте запущенное приложение, чтобы задать ему другой маршрут." : "Добавьте приложение, использующее прокси Windows, чтобы задать его TCP-трафику другой маршрут."}</span>
-            </div>
-          )}
+          {matchingApps.map((app) => <div className="compact-rule" key={app.id}>
+            <span className="rule-app-copy"><strong title={app.path}>{app.name}</strong>{showPaths ? <small>{app.path}</small> : null}</span>
+            <select aria-label={`Маршрут для ${app.name}`} value={app.route} onChange={(event) => updateApp(app.id, event.target.value as AppRouteChoice)}>
+              <option value="inherit">По умолчанию</option><option value="vpn">Через VPN</option><option value="direct">Напрямую</option>
+            </select>
+            <button className="icon-button rule-remove" type="button" aria-label={`Удалить правило ${app.name}`} title="Удалить правило" onClick={() => onDraftChange({ ...draft, apps: draft.apps.filter((item) => item.id !== app.id) })}><XIcon size={16} /></button>
+          </div>)}
+          {matchingApps.length === 0 ? <div className="empty-state compact-empty"><RoutingIcon size={22} /><strong>{draft.apps.length ? "Ничего не найдено" : "Исключений пока нет"}</strong><span>{draft.apps.length ? "Измените запрос или очистите поиск." : "Добавьте запущенное приложение и выберите его маршрут."}</span></div> : null}
         </div>
+        <p className="rules-footer">{search ? `Найдено: ${matchingApps.length} из ${draft.apps.length}` : summary}</p>
       </section>
-      <button className="primary-button" type="button" disabled={connectionActive || !dirty || applying} aria-busy={applying} onClick={apply} title={connectionActive ? "Сначала отключитесь, чтобы изменить правила" : undefined}>
-        {applying ? <LoaderIcon size={20} /> : <CheckIcon size={20} />}{applying ? "Сохраняем…" : "Сохранить правила"}
-      </button>
+
+      <details className="card traffic-rules">
+        <summary><span><strong>Правила трафика</strong><small>Только TUN · {draft.trafficRules.length} из 32 · первое совпадение</small></span>{blocksQuic ? <span className="quiet-badge">UDP 443 блокируется</span> : null}</summary>
+        <div className="traffic-rules-body">
+          <p className="field-help">Только для TUN. Эти правила применяются перед исключениями приложений, но после защищённой обработки DNS и IPv6.</p>
+          <div className="traffic-rule-list">
+            {draft.trafficRules.map((rule, index) => <div className="traffic-rule-row" key={rule.id}>
+              <label className="traffic-rule-enabled"><input type="checkbox" checked={rule.enabled} onChange={(event) => onDraftChange({ ...draft, trafficRules: draft.trafficRules.map((item) => item.id === rule.id ? { ...item, enabled: event.target.checked } : item) })} /><span className="sr-only">Включить правило {index + 1}</span></label>
+              <span className="traffic-rule-copy"><strong>{rule.network.toUpperCase()} {rule.port}</strong><small>{rule.action === "block" ? "Блокировать" : rule.action === "direct" ? "Напрямую" : "Через VPN"}</small></span>
+              <span className="traffic-rule-order"><button className="icon-button" type="button" disabled={index === 0} aria-label={`Поднять правило ${index + 1}`} title="Поднять" onClick={() => moveTrafficRule(index, -1)}>↑</button><button className="icon-button" type="button" disabled={index === draft.trafficRules.length - 1} aria-label={`Опустить правило ${index + 1}`} title="Опустить" onClick={() => moveTrafficRule(index, 1)}>↓</button></span>
+              <button className="text-button" type="button" onClick={() => openTrafficEditor(rule)}>Изменить</button>
+              <button className="icon-button" type="button" aria-label={`Удалить правило ${index + 1}`} title="Удалить" onClick={() => onDraftChange({ ...draft, trafficRules: draft.trafficRules.filter((item) => item.id !== rule.id) })}><XIcon size={16} /></button>
+            </div>)}
+          </div>
+          <button className="secondary-button compact-action" type="button" disabled={draft.trafficRules.length >= 32} onClick={() => openTrafficEditor()}><PlusIcon size={17} />Добавить правило</button>
+          <p className="settings-explanation">Блокировка UDP 443 может улучшить совместимость YouTube за счёт перехода на TCP. Приложения, работающие только через QUIC, потребуют отключить это правило.</p>
+        </div>
+      </details>
+
+      <details className="card settings-details naive-settings">
+        <summary>Дополнительные настройки Naive</summary>
+        <label className="field-row"><span><strong>UDP over TCP для Naive</strong><small>Для всех профилей Naive</small></span><input type="checkbox" aria-label="UDP over TCP для Naive" checked={draft.naiveUdpOverTcp} onChange={(event) => onDraftChange({ ...draft, naiveUdpOverTcp: event.target.checked })} /></label>
+        <p className="settings-explanation">На сервере нужна поддержка SagerNet UoT v2, например в sing-box. Обычного Naive или Caddy недостаточно. Для UDP приложений используйте TUN. Правила трафика, включая блокировку UDP 443, продолжают действовать.</p>
+      </details>
+
+      <details className="card settings-details tun-stack-settings">
+        <summary>Дополнительные настройки TUN</summary>
+        <label className="field-row"><span><strong>Стек TUN</strong><small>Применяется только в режиме TUN</small></span><select aria-label="Стек TUN" value={draft.tunStack} onChange={(event) => onDraftChange({ ...draft, tunStack: event.target.value as RoutingConfig["tunStack"] })}><option value="gvisor">gVisor</option><option value="system">System</option></select></label>
+        <p className="settings-explanation">По умолчанию используется gVisor. Он может помочь с совместимостью с zapret. При необходимости можно выбрать System; настройка сохраняется.</p>
+      </details>
 
       {pickerOpen ? (
         <Dialog
@@ -577,7 +618,7 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
           focusKey="application-picker-search"
           onClose={() => setPickerOpen(false)}
           busy={pickerLoading}
-          actions={<button className="secondary-button" type="button" onClick={() => setPickerOpen(false)}>Готово</button>}
+          actions={<><button className="text-button" type="button" disabled={pickerLoading} onClick={openApplicationPicker}><RefreshIcon size={16} />Обновить список</button><button className="secondary-button" type="button" onClick={() => setPickerOpen(false)}>Готово · {draft.apps.length}</button></>}
         >
           {pickerLoading ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><LoaderIcon size={17} />Ищем запущенные приложения…</p> : (
             <>
@@ -603,81 +644,80 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, onApply, onTo
           )}
         </Dialog>
       ) : null}
+      {trafficEditor ? (
+        <Dialog title={trafficEditorOriginalId ? "Изменить правило трафика" : "Добавить правило трафика"} description="Правило применяется только после нажатия «Применить»." onClose={closeTrafficEditor}
+          actions={<><button className="secondary-button" type="button" onClick={closeTrafficEditor}>Отмена</button><button className="primary-button dialog-primary" type="submit" form="traffic-rule-form">Применить</button></>}>
+          <form id="traffic-rule-form" className="traffic-rule-form" onSubmit={(event) => { event.preventDefault(); applyTrafficEditor(); }}>
+            <label className="dialog-field"><span>Сеть</span><select aria-label="Сеть" value={trafficEditor.network} data-autofocus onChange={(event) => { setTrafficEditor({ ...trafficEditor, network: event.target.value as TrafficRule["network"] }); setTrafficEditorError(""); }}><option value="udp">UDP</option><option value="tcp">TCP</option></select></label>
+            <label className="dialog-field"><span>Порт</span><input type="number" inputMode="numeric" min={1} max={65535} value={trafficEditor.port} aria-invalid={Boolean(trafficEditorError)} aria-describedby={trafficEditorError ? "traffic-rule-error" : undefined} onChange={(event) => { setTrafficEditor({ ...trafficEditor, port: Number(event.target.value) }); setTrafficEditorError(""); }} /></label>
+            <label className="dialog-field"><span>Действие</span><select aria-label="Действие" value={trafficEditor.action} onChange={(event) => setTrafficEditor({ ...trafficEditor, action: event.target.value as TrafficRule["action"] })}><option value="block">Блокировать</option><option value="direct">Напрямую</option><option value="vpn">Через VPN</option></select></label>
+            <label className="paths-toggle"><input type="checkbox" checked={trafficEditor.enabled} onChange={(event) => setTrafficEditor({ ...trafficEditor, enabled: event.target.checked })} />Правило включено</label>
+          </form>
+          {trafficEditorError ? <p id="traffic-rule-error" className="field-error" role="alert">{trafficEditorError}</p> : null}
+        </Dialog>
+      ) : null}
     </div>
   );
 }
 
-function SettingsPage({ headingRef, snapshot, draft, onDraftChange, onSave, onReset, onToast, runAsyncAction, actionFailure, onClearFailure }: {
+function SettingsPage({ headingRef, draft, onDraftChange, onReset, saveState, resetDisabled, actionFailure, onClearFailure }: {
   headingRef: React.RefObject<HTMLHeadingElement | null>;
-  snapshot: ControllerSnapshot;
   draft: SettingsConfig;
   onDraftChange: (settings: SettingsConfig) => void;
-  onSave: () => Promise<void>;
   onReset: () => void;
-  onToast: (message: string, kind?: ToastKind) => void;
-  runAsyncAction: RunAsyncAction;
+  saveState: SaveFeedback;
+  resetDisabled: boolean;
   actionFailure: ActionFailure | null;
   onClearFailure: () => void;
 }) {
-  const [saving, setSaving] = useState(false);
-  const settingsUnavailable = !snapshot.isDemo;
-  const dirty = JSON.stringify(draft) !== JSON.stringify(snapshot.settings);
-  const portsValid = draft.httpPort >= 1024 && draft.httpPort <= 65535 && draft.socksPort >= 1024 && draft.socksPort <= 65535 && draft.httpPort !== draft.socksPort;
-  const save = () => {
-    if (!dirty || !portsValid || saving) return;
-    void runAsyncAction({
-      page: "settings",
-      title: "Не удалось сохранить настройки",
-      setBusy: setSaving,
-      action: onSave,
-      retry: save,
-      onSuccess: () => onToast("Настройки сохранены", "success"),
-    });
-  };
+  const update = useAppUpdates();
+  const updateMessage = update.status === "checking" ? "Проверяем выпуск…"
+    : update.status === "available" ? `Доступна версия ${update.latestVersion}`
+      : update.status === "upToDate" ? "Установлена актуальная версия"
+        : update.status === "noRelease" ? "Опубликованных выпусков пока нет"
+          : update.status === "error" ? "Не удалось проверить обновления"
+            : update.status === "unavailable" ? "Проверка доступна в приложении RouteDeck"
+              : "Проверка ещё не выполнялась";
   return (
-    <div className="page">
-      <div className="page-title-row">
-        <div><p className="overline">Поведение приложения</p><h1 ref={headingRef} tabIndex={-1}>Настройки</h1></div>
-        {dirty ? <span className="quiet-badge warning-badge">Изменено</span> : null}
-      </div>
+    <div className="page settings-page">
+      <div className="page-title-row"><h1 ref={headingRef} tabIndex={-1}>Настройки</h1><SaveState state={saveState} /></div>
       <ActionFailureNotice failure={actionFailure} page="settings" onClear={onClearFailure} />
-
-      {settingsUnavailable ? <OpaqueNotice notice={{ id: "settings-unavailable", kind: "info", title: "Эти настройки появятся позже", body: "RouteDeck пока выбирает свободные локальные порты автоматически. Настройки трея и автозапуска ещё не подключены." }} /> : null}
-
-      <section className="card settings-group">
-        <div className="section-heading compact-heading"><div><p className="overline">Интерфейс</p><h2>Общие</h2></div></div>
-        <label className="check-row"><input type="checkbox" disabled={settingsUnavailable} checked={draft.startMinimized} onChange={(event) => onDraftChange({ ...draft, startMinimized: event.target.checked })} /><span><strong>Запускать свёрнутым</strong><small>Показывать RouteDeck только в трее после старта</small></span></label>
-        <label className="field-row"><span><strong>При закрытии окна</strong><small>Действие системной кнопки закрытия</small></span><select disabled={settingsUnavailable} value={draft.closeBehavior} onChange={(event) => onDraftChange({ ...draft, closeBehavior: event.target.value as SettingsConfig["closeBehavior"] })}><option value="tray">Скрыть в трей</option><option value="exit">Завершить работу</option></select></label>
-        <label className="field-row"><span><strong>Тема</strong><small>Dark-first, без внешних шрифтов</small></span><select disabled={settingsUnavailable} value={draft.theme} onChange={(event) => onDraftChange({ ...draft, theme: event.target.value as SettingsConfig["theme"] })}><option value="dark">Тёмная</option><option value="light">Светлая</option><option value="system">Как в Windows</option></select></label>
+      <section className="card settings-group lean-settings">
+        <h2>Интерфейс</h2>
+        <label className="field-row"><span><strong>Тема</strong></span><select aria-label="Тема" value={draft.theme} onChange={(event) => onDraftChange({ ...draft, theme: event.target.value as SettingsConfig["theme"] })}><option value="dark">Тёмная</option><option value="light">Светлая</option><option value="system">Как в Windows</option></select></label>
       </section>
-
-      <section className="card settings-group">
-        <div className="section-heading compact-heading"><div><p className="overline">Локальные endpoints</p><h2>Подключение</h2></div></div>
-        <label className="number-field"><span>HTTP-порт</span><input type="number" disabled={settingsUnavailable} min="1024" max="65535" value={draft.httpPort} aria-describedby="port-help" onChange={(event) => onDraftChange({ ...draft, httpPort: Number(event.target.value) })} /></label>
-        <label className="number-field"><span>SOCKS-порт</span><input type="number" disabled={settingsUnavailable} min="1024" max="65535" value={draft.socksPort} aria-describedby="port-help" onChange={(event) => onDraftChange({ ...draft, socksPort: Number(event.target.value) })} /></label>
-        <p id="port-help" className={`field-help${portsValid ? "" : " field-error"}`}>{portsValid ? "Допустимо: 1024–65535. Порты должны отличаться." : "Укажите разные свободные порты от 1024 до 65535."}</p>
+      <section className="card settings-group lean-settings">
+        <h2>Подписки</h2>
+        <label className="field-row"><span><strong>Автообновление</strong></span><select aria-label="Автообновление подписок" value={draft.subscriptionRefreshHours} onChange={(event) => onDraftChange({ ...draft, subscriptionRefreshHours: Number(event.target.value) as SettingsConfig["subscriptionRefreshHours"] })}><option value={0}>Выключено</option><option value={6}>Раз в 6 часов</option><option value={24}>Раз в сутки</option></select></label>
+        <p className="settings-explanation">Работает, пока RouteDeck открыт и отключён. Во время подключения обновление откладывается, чтобы не прерывать сеанс. Вручную обновить можно в списке серверов.</p>
       </section>
-
-      <section className="card settings-group">
-        <div className="section-heading compact-heading"><div><p className="overline">Системный прокси</p><h2>Совместимость с другими VPN</h2></div></div>
-        <label className="radio-setting"><input type="radio" disabled={settingsUnavailable} name="proxy-policy" value="never-overwrite" checked={draft.proxyConflictPolicy === "never-overwrite"} onChange={() => onDraftChange({ ...draft, proxyConflictPolicy: "never-overwrite" })} /><span><strong>Не заменять настройки другой программы</strong><small>При конфликте RouteDeck покажет ошибку</small></span></label>
-        <div className="persistent-hint" data-kind="info"><InfoIcon size={18} /><p>Windows использует один эффективный системный прокси. Разные локальные порты не создают двух владельцев.</p></div>
+      <section className="card settings-group lean-settings update-settings" aria-labelledby="app-updates-title">
+        <div className="settings-card-heading"><div><h2 id="app-updates-title">Обновления RouteDeck</h2>{update.currentVersion ? <small>Версия {update.currentVersion}</small> : null}</div><button className="secondary-button compact-action" type="button" disabled={update.status === "checking" || update.status === "unavailable"} aria-busy={update.status === "checking"} onClick={() => { void appUpdateMonitor.check(false); }}>{update.status === "checking" ? <LoaderIcon size={17} /> : <RefreshIcon size={17} />}{update.status === "error" ? "Повторить" : "Проверить"}</button></div>
+        <p className="update-status" role="status" aria-live="polite">{updateMessage}</p>
+        {update.status === "available" ? <><p className="settings-explanation">Обновление устанавливается вручную: скачайте portable-выпуск и замените текущие файлы после закрытия RouteDeck.</p><button className="primary-button compact-action" type="button" onClick={() => { void appUpdateMonitor.openReleases().catch(() => undefined); }}>Скачать на GitHub</button></> : null}
+        <label className="paths-toggle"><input type="checkbox" checked={update.automatic} disabled={update.status === "unavailable"} onChange={(event) => appUpdateMonitor.setAutomatic(event.target.checked)} />Проверять автоматически раз в 6 часов</label>
       </section>
-
-      <button className="primary-button" type="button" disabled={settingsUnavailable || !dirty || !portsValid || saving} aria-busy={saving} onClick={save} title={settingsUnavailable ? "Сохранение настроек ещё не подключено" : undefined}>{saving ? <LoaderIcon size={20} /> : <CheckIcon size={20} />}{saving ? "Сохраняем…" : settingsUnavailable ? "Сохранение недоступно" : "Сохранить изменения"}</button>
-
-      <section className="danger-zone" aria-labelledby="danger-title"><div><h2 id="danger-title">Опасная зона</h2><p>Сбрасывает только локальные настройки и черновики RouteDeck. Чужой VPN и настройки Windows не изменяются.</p></div><button className="danger-button" type="button" onClick={onReset}>Сбросить локальное состояние…</button></section>
+      <details className="card settings-details">
+        <summary>Как устроено подключение</summary>
+        <dl><div><dt>Локальные порты</dt><dd>Свободные порты выбираются автоматически.</dd></div><div><dt>Другие VPN</dt><dd>RouteDeck не заменяет чужие настройки системного прокси.</dd></div><div><dt>TUN</dt><dd>Windows запрашивает права при подключении. Постоянная служба не устанавливается.</dd></div></dl>
+      </details>
+      <details className="card settings-details reset-details">
+        <summary>Сброс приложения</summary>
+        <p>Удаляет все серверы, подписки, правила и настройки RouteDeck. Активное соединение будет остановлено.</p>
+        <button className="danger-button compact-action" type="button" disabled={resetDisabled} onClick={onReset}>Сбросить RouteDeck…</button>
+      </details>
     </div>
   );
 }
 
-function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, actionFailure, onClearFailure }: {
+function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, actionFailure, onClearFailure, onClearStaleProxy }: {
   snapshot: ControllerSnapshot;
   headingRef: React.RefObject<HTMLHeadingElement | null>;
   onToast: (message: string, kind?: ToastKind) => void;
   runAsyncAction: RunAsyncAction;
   actionFailure: ActionFailure | null;
   onClearFailure: () => void;
+  onClearStaleProxy: () => void;
 }) {
   const [checking, setChecking] = useState(false);
   const [copying, setCopying] = useState(false);
@@ -707,6 +747,15 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
     body: `${snapshot.environment.otherVpnName ?? "Другой клиент"} использует системный прокси ${snapshot.environment.externalProxyEndpoint ?? "Windows"}. RouteDeck не изменяет его без явного выбора.`,
     redactedDetail: "Локальные прокси могут работать на разных портах, но эффективный системный прокси Windows только один.",
   };
+  const proxy = snapshot.diagnostics.systemProxy;
+  const proxyPresentation = {
+    disabled: ["Отключён", "Прокси Windows не используется."],
+    owned: ["Принадлежит RouteDeck", "Системная настройка принадлежит текущему подключению RouteDeck."],
+    foreignActive: ["Используется другой программой", "По сохранённому адресу есть локальный слушатель. RouteDeck не будет менять эти настройки."],
+    stale: ["Не отвечает", "Прокси Windows указывает на локальный порт, на котором нет работающего слушателя."],
+    conflict: ["Требует проверки", "Настройки неоднозначны или не совпадают с сохранённым состоянием. Автоматическая очистка недоступна."],
+    unavailable: ["Не удалось проверить", "Windows не вернула достоверное состояние системного прокси."],
+  }[proxy.state];
   return (
     <div className="page">
       <div className="page-title-row"><div><p className="overline">Состояние приложения</p><h1 ref={headingRef} tabIndex={-1}>Диагностика</h1></div>{snapshot.diagnostics.snapshotReceivedAt ? <span className="quiet-badge">Обновлено {snapshot.diagnostics.snapshotReceivedAt}</span> : null}</div>
@@ -714,6 +763,12 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
       <p className="field-help">Здесь показано последнее состояние подключения. Обновление не запускает новое сетевое подключение.</p>
       <button className="primary-button" type="button" disabled={checking || snapshot.diagnostics.running} aria-busy={checking || snapshot.diagnostics.running} onClick={run}>{checking || snapshot.diagnostics.running ? <LoaderIcon size={20} /> : <ActivityIcon size={20} />}{checking || snapshot.diagnostics.running ? "Обновляем…" : "Обновить состояние"}</button>
       {snapshot.environment.otherVpnDetected ? <OpaqueNotice notice={externalNotice} primaryAction={{ label: "Обновить", onClick: run }} /> : null}
+      <section className="card system-proxy-card" aria-labelledby="system-proxy-title">
+        <div className="system-proxy-card__heading"><div><p className="overline">Windows</p><h2 id="system-proxy-title">Системный прокси</h2></div><span className="quiet-badge" data-state={proxy.state}>{proxyPresentation[0]}</span></div>
+        <p>{proxyPresentation[1]}</p>
+        {proxy.endpoint ? <dl className="diagnostic-facts"><div><dt>Адрес</dt><dd>{proxy.endpoint}</dd></div><div><dt>Локальный слушатель</dt><dd>{proxy.state === "stale" ? "Не найден" : proxy.state === "foreignActive" ? "Обнаружен" : "Не проверялся"}</dd></div></dl> : null}
+        {proxy.state === "stale" && proxy.cleanupToken ? <button className="danger-button compact-action" type="button" disabled={checking || snapshot.diagnostics.running || Boolean(snapshot.switching) || !(snapshot.phase === "disconnected" || (snapshot.phase === "connected" && snapshot.activeMode === "tun"))} onClick={onClearStaleProxy}>Отключить неработающий прокси</button> : null}
+      </section>
       <ProofCard proofs={snapshot.diagnostics.steps} title="Проверки" />
       {snapshot.diagnostics.snapshotReceivedAt ? <p className="diagnostic-duration">Состояние обновлено в {snapshot.diagnostics.snapshotReceivedAt}; время отдельных этапов отображается только при наличии данных.</p> : null}
       <button className="secondary-button full-width" type="button" disabled={copying} aria-busy={copying} onClick={copyReport}>{copying ? <LoaderIcon size={19} /> : <CopyIcon size={19} />}{copying ? "Копируем…" : "Копировать отчёт"}</button>
@@ -728,7 +783,13 @@ function Dialog({ title, description, focusKey, onClose, busy = false, closeDisa
 
   useEffect(() => {
     previouslyFocusedRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    return () => previouslyFocusedRef.current?.focus({ preventScroll: true });
+    const shell = document.querySelector<HTMLElement>(".app-shell");
+    const previousInert = shell?.inert ?? false;
+    if (shell) shell.inert = true;
+    return () => {
+      if (shell) shell.inert = previousInert;
+      if (previouslyFocusedRef.current?.isConnected && previouslyFocusedRef.current.getClientRects().length) previouslyFocusedRef.current.focus({ preventScroll: true });
+    };
   }, []);
 
   useEffect(() => {
@@ -736,9 +797,9 @@ function Dialog({ title, description, focusKey, onClose, busy = false, closeDisa
     const focusable = busy || closeDisabled
       ? dialog?.querySelector<HTMLElement>("[data-dialog-busy-focus]")
       : dialog?.querySelector<HTMLElement>("[data-error-autofocus]:not(:disabled)")
-      ?? dialog?.querySelector<HTMLElement>("[data-autofocus]")
+      ?? dialog?.querySelector<HTMLElement>("[data-autofocus]:not(:disabled)")
       ?? dialog?.querySelector<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)");
-    const frame = window.requestAnimationFrame(() => focusable?.focus());
+    const frame = window.requestAnimationFrame(() => focusable?.focus({ preventScroll: true }));
     return () => window.cancelAnimationFrame(frame);
   }, [busy, closeDisabled, focusKey]);
 
@@ -751,31 +812,31 @@ function Dialog({ title, description, focusKey, onClose, busy = false, closeDisa
         return;
       }
       if (event.key !== "Tab" || !dialog) return;
-      const items = Array.from(dialog.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex='-1'])"));
+      const items = Array.from(dialog.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex='-1'])")).filter((item) => item.getClientRects().length > 0);
       const first = items[0];
       const last = items[items.length - 1];
       const busyTarget = dialog.querySelector<HTMLElement>("[data-dialog-busy-focus]");
       if (!first || !last) {
         if (busyTarget) {
           event.preventDefault();
-          busyTarget.focus();
+          busyTarget.focus({ preventScroll: true });
         }
         return;
       }
       if (document.activeElement === busyTarget) {
         event.preventDefault();
-        (event.shiftKey ? last : first).focus();
+        (event.shiftKey ? last : first).focus({ preventScroll: true });
         return;
       }
-      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
-      if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus({ preventScroll: true }); }
+      if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus({ preventScroll: true }); }
     };
     const onFocusIn = (event: FocusEvent) => {
       if (!dialog || dialog.contains(event.target as Node | null)) return;
       const target = busy || closeDisabled
         ? dialog.querySelector<HTMLElement>("[data-dialog-busy-focus]")
         : dialog.querySelector<HTMLElement>("[data-error-autofocus]:not(:disabled)")
-        ?? dialog.querySelector<HTMLElement>("[data-autofocus]")
+        ?? dialog.querySelector<HTMLElement>("[data-autofocus]:not(:disabled)")
         ?? dialog.querySelector<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)");
       target?.focus({ preventScroll: true });
     };
@@ -787,14 +848,14 @@ function Dialog({ title, description, focusKey, onClose, busy = false, closeDisa
     };
   }, [busy, closeDisabled, onClose]);
 
-  return (
+  return createPortal(
     <div className="dialog-scrim" role="presentation">
       <div className="dialog" ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby={description ? "dialog-description" : undefined}>
         <div className="dialog-header"><div><h2 id="dialog-title">{title}</h2>{description ? <p id="dialog-description">{description}</p> : null}</div><button className="icon-button" type="button" aria-label="Закрыть окно" title={closeDisabled ? "Дождитесь завершения импорта" : "Закрыть"} disabled={closeDisabled} onClick={onClose}><XIcon size={19} /></button></div>
         <div className="dialog-content">{children}</div>
         <div className="dialog-actions">{actions}</div>
       </div>
-    </div>
+    </div>, document.body
   );
 }
 
@@ -804,7 +865,7 @@ function Toast({ toast, onClose, onPausedChange }: { toast: ToastState; onClose:
   const Icon = toast.kind === "warning" ? WarningIcon : toast.kind === "info" ? InfoIcon : CheckIcon;
   useEffect(() => onPausedChange(hovered || focusWithin), [focusWithin, hovered, onPausedChange]);
   useEffect(() => () => onPausedChange(false), [onPausedChange]);
-  return (
+  return createPortal(
     <div
       className="toast"
       data-kind={toast.kind}
@@ -817,46 +878,99 @@ function Toast({ toast, onClose, onPausedChange }: { toast: ToastState; onClose:
       onBlur={(event) => setFocusWithin(event.currentTarget.contains(event.relatedTarget as Node | null))}
     >
       <Icon size={19} /><span>{toast.message}</span><button className="icon-button" type="button" aria-label="Закрыть уведомление" title="Закрыть" onClick={onClose}><XIcon size={17} /></button>
-    </div>
+    </div>, document.body
   );
 }
 
 export default function App() {
   const snapshot = useController();
+  const appUpdate = useAppUpdates();
   const [activePage, setActivePage] = useState<Destination>("home");
   const [dialog, setDialog] = useState<DialogKind>(null);
-  const [pendingMode, setPendingMode] = useState<ConnectionMode | null>(null);
+  const [returnAfterPick, setReturnAfterPick] = useState(false);
+  const [sourceAction, setSourceAction] = useState<Server | null>(null);
+  const [sourceBusy, setSourceBusy] = useState(false);
+  const [backgroundRefreshing, setBackgroundRefreshing] = useState(false);
+  const [sourceReconnect, setSourceReconnect] = useState(false);
+  const [sourceError, setSourceError] = useState("");
+  const refreshUrlRef = useRef<HTMLInputElement>(null);
+  const serversHeadingRef = useRef<HTMLHeadingElement>(null);
   const [search, setSearch] = useState("");
-  const [routingDraft, setRoutingDraft] = useState<RoutingConfig>(snapshot.routing);
-  const [settingsDraft, setSettingsDraft] = useState<SettingsConfig>(snapshot.settings);
+  const routingSave = useAutoSave(snapshot.routing, controller.applyRouting);
+  const settingsSave = useAutoSave(snapshot.settings, controller.saveSettings);
+  const routingDraft = routingSave.draft;
+  const settingsDraft = settingsSave.draft;
   const [toast, setToast] = useState<ToastState | null>(null);
   const [toastPaused, setToastPaused] = useState(false);
   const [actionFailure, setActionFailure] = useState<ActionFailure | null>(null);
   const [importError, setImportError] = useState("");
   const [importing, setImporting] = useState(false);
+  const [importKind, setImportKind] = useState<ImportKind>("manual");
+  const [importPreview, setImportPreview] = useState<SubscriptionPreview | null>(null);
+  const [committingImport, setCommittingImport] = useState(false);
+  const [proxyCleanupToken, setProxyCleanupToken] = useState<string | null>(null);
+  const [proxyCleanupBusy, setProxyCleanupBusy] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const subscriptionInputRef = useRef<HTMLInputElement>(null);
+  const serverInputRef = useRef<HTMLTextAreaElement>(null);
+  const sourceNameRef = useRef<HTMLInputElement>(null);
   const importGeneration = useRef(0);
   const scrollPositions = useRef<Record<Destination, number>>({ home: 0, servers: 0, routing: 0, settings: 0, diagnostics: 0 });
 
+  useEffect(() => {
+    if (!snapshot.isDemo) void appUpdateMonitor.start();
+  }, [snapshot.isDemo]);
+
+  useEffect(() => {
+    const attempts = new Map<string, number>();
+    let refreshing = false;
+    const tick = () => {
+      if (refreshing) return;
+      const now = Date.now();
+      const sourceId = nextSubscriptionRefresh(controller.getSnapshot(), attempts, now);
+      if (!sourceId) return;
+      attempts.set(sourceId, now);
+      refreshing = true;
+      setBackgroundRefreshing(true);
+      void controller.refreshSource(sourceId, undefined, true).catch(() => {
+        // Manual refresh exposes actionable errors. A failed background fetch
+        // preserves the source and waits the full interval before trying again.
+      }).finally(() => { refreshing = false; setBackgroundRefreshing(false); });
+    };
+    const timer = window.setInterval(tick, 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
   const clearSubscriptionUrl = useCallback(() => {
     if (subscriptionInputRef.current) subscriptionInputRef.current.value = "";
+    if (serverInputRef.current) serverInputRef.current.value = "";
   }, []);
 
   const invalidateImport = useCallback(() => {
     importGeneration.current += 1;
     controller.cancelImportPreview();
     setImporting(false);
+    setImportPreview(null);
   }, []);
 
   const closeDialog = useCallback(() => {
     invalidateImport();
     setDialog(null);
-    setPendingMode(null);
+    setSourceAction(null);
+    setSourceError("");
+    if (refreshUrlRef.current) refreshUrlRef.current.value = "";
     setImportError("");
+    setProxyCleanupToken(null);
     clearSubscriptionUrl();
   }, [clearSubscriptionUrl, invalidateImport]);
+
+  useEffect(() => {
+    if (dialog === "clear-stale-proxy" && snapshot.diagnostics.systemProxy.cleanupToken !== proxyCleanupToken) {
+      setDialog(null);
+      setProxyCleanupToken(null);
+    }
+  }, [dialog, proxyCleanupToken, snapshot.diagnostics.systemProxy.cleanupToken]);
 
   const showToast = useCallback((message: string, kind: ToastKind = "success") => {
     setToast({ message, kind });
@@ -894,12 +1008,14 @@ export default function App() {
 
   const navigate = useCallback((destination: Destination) => {
     if (mainRef.current) scrollPositions.current[activePage] = mainRef.current.scrollTop;
+    setToast(null);
+    setReturnAfterPick(false);
     setActivePage(destination);
   }, [activePage]);
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
-      headingRef.current?.focus({ preventScroll: true });
+      (activePage === "servers" ? serversHeadingRef.current : headingRef.current)?.focus({ preventScroll: true });
       if (mainRef.current) mainRef.current.scrollTop = scrollPositions.current[activePage];
     });
     return () => window.cancelAnimationFrame(frame);
@@ -930,28 +1046,55 @@ export default function App() {
     const applyTheme = () => {
       const theme = settingsDraft.theme === "system" ? (query.matches ? "light" : "dark") : settingsDraft.theme;
       document.documentElement.dataset.theme = theme;
+      syncWindowTheme(theme);
     };
     applyTheme();
     query.addEventListener("change", applyTheme);
     return () => query.removeEventListener("change", applyTheme);
   }, [settingsDraft.theme]);
 
+  useEffect(() => {
+    // Suppress WebView navigation/printing menus; application handlers still receive
+    // the event, and keyboard editing shortcuts retain their normal behavior.
+    const suppressBrowserMenu = (event: MouseEvent) => event.preventDefault();
+    document.addEventListener("contextmenu", suppressBrowserMenu);
+    return () => document.removeEventListener("contextmenu", suppressBrowserMenu);
+  }, []);
+
   const handleModeChange = (mode: ConnectionMode) => {
     if (mode === snapshot.mode) return;
-    if (snapshot.phase !== "disconnected") {
-      setPendingMode(mode);
-      setDialog("mode-change");
-      return;
-    }
+    void runAsyncAction({ page: "home", title: "Не удалось сменить режим", action: () => controller.setMode(mode), retry: retryConnection });
+  };
+
+  const openServerPicker = (destination: Destination) => {
+    navigate(destination);
+    if (destination === "servers") setReturnAfterPick(true);
+  };
+
+  const selectServer = (serverId: string) => {
+    const returnHome = returnAfterPick;
+    if (returnHome) navigate("home");
+    void runAsyncAction({ page: returnHome ? "home" : "servers", title: "Не удалось переключить сервер", action: () => controller.selectServer(serverId) });
+  };
+
+  const refreshSource = (server: Server, url?: string) => {
     void runAsyncAction({
-      page: "home",
-      title: "Не удалось сменить режим",
-      action: async () => controller.setMode(mode),
-      retry: () => handleModeChange(mode),
+      page: "servers", title: "Не удалось обновить подписку", setBusy: setSourceBusy,
+      action: () => controller.refreshSource(server.sourceId!, url), errorPresentation: dialog === "refresh-source" ? "inline" : "persistent",
+      onError: (error) => setSourceError(error.message),
+      onSuccess: () => { if (dialog === "refresh-source") closeDialog(); else setSourceAction(null); showToast("Подписка обновлена"); },
     });
   };
 
+  const requestSourceRefresh = (server: Server) => {
+    setSourceReconnect(snapshot.servers.some((item) => item.sourceId === server.sourceId && item.id === snapshot.activeServerId));
+    setSourceError(""); setSourceAction(server);
+    if (server.sourceRefreshable) refreshSource(server);
+    else setDialog("refresh-source");
+  };
+
   const handleConnect = () => {
+    setBackgroundRefreshing(false);
     void runAsyncAction({
       page: "home",
       title: snapshot.mode === "tun" ? "Не удалось запустить TUN" : "Не удалось подключиться",
@@ -960,21 +1103,11 @@ export default function App() {
     });
   };
 
-  const applyRouting = async () => {
-    await controller.applyRouting(routingDraft);
-    setRoutingDraft(controller.getSnapshot().routing);
-  };
-
-  const saveSettings = async () => {
-    await controller.saveSettings(settingsDraft);
-    setSettingsDraft(controller.getSnapshot().settings);
-  };
-
   const importSubscription = () => {
-    const subscriptionUrl = subscriptionInputRef.current?.value.trim() ?? "";
+    const subscriptionUrl = (importKind === "subscription" ? subscriptionInputRef.current?.value : serverInputRef.current?.value)?.trim() ?? "";
     if (!subscriptionUrl) {
-      setImportError("Вставьте ссылку на подписку.");
-      window.requestAnimationFrame(() => subscriptionInputRef.current?.focus());
+      setImportError(importKind === "subscription" ? "Вставьте ссылку на подписку." : "Вставьте ссылку сервера или конфигурацию.");
+      window.requestAnimationFrame(() => (importKind === "subscription" ? subscriptionInputRef.current : serverInputRef.current)?.focus({ preventScroll: true }));
       return;
     }
     setImportError("");
@@ -982,17 +1115,16 @@ export default function App() {
     const generation = ++importGeneration.current;
     void runAsyncAction({
       page: "servers",
-      title: "Не удалось импортировать подписку",
+      title: "Не удалось прочитать источник",
       setBusy: (busy) => {
         if (generation === importGeneration.current) setImporting(busy);
       },
       action: async () => {
-        const preview = await controller.previewSubscription({ type: "url", value: subscriptionUrl });
+        const preview = await controller.previewSubscription({ type: importKind === "subscription" ? "url" : "clipboard", value: subscriptionUrl });
         if (generation !== importGeneration.current) return null;
-        await controller.commitSubscription(preview);
         return preview;
       },
-      errorPresentation: "inline",
+      errorPresentation: "persistent",
       onError: (publicError) => {
         if (generation !== importGeneration.current) return;
         setImportError(publicError.message);
@@ -1000,8 +1132,25 @@ export default function App() {
       onSuccess: (preview) => {
         if (!preview || generation !== importGeneration.current) return;
         clearSubscriptionUrl();
+        setImportPreview(preview);
+      },
+    });
+  };
+
+  const confirmImport = () => {
+    if (!importPreview || committingImport) return;
+    const preview = importPreview;
+    const sourceName = sourceNameRef.current?.value.trim() || undefined;
+    void runAsyncAction({
+      page: "servers",
+      title: "Не удалось добавить серверы",
+      setBusy: setCommittingImport,
+      action: () => controller.commitSubscription(preview, sourceName),
+      errorPresentation: "inline",
+      onError: (publicError) => setImportError(publicError.message),
+      onSuccess: () => {
         closeDialog();
-        showToast(`Импортировано серверов: ${preview.nodeNames.length}`, "success");
+        showToast(`Добавлено серверов: ${preview.nodeNames.length}`, "success");
       },
     });
   };
@@ -1024,25 +1173,51 @@ export default function App() {
     });
   };
 
+  const requestProxyCleanup = () => {
+    const token = snapshot.diagnostics.systemProxy.cleanupToken;
+    if (snapshot.diagnostics.systemProxy.state !== "stale" || !token) return;
+    setProxyCleanupToken(token);
+    setDialog("clear-stale-proxy");
+  };
+
+  const confirmProxyCleanup = () => {
+    if (!proxyCleanupToken || proxyCleanupBusy) return;
+    const token = proxyCleanupToken;
+    void runAsyncAction({
+      page: "diagnostics",
+      title: "Не удалось отключить неработающий прокси",
+      setBusy: setProxyCleanupBusy,
+      errorPresentation: "persistent",
+      action: async () => {
+        try { await controller.clearStaleSystemProxy(token); }
+        catch (error) {
+          await controller.runDiagnostics().catch(() => undefined);
+          throw error;
+        }
+      },
+      onSuccess: () => { closeDialog(); showToast("Неработающий прокси Windows отключён", "success"); },
+    });
+  };
+
   const renderPage = () => {
     switch (activePage) {
       case "home":
-        return <HomePage snapshot={snapshot} headingRef={headingRef} onNavigate={navigate} onModeChange={handleModeChange} onConnect={handleConnect} onDisconnect={disconnect} onRetry={retryConnection} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
+        return <HomePage snapshot={snapshot} libraryBusy={(sourceBusy && !sourceReconnect) || backgroundRefreshing} headingRef={headingRef} onNavigate={openServerPicker} onModeChange={handleModeChange} onConnect={handleConnect} onDisconnect={disconnect} onRetry={retryConnection} onLatencyInfo={() => setDialog("latency-info")} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "servers":
-        return <ServersPage snapshot={snapshot} headingRef={headingRef} search={search} onSearch={setSearch} onImport={() => { invalidateImport(); clearSubscriptionUrl(); setDialog("import"); }} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
+        return null;
       case "routing":
-        return <RoutingPage snapshot={snapshot} headingRef={headingRef} draft={routingDraft} onDraftChange={setRoutingDraft} onApply={applyRouting} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
+        return <RoutingPage snapshot={snapshot} headingRef={headingRef} draft={routingDraft} onDraftChange={routingSave.change} saveState={routingSave} />;
       case "settings":
-        return <SettingsPage snapshot={snapshot} headingRef={headingRef} draft={settingsDraft} onDraftChange={setSettingsDraft} onSave={saveSettings} onReset={() => setDialog("reset")} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
+        return <SettingsPage headingRef={headingRef} draft={settingsDraft} onDraftChange={settingsSave.change} saveState={settingsSave} resetDisabled={routingSave.running || settingsSave.running || (routingSave.pending && !routingSave.error) || (settingsSave.pending && !settingsSave.error) || Boolean(snapshot.switching)} onReset={() => setDialog("reset")} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "diagnostics":
-        return <DiagnosticsPage snapshot={snapshot} headingRef={headingRef} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
+        return <DiagnosticsPage snapshot={snapshot} headingRef={headingRef} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} onClearStaleProxy={requestProxyCleanup} />;
     }
   };
 
   return (
     <div className="app-shell" data-demo={snapshot.isDemo || undefined}>
       <header className="app-header">
-        <div className="brand"><span className="brand-mark"><RoutingIcon size={20} /></span><span><strong>RouteDeck</strong><small>VPN-клиент</small></span></div>
+        <div className="brand"><span className="brand-mark"><RoutingIcon size={20} /></span><span><strong>RouteDeck{appUpdate.currentVersion ? <span className="brand-version">v{appUpdate.currentVersion}</span> : null}</strong><small>VPN-клиент</small></span></div>
         <StatusBadge phase={snapshot.phase} />
       </header>
       {snapshot.isDemo ? (
@@ -1054,50 +1229,104 @@ export default function App() {
       ) : null}
       <div className="workspace">
         <Navigation active={activePage} onNavigate={navigate} variant="rail" />
-        <main className="app-main" ref={mainRef}>{renderPage()}</main>
+        <main className="app-main" ref={mainRef}>
+          <div className="page-slot" hidden={activePage !== "servers"}>
+            <ServersPage snapshot={snapshot} headingRef={serversHeadingRef} search={search} onSearch={setSearch}
+              onImport={(kind) => { invalidateImport(); clearSubscriptionUrl(); setImportError(""); setImportKind(kind); setDialog("import"); }}
+              onSelect={selectServer} picking={returnAfterPick} onBack={() => navigate("home")}
+              onRefresh={requestSourceRefresh} onRemove={(server) => { setSourceAction(server); setSourceError(""); setDialog("remove-source"); }} sourceBusy={sourceBusy}
+              actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />
+          </div>
+          {activePage !== "servers" ? <div className="page-slot">{renderPage()}</div> : null}
+        </main>
       </div>
       <Navigation active={activePage} onNavigate={navigate} variant="bottom" />
-      {toast ? <Toast toast={toast} onPausedChange={setToastPaused} onClose={() => { setToast(null); setToastPaused(false); }} /> : null}
+      {toast && !dialog ? <Toast toast={toast} onPausedChange={setToastPaused} onClose={() => { setToast(null); setToastPaused(false); }} /> : null}
+
+      {dialog === "latency-info" ? <Dialog title="Отклик через VPN" onClose={closeDialog}
+        description="Вы → выбранный VPN → Google. Измеряется ответ на короткий запрос через уже установленное соединение."
+        actions={<button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Понятно</button>}>
+        <p className="dialog-copy">Сначала устанавливаем соединение, затем выполняем три замера. Показываем медиану — среднее по порядку значение. DNS и установка TCP/TLS в эти три замера не входят.</p>
+        <p className="dialog-copy">Это ориентир для работы через VPN, а не пинг до любой игры или сайта: у них свои серверы и маршруты. Если соединение для замера пришлось открыть заново, показываем «—».</p>
+        <p className="dialog-copy">Замер появляется после первой фоновой проверки. Полная проверка доступности интернета сохраняется отдельно на странице «Статус».</p>
+      </Dialog> : null}
 
       {dialog === "import" ? (
         <Dialog
-          title="Импорт подписки"
-          description="Вставьте ссылку от провайдера."
-          focusKey="subscription-url"
+          title={importPreview ? "Добавить в библиотеку" : importKind === "manual" ? "Добавить сервер" : "Добавить подписку"}
+          description={importPreview ? "Проверьте состав новой группы перед добавлением." : importKind === "manual" ? "Вставьте ссылку сервера, несколько ссылок или JSON-конфигурацию." : "Вставьте HTTPS-ссылку на подписку от провайдера."}
+          focusKey={importPreview ? "import-preview" : importKind}
           onClose={closeDialog}
-          busy={importing}
+          busy={importing || committingImport}
+          closeDisabled={committingImport}
           actions={<>
-            <button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Отмена</button>
-            <button className="primary-button dialog-primary" type="submit" form="subscription-import-form" disabled={importing} aria-busy={importing}>{importing ? <LoaderIcon size={19} /> : <ImportIcon size={19} />}{importing ? "Импортируем…" : "Импортировать"}</button>
+            <button className="secondary-button" type="button" disabled={committingImport} onClick={closeDialog}>Отмена</button>
+            <button className="primary-button dialog-primary" type="submit" form="subscription-import-form" disabled={importing || committingImport || Boolean(importPreview && !importPreview.nodeNames.length)} aria-busy={importing || committingImport}>{importing || committingImport ? <LoaderIcon size={19} /> : importPreview ? <PlusIcon size={19} /> : <ImportIcon size={19} />}{committingImport ? "Добавляем…" : importing ? "Проверяем…" : importPreview ? "Добавить" : "Продолжить"}</button>
           </>}
         >
-          <form id="subscription-import-form" onSubmit={(event) => { event.preventDefault(); importSubscription(); }}>
-            {importing ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><LoaderIcon size={17} />Загружаем подписку…</p> : null}
-            <div className="dialog-field">
-              <label htmlFor="subscription-url">Ссылка на подписку</label>
-              <input ref={subscriptionInputRef} id="subscription-url" type="url" inputMode="url" autoComplete="url" defaultValue="" disabled={importing} data-autofocus data-error-autofocus={importError ? "true" : undefined} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : undefined} placeholder="https://provider.example/subscription" onInput={() => setImportError("")} />
-              {importError ? <small id="import-error" className="field-error" role="alert">{importError}</small> : null}
+          <form id="subscription-import-form" className="import-form" onSubmit={(event) => { event.preventDefault(); if (importPreview) confirmImport(); else importSubscription(); }}>
+            {importing || committingImport ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><LoaderIcon size={17} />{committingImport ? "Сохраняем группу…" : importKind === "subscription" ? "Загружаем и проверяем подписку…" : "Проверяем конфигурацию…"}</p> : null}
+            <div className="dialog-field" hidden={Boolean(importPreview)}>
+              {importKind === "subscription" ? <>
+                <label htmlFor="subscription-url">Ссылка на подписку</label>
+                <input ref={subscriptionInputRef} id="subscription-url" type="url" inputMode="url" autoComplete="off" spellCheck={false} defaultValue="" disabled={importing || Boolean(importPreview)} data-autofocus data-error-autofocus={importError ? "true" : undefined} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-source-help"} placeholder="https://provider.example/subscription" onInput={() => setImportError("")} />
+              </> : <>
+                <label htmlFor="server-content">Ссылка или конфигурация сервера</label>
+                <textarea ref={serverInputRef} id="server-content" rows={4} autoComplete="off" spellCheck={false} defaultValue="" disabled={importing || Boolean(importPreview)} data-autofocus data-error-autofocus={importError ? "true" : undefined} aria-invalid={Boolean(importError)} aria-describedby={importError ? "import-error" : "import-source-help"} placeholder="naive+https://user:password@server.example:443#Мой сервер" onInput={() => setImportError("")} />
+              </>}
+              <small id="import-source-help">{importKind === "manual" ? "VLESS, Hysteria2, Naive HTTPS / QUIC; JSON sing-box. Каждая ссылка — с новой строки." : "Ссылка может содержать ключ доступа. Не передавайте её другим."}</small>
             </div>
+            {importPreview ? <section className="import-preview" aria-label="Состав новой группы">
+              <h3 tabIndex={-1} data-autofocus>Серверов для добавления: {importPreview.nodeNames.length}</h3>
+              <div className="import-protocols">{importPreview.supported.map((item) => <span className="quiet-badge" key={item.protocol}>{item.protocol} · {item.count}</span>)}</div>
+              {importPreview.unsupportedCount ? <p className="import-warning"><WarningIcon size={17} />Не будут добавлены неподдерживаемые записи: {importPreview.unsupportedCount}.</p> : null}
+              <p className="field-help">Это проверка формата. Доступность сервера проверяется при подключении.</p>
+              <button className="text-button" type="button" disabled={committingImport} onClick={() => { invalidateImport(); setImportError(""); }}>Вставить другой источник</button>
+            </section> : null}
+            <div className="dialog-field">
+              <label htmlFor="source-name">Название группы <span className="optional-label">необязательно</span></label>
+              <input ref={sourceNameRef} id="source-name" type="text" autoComplete="off" maxLength={80} defaultValue="" disabled={importing || committingImport} placeholder={importKind === "manual" ? "Например, Мой Naive" : "Например, Основная подписка"} onInput={() => setImportError("")} />
+            </div>
+            {importError ? <p id="import-error" className="field-error" role="alert">{importError}</p> : null}
+            {snapshot.phase !== "disconnected" && snapshot.phase !== "failed" ? <p className="persistent-hint"><InfoIcon size={17} />Перед добавлением отключите соединение RouteDeck.</p> : null}
           </form>
         </Dialog>
       ) : null}
 
-      {dialog === "mode-change" && pendingMode ? (
-        <Dialog
-          title="Сменить режим подключения?"
-          description="RouteDeck остановит текущее подключение. Новый режим не запустится автоматически."
-          onClose={closeDialog}
-          actions={<><button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Оставить текущий</button><button className="primary-button dialog-primary" type="button" onClick={() => { const mode = pendingMode; closeDialog(); void runAsyncAction({ page: "home", title: "Не удалось сменить режим", action: async () => { await controller.disconnect(); controller.setMode(mode); }, retry: () => handleModeChange(mode) }); }}><CheckIcon size={19} />Отключить и выбрать</button></>}
-        ><p className="dialog-copy">Будет выбран режим <strong>{pendingMode === "tun" ? "TUN" : "Системный прокси"}</strong>. После смены режима нажмите «Подключить».</p></Dialog>
+      {dialog === "refresh-source" && sourceAction ? (
+        <Dialog title="Обновить подписку" description="У этой группы ещё нет сохранённой ссылки. Укажите её один раз для следующих обновлений." onClose={closeDialog} busy={sourceBusy} closeDisabled={sourceBusy}
+          actions={<><button className="secondary-button" type="button" disabled={sourceBusy} onClick={closeDialog}>Отмена</button><button className="primary-button dialog-primary" type="submit" form="refresh-source-form" disabled={sourceBusy}>{sourceBusy ? "Обновляем…" : "Обновить"}</button></>}>
+          <form id="refresh-source-form" onSubmit={(event) => { event.preventDefault(); const url = refreshUrlRef.current?.value.trim(); if (!url) { setSourceError("Вставьте HTTPS-ссылку на подписку."); return; } refreshSource(sourceAction, url); }}>
+            <div className="dialog-field"><label htmlFor="refresh-url">Ссылка на подписку</label><input id="refresh-url" ref={refreshUrlRef} type="url" autoComplete="off" spellCheck={false} defaultValue="" data-autofocus disabled={sourceBusy} placeholder="https://provider.example/subscription" /></div>
+          </form>
+          {sourceBusy ? <p role="status" tabIndex={-1} data-dialog-busy-focus>Загружаем и проверяем подписку…</p> : null}
+          {sourceError ? <p className="field-error" role="alert">{sourceError}</p> : null}
+        </Dialog>
+      ) : null}
+
+      {dialog === "remove-source" && sourceAction ? (
+        <Dialog title="Удалить группу?" description={`«${sourceAction.source}» и её серверы будут удалены из библиотеки.`} onClose={closeDialog} busy={sourceBusy} closeDisabled={sourceBusy}
+          actions={<><button className="secondary-button" type="button" data-autofocus disabled={sourceBusy} onClick={closeDialog}>Отмена</button><button className="danger-button" type="button" disabled={sourceBusy} onClick={() => { void runAsyncAction({ page: "servers", title: "Не удалось удалить группу", setBusy: setSourceBusy, errorPresentation: "inline", action: () => controller.removeSource(sourceAction.sourceId!), onError: (error) => setSourceError(error.message), onSuccess: () => { closeDialog(); showToast("Группа удалена", "info"); } }); }}>{sourceBusy ? "Удаляем…" : "Удалить группу"}</button></>}>
+          <p className="dialog-copy">{snapshot.servers.some((server) => server.sourceId === sourceAction.sourceId && server.id === snapshot.activeServerId) ? "Текущее соединение будет отключено. Вы сможете выбрать другой сервер." : "Другие группы останутся в библиотеке."}</p>
+          {sourceBusy ? <p role="status" tabIndex={-1} data-dialog-busy-focus>Сохраняем изменения…</p> : null}
+          {sourceError ? <p className="field-error" role="alert">{sourceError}</p> : null}
+        </Dialog>
       ) : null}
 
       {dialog === "reset" ? (
         <Dialog
           title="Сбросить локальное состояние?"
-          description="Будут удалены только локальные настройки и черновики RouteDeck. Чужой VPN и Windows не изменяются."
+          description="Будут удалены все серверы, подписки, правила и настройки RouteDeck. Это действие нельзя отменить."
           onClose={closeDialog}
-          actions={<><button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Отмена</button><button className="danger-button" type="button" onClick={() => { closeDialog(); void runAsyncAction({ page: "settings", title: "Не удалось сбросить локальное состояние", action: controller.resetLocalState, retry: () => setDialog("reset"), onSuccess: () => { setRoutingDraft(controller.getSnapshot().routing); setSettingsDraft(controller.getSnapshot().settings); showToast("Локальное состояние сброшено", "info"); } }); }}><TrashIcon size={19} />Сбросить RouteDeck</button></>}
-        ><p className="dialog-copy">Активное подключение будет остановлено, а настройки RouteDeck — сброшены.</p></Dialog>
+          actions={<><button className="secondary-button" type="button" data-autofocus onClick={closeDialog}>Отмена</button><button className="danger-button" type="button" onClick={() => { closeDialog(); void runAsyncAction({ page: "settings", title: "Не удалось сбросить локальное состояние", action: controller.resetLocalState, retry: () => setDialog("reset"), onSuccess: () => { routingSave.discard(); settingsSave.discard(); showToast("Локальное состояние сброшено", "info"); } }); }}><TrashIcon size={19} />Сбросить RouteDeck</button></>}
+        ><p className="dialog-copy">Активное подключение будет остановлено. RouteDeck восстановит только принадлежащие ему сетевые настройки; настройки другой программы не перезаписываются.</p></Dialog>
+      ) : null}
+      {dialog === "clear-stale-proxy" && proxyCleanupToken ? (
+        <Dialog title="Отключить неработающий прокси?" description="RouteDeck ещё раз проверит сохранённое состояние перед изменением." onClose={closeDialog} busy={proxyCleanupBusy} closeDisabled={proxyCleanupBusy}
+          actions={<><button className="secondary-button" type="button" data-autofocus disabled={proxyCleanupBusy} onClick={closeDialog}>Отмена</button><button className="danger-button" type="button" disabled={proxyCleanupBusy} onClick={confirmProxyCleanup}>{proxyCleanupBusy ? <LoaderIcon size={19} /> : null}{proxyCleanupBusy ? "Отключаем…" : "Отключить прокси"}</button></>}>
+          <p className="dialog-copy">Сохранённая настройка системного прокси Windows будет отключена. RouteDeck не завершает работающие процессы VPN или прокси-программ.</p>
+          {proxyCleanupBusy ? <p role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><LoaderIcon size={17} />Проверяем состояние и отключаем прокси…</p> : null}
+        </Dialog>
       ) : null}
     </div>
   );

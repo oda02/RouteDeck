@@ -1,6 +1,7 @@
 # Diagnostics overrides
 
-- Primary action: Run connection check. Copy sanitized report is secondary.
+- Primary action: Refresh state. It reads current backend evidence, not a new
+  on-demand network probe. Copy sanitized report is secondary.
 - Show the connection proof pipeline in order with state, measured value, timestamp,
   duration, and a plain-language failure. Preserve successful earlier steps.
 - Logs are collapsed by default, selectable, searchable, and secret-redacted before

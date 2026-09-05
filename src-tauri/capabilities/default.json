@@ -4,10 +4,13 @@
   "description": "Minimal capability set for the main RouteDeck window",
   "windows": ["main"],
   "permissions": [
+    "allow-set-interface-theme",
     "allow-preview-import-content",
     "allow-preview-import-url",
     "allow-discard-import-preview",
     "allow-confirm-import",
+    "allow-refresh-source",
+    "allow-remove-source",
     "allow-start-local-proxy",
     "allow-start-system-proxy",
     "allow-start-tun",
@@ -19,7 +22,11 @@
     "allow-stop-tun",
     "allow-retry-session-recovery",
     "allow-runtime-diagnostics",
+    "allow-clear-stale-system-proxy",
     "allow-list-running-applications",
+    "allow-get-app-version",
+    "allow-check-app-update",
+    "allow-open-app-releases",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

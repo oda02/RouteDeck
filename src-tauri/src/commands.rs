@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::{
+    app_updates::{self, AppUpdateChecker, AppUpdateInfo},
     application::{
         ApplicationController, ConfirmedImport, Diagnostics, ImportPreview, PublicError,
         PublicErrorCode, PublicErrorStage, RuntimeStatus, SystemProxyRouting, TunRouting,
@@ -10,6 +11,40 @@ use crate::{
     domain::DefaultRoute,
     running_applications::{self, RunningApplication},
 };
+
+#[tauri::command]
+pub fn get_app_version() -> String {
+    env!("CARGO_PKG_VERSION").into()
+}
+
+#[tauri::command]
+pub async fn check_app_update(
+    checker: State<'_, Arc<AppUpdateChecker>>,
+) -> Result<AppUpdateInfo, &'static str> {
+    let checker = Arc::clone(checker.inner());
+    tauri::async_runtime::spawn_blocking(move || checker.check())
+        .await
+        .map_err(|_| "Update check unavailable")?
+}
+
+#[tauri::command]
+pub fn open_app_releases() -> Result<(), &'static str> {
+    app_updates::open_releases_page()
+}
+
+#[tauri::command]
+pub fn set_interface_theme(
+    app: tauri::AppHandle,
+    theme: crate::window_appearance::InterfaceTheme,
+) -> Result<(), &'static str> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or("Main window unavailable")?;
+    // Updates both the native window and WebView fill, including during resize.
+    window
+        .set_background_color(Some(theme.background()))
+        .map_err(|_| "Window appearance unavailable")
+}
 
 #[tauri::command]
 pub async fn preview_import_content(
@@ -49,9 +84,38 @@ pub fn discard_import_preview(
 pub async fn confirm_import(
     controller: State<'_, Arc<ApplicationController>>,
     preview_id: String,
+    source_name: Option<String>,
 ) -> Result<ConfirmedImport, PublicError> {
     let controller = Arc::clone(controller.inner());
-    tauri::async_runtime::spawn_blocking(move || controller.confirm_import(&preview_id))
+    tauri::async_runtime::spawn_blocking(move || {
+        controller.confirm_import_named(&preview_id, source_name.as_deref())
+    })
+    .await
+    .map_err(command_join_error)?
+}
+
+#[tauri::command]
+pub async fn refresh_source(
+    controller: State<'_, Arc<ApplicationController>>,
+    source_id: String,
+    url: Option<String>,
+) -> Result<ConfirmedImport, PublicError> {
+    let controller = Arc::clone(controller.inner());
+    let slot = controller.reserve_preview_slot()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        controller.refresh_source_reserved(&source_id, url.as_deref(), slot)
+    })
+    .await
+    .map_err(command_join_error)?
+}
+
+#[tauri::command]
+pub async fn remove_source(
+    controller: State<'_, Arc<ApplicationController>>,
+    source_id: String,
+) -> Result<(), PublicError> {
+    let controller = Arc::clone(controller.inner());
+    tauri::async_runtime::spawn_blocking(move || controller.remove_source(&source_id))
         .await
         .map_err(command_join_error)?
 }
@@ -149,8 +213,9 @@ pub async fn stop_tun(
         .map_err(command_join_error)?
 }
 
-/// Rechecks the private session root after the user has explicitly reviewed
-/// and removed preserved crash data. This command never deletes files itself.
+/// Retries restore-before-stop for a retained live session. With no live session,
+/// only rechecks preserved crash data and reconciles the owned proxy journal;
+/// it never recursively removes unreviewed session files.
 #[tauri::command]
 pub async fn retry_session_recovery(
     controller: State<'_, Arc<ApplicationController>>,
@@ -162,8 +227,24 @@ pub async fn retry_session_recovery(
 }
 
 #[tauri::command]
-pub fn runtime_diagnostics(controller: State<'_, Arc<ApplicationController>>) -> Diagnostics {
-    controller.diagnostics()
+pub async fn runtime_diagnostics(
+    controller: State<'_, Arc<ApplicationController>>,
+) -> Result<Diagnostics, PublicError> {
+    let controller = Arc::clone(controller.inner());
+    tauri::async_runtime::spawn_blocking(move || controller.diagnostics())
+        .await
+        .map_err(command_join_error)
+}
+
+#[tauri::command]
+pub async fn clear_stale_system_proxy(
+    token: String,
+    controller: State<'_, Arc<ApplicationController>>,
+) -> Result<Diagnostics, PublicError> {
+    let controller = Arc::clone(controller.inner());
+    tauri::async_runtime::spawn_blocking(move || controller.clear_stale_system_proxy(&token))
+        .await
+        .map_err(command_join_error)?
 }
 
 /// Lists distinct executable images in the current interactive Windows session.

@@ -3,6 +3,7 @@ pub(crate) struct TunUpstreamIdentity {
     pub(crate) interface_luid: u64,
     pub(crate) interface_index: u32,
     pub(crate) interface_alias: String,
+    pub(crate) ipv4_dns_server: Option<std::net::Ipv4Addr>,
 }
 
 #[cfg(windows)]
@@ -12,7 +13,7 @@ mod windows {
         fs::{self, File, OpenOptions},
         io::{Read, Seek, SeekFrom, Write},
         mem::size_of,
-        net::IpAddr,
+        net::{IpAddr, Ipv4Addr},
         os::windows::{
             ffi::{OsStrExt, OsStringExt},
             fs::{MetadataExt, OpenOptionsExt},
@@ -35,14 +36,13 @@ mod windows {
         },
         NetworkManagement::IpHelper::{
             FreeMibTable, GetAdaptersAddresses, GetBestRoute2, GetIfEntry2, GetIpForwardTable2,
-            GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
-            GAA_FLAG_SKIP_UNICAST, IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211, IF_TYPE_PPP,
-            IF_TYPE_TUNNEL, IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2, MIB_IPFORWARD_ROW2,
-            MIB_IPFORWARD_TABLE2,
+            GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST,
+            IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211, IF_TYPE_PPP, IF_TYPE_TUNNEL,
+            IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
         },
         NetworkManagement::Ndis::{IfOperStatusUp, NET_LUID_LH, TUNNEL_TYPE_NONE},
         Networking::WinSock::{
-            AF_INET, AF_INET6, AF_UNSPEC, IN6_ADDR, IN_ADDR, SOCKADDR_IN, SOCKADDR_IN6,
+            AF_INET, AF_INET6, AF_UNSPEC, IN6_ADDR, IN_ADDR, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
             SOCKADDR_INET,
         },
         Security::{
@@ -410,6 +410,7 @@ mod windows {
             interface_luid: upstream.interface_luid,
             interface_index: upstream.interface_index,
             interface_alias: upstream.interface_alias.clone(),
+            ipv4_dns_server: upstream.ipv4_dns_server,
         }
     }
 
@@ -419,10 +420,12 @@ mod windows {
                 interface_luid,
                 interface_index,
                 interface_alias,
+                ipv4_dns_server,
             } => TunUpstreamIdentity {
                 interface_luid: *interface_luid,
                 interface_index: *interface_index,
                 interface_alias: interface_alias.clone(),
+                ipv4_dns_server: *ipv4_dns_server,
             },
         }
     }
@@ -441,11 +444,18 @@ mod windows {
                 interface_luid,
                 interface_index,
                 interface_alias,
+                ipv4_dns_server,
             } => {
                 hasher.update(interface_luid.to_le_bytes());
                 hasher.update(interface_index.to_le_bytes());
                 hasher.update((interface_alias.len() as u64).to_le_bytes());
                 hasher.update(interface_alias.as_bytes());
+                if let Some(address) = ipv4_dns_server {
+                    hasher.update([1]);
+                    hasher.update(address.octets());
+                } else {
+                    hasher.update([0]);
+                }
             }
         }
         format!("{:x}", hasher.finalize())
@@ -755,28 +765,51 @@ mod windows {
 
         match start_engine_session(&invocation, &start) {
             Ok(mut running) => {
-                let child = &mut running.child;
-                let journal = &mut running.journal;
-                let engine_created = running.engine_created;
-                let capture = &running.capture;
-                let engine_pid = child.pid();
-                write_frame(
-                    &mut pipe,
-                    &Frame::Started {
-                        request_id: start.request_id,
-                        engine_pid,
-                        engine_created,
+                let mut stop_request = None;
+                let result = with_tun_cleanup(
+                    running.child.as_mut(),
+                    &mut running.journal,
+                    CleanupWhen::Always,
+                    |child, _journal| {
+                        write_frame(
+                            &mut pipe,
+                            &Frame::Started {
+                                request_id: start.request_id,
+                                engine_pid: child.pid(),
+                                engine_created: running.engine_created,
+                            },
+                        )
+                        .map_err(protocol_runtime_error)?;
+                        stop_request = serve_running(
+                            &mut pipe,
+                            &invocation,
+                            &mut state,
+                            child,
+                            &running.capture,
+                        )?;
+                        Ok(())
                     },
-                )
-                .map_err(protocol_runtime_error)?;
-                serve_running(
-                    &mut pipe,
-                    &invocation,
-                    &mut state,
-                    child.as_mut(),
-                    journal,
-                    capture,
-                )
+                    |luid| wait_for_cleanup(luid, Duration::from_secs(3)),
+                );
+                if let Some(request_id) = stop_request {
+                    // Never report Complete merely because routes disappeared: child
+                    // termination and durable journal finalization must also succeed.
+                    let response = write_frame(
+                        &mut pipe,
+                        &Frame::Stopped {
+                            request_id,
+                            cleanup: if result.is_ok() {
+                                CleanupState::Complete
+                            } else {
+                                CleanupState::Conflict
+                            },
+                        },
+                    );
+                    if result.is_ok() {
+                        response.map_err(protocol_runtime_error)?;
+                    }
+                }
+                result
             }
             Err(error) => {
                 let _ = write_frame(
@@ -838,7 +871,11 @@ mod windows {
         let config = duplicate_config(parent.raw(), request)?;
         let config_directory = protected_config_directory(&config)?;
         let contents = read_verified_config(config, request)?;
-        let expected_families = validate_tun_config(&contents, &request.upstream.interface_alias)?;
+        let expected_families = validate_tun_config_for_upstream(
+            &contents,
+            &request.upstream.interface_alias,
+            request.upstream.ipv4_dns_server,
+        )?;
 
         let session = SessionConfig::create(&config_directory, &contents)?;
         let diagnostics = Arc::new(Mutex::new(DiagnosticBuffer::default()));
@@ -851,67 +888,54 @@ mod windows {
             &request.config_sha256,
         )?;
         let mut child = launcher.start(&session, redactor, diagnostics)?;
-        let engine_created = process_creation_time_for_pid(child.pid())?;
-        journal.mark_running(child.pid(), engine_created)?;
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let owned_luid = loop {
-            let found = match find_tun_adapter_luids() {
-                Ok(found) => found,
-                Err(error) => {
-                    rollback_failed_start(child.as_mut(), &mut journal, None)?;
-                    return Err(error);
-                }
-            };
-            if found.len() > 1 {
-                rollback_failed_start(child.as_mut(), &mut journal, None)?;
-                return Err(RuntimeError::new(
-                    "tun_preflight",
-                    "multiple RouteDeck TUN adapters appeared",
-                ));
-            }
-            if let Some(luid) = found.into_iter().next() {
-                break luid;
-            }
-            if Instant::now() >= deadline {
-                rollback_failed_start(child.as_mut(), &mut journal, None)?;
-                return Err(RuntimeError::new(
-                    "tun_preflight",
-                    "the owned RouteDeck TUN adapter did not appear",
-                ));
-            }
-            thread::sleep(Duration::from_millis(50));
-        };
-        let route_deadline = Instant::now() + Duration::from_secs(5);
-        if let Err(error) = journal.mark_adapter(child.pid(), engine_created, owned_luid) {
-            rollback_failed_start(child.as_mut(), &mut journal, Some(owned_luid))?;
-            return Err(error);
-        }
-        loop {
-            if inspect_owned_capture(owned_luid, expected_families).is_ok() {
-                break;
-            }
-            if Instant::now() >= route_deadline {
-                rollback_failed_start(child.as_mut(), &mut journal, Some(owned_luid))?;
-                return Err(RuntimeError::new(
+        let (engine_created, owned_luid) = with_tun_cleanup(
+            child.as_mut(),
+            &mut journal,
+            CleanupWhen::OnFailure,
+            |child, journal| {
+                let engine_created = process_creation_time_for_pid(child.pid())?;
+                journal.mark_running(child.pid(), engine_created)?;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let owned_luid = loop {
+                    let found = find_tun_adapter_luids()?;
+                    if found.len() > 1 {
+                        return Err(RuntimeError::new(
+                            "tun_preflight",
+                            "multiple RouteDeck TUN adapters appeared",
+                        ));
+                    }
+                    if let Some(luid) = found.into_iter().next() {
+                        break luid;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(RuntimeError::new(
+                            "tun_preflight",
+                            "the owned RouteDeck TUN adapter did not appear",
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                };
+                let route_deadline = Instant::now() + Duration::from_secs(5);
+                journal.mark_adapter(child.pid(), engine_created, owned_luid)?;
+                loop {
+                    if inspect_owned_capture(owned_luid, expected_families).is_ok() {
+                        break;
+                    }
+                    if Instant::now() >= route_deadline {
+                        return Err(RuntimeError::new(
                     "tun_capture",
                     "RouteDeck TUN adapter appeared, but its enabled address-family capture routes did not become effective",
                 ));
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        if let Err(error) = journal.mark_capture(child.pid(), engine_created, owned_luid) {
-            rollback_failed_start(child.as_mut(), &mut journal, Some(owned_luid))?;
-            return Err(error);
-        }
-        if let Err(error) = inspect_owned_capture(owned_luid, expected_families) {
-            rollback_failed_start(child.as_mut(), &mut journal, Some(owned_luid))?;
-            return Err(error);
-        }
-        if let Err(error) = validate_physical_upstream_after_start(&request.upstream) {
-            rollback_failed_start(child.as_mut(), &mut journal, Some(owned_luid))?;
-            return Err(error);
-        }
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                journal.mark_capture(child.pid(), engine_created, owned_luid)?;
+                inspect_owned_capture(owned_luid, expected_families)?;
+                validate_physical_upstream_after_start(&request.upstream)?;
+                Ok((engine_created, owned_luid))
+            },
+            |luid| wait_for_cleanup(luid, Duration::from_secs(3)),
+        )?;
         Ok(RunningSession {
             child: Box::new(HelperEngineChild {
                 child,
@@ -927,22 +951,43 @@ mod windows {
         })
     }
 
-    fn rollback_failed_start(
+    #[derive(Clone, Copy)]
+    enum CleanupWhen {
+        OnFailure,
+        Always,
+    }
+
+    trait CleanupJournal {
+        fn owned_luid(&self) -> Option<u64>;
+        fn complete(&mut self) -> Result<(), RuntimeError>;
+        fn mark_conflict(&mut self) -> Result<(), RuntimeError>;
+    }
+
+    // The only exit boundary after an engine is launched. Drop is still a last-resort
+    // containment mechanism, but is never taken as proof of network restoration.
+    fn with_tun_cleanup<T, J: CleanupJournal>(
         child: &mut dyn ManagedChild,
-        journal: &mut TunJournal,
-        owned_luid: Option<u64>,
-    ) -> Result<(), RuntimeError> {
-        let stopped = child.stop();
-        let cleanup = wait_for_cleanup(owned_luid, Duration::from_secs(3));
-        if stopped.is_ok() && cleanup == CleanupState::Complete {
-            journal.complete()
-        } else {
-            journal.mark_conflict()?;
-            Err(RuntimeError::new(
-                "session_recovery",
-                "failed TUN startup could not be rolled back safely",
-            ))
+        journal: &mut J,
+        when: CleanupWhen,
+        operation: impl FnOnce(&mut dyn ManagedChild, &mut J) -> Result<T, RuntimeError>,
+        verify: impl FnOnce(Option<u64>) -> CleanupState,
+    ) -> Result<T, RuntimeError> {
+        let result = operation(child, journal);
+        if result.is_ok() && matches!(when, CleanupWhen::OnFailure) {
+            return result;
         }
+        let stopped = child.stop();
+        let cleanup = verify(journal.owned_luid());
+        if stopped.is_ok() && cleanup == CleanupState::Complete && journal.complete().is_ok() {
+            return result;
+        }
+        // Retain the journal path for recovery even if recording the conflict
+        // fails. Its last write may be incomplete; never claim cleanup success.
+        let _ = journal.mark_conflict();
+        Err(RuntimeError::new(
+            "session_recovery",
+            "TUN cleanup could not be verified; recovery evidence requires review",
+        ))
     }
 
     struct HelperEngineChild {
@@ -969,26 +1014,13 @@ mod windows {
         invocation: &HelperInvocation,
         state: &mut ServerState,
         child: &mut dyn ManagedChild,
-        journal: &mut TunJournal,
         capture: &CaptureExpectation,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<Option<u64>, RuntimeError> {
         let parent = open_verified_parent(invocation)?;
         loop {
             let frame = match pipe.read_frame_from_peer(parent.raw()) {
                 Ok(frame) => frame,
-                Err(_) => {
-                    let stop = child.stop();
-                    let cleanup = wait_for_cleanup(capture.owned_luid, Duration::from_secs(3));
-                    if stop.is_ok() && cleanup == CleanupState::Complete {
-                        journal.complete()?;
-                        return Ok(());
-                    }
-                    journal.mark_conflict()?;
-                    return Err(RuntimeError::new(
-                        "stop_engine",
-                        "GUI disconnected and TUN cleanup could not be verified",
-                    ));
-                }
+                Err(error) => return Err(protocol_runtime_error(error)),
             };
             if frame_session(&frame).is_some_and(|session| session != invocation.session) {
                 return Err(RuntimeError::new(
@@ -1026,15 +1058,17 @@ mod windows {
                                 },
                             )
                             .map_err(protocol_runtime_error)?,
-                            Err(error) => write_frame(
-                                pipe,
-                                &Frame::Failure {
-                                    request_id,
-                                    code: HelperFailureCode::CaptureInvalid,
-                                    safe_detail: Some(safe_helper_detail(error.stage()).into()),
-                                },
-                            )
-                            .map_err(protocol_runtime_error)?,
+                            Err(error) => {
+                                write_frame(
+                                    pipe,
+                                    &Frame::Failure {
+                                        request_id,
+                                        code: HelperFailureCode::CaptureInvalid,
+                                        safe_detail: Some(safe_helper_detail(error.stage()).into()),
+                                    },
+                                )
+                                .map_err(protocol_runtime_error)?;
+                            }
                         }
                     } else {
                         write_frame(
@@ -1051,29 +1085,7 @@ mod windows {
                     }
                 }
                 Frame::StopTun { request_id, .. } => {
-                    let stop = child.stop();
-                    let cleanup = wait_for_cleanup(capture.owned_luid, Duration::from_secs(3));
-                    if stop.is_ok() && cleanup == CleanupState::Complete {
-                        journal.complete()?;
-                    } else {
-                        journal.mark_conflict()?;
-                    }
-                    write_frame(
-                        pipe,
-                        &Frame::Stopped {
-                            request_id,
-                            cleanup,
-                        },
-                    )
-                    .map_err(protocol_runtime_error)?;
-                    return if stop.is_ok() && cleanup == CleanupState::Complete {
-                        Ok(())
-                    } else {
-                        Err(RuntimeError::new(
-                            "stop_engine",
-                            "TUN helper cleanup requires review",
-                        ))
-                    };
+                    return Ok(Some(request_id));
                 }
                 _ => {
                     return Err(RuntimeError::new(
@@ -1248,9 +1260,18 @@ mod windows {
         ipv6: bool,
     }
 
+    #[cfg(test)]
     fn validate_tun_config(
         contents: &str,
         upstream_alias: &str,
+    ) -> Result<ExpectedFamilies, RuntimeError> {
+        validate_tun_config_for_upstream(contents, upstream_alias, None)
+    }
+
+    fn validate_tun_config_for_upstream(
+        contents: &str,
+        upstream_alias: &str,
+        ipv4_dns_server: Option<Ipv4Addr>,
     ) -> Result<ExpectedFamilies, RuntimeError> {
         let root: serde_json::Value = serde_json::from_str(contents).map_err(|_| {
             RuntimeError::new(
@@ -1258,6 +1279,7 @@ mod windows {
                 "protected TUN config is not valid JSON",
             )
         })?;
+        validate_generated_config_fields(&root)?;
         let object = root.as_object().ok_or_else(|| {
             RuntimeError::new("tun_helper_config", "protected TUN config root is invalid")
         })?;
@@ -1280,6 +1302,7 @@ mod windows {
             ipv4: false,
             ipv6: false,
         };
+        let mut expected_prefixes = Vec::new();
         for inbound in inbounds {
             let inbound = inbound.as_object().ok_or_else(|| {
                 RuntimeError::new("tun_helper_config", "protected TUN inbound is invalid")
@@ -1299,7 +1322,10 @@ mod windows {
                         .get("strict_route")
                         .and_then(serde_json::Value::as_bool)
                         != Some(true)
-                    || inbound.get("stack").and_then(serde_json::Value::as_str) != Some("system")
+                    || !matches!(
+                        inbound.get("stack").and_then(serde_json::Value::as_str),
+                        Some("system" | "gvisor")
+                    )
                 {
                     return Err(RuntimeError::new(
                         "tun_helper_config",
@@ -1317,9 +1343,20 @@ mod windows {
                         )
                     })?;
                 for address in addresses {
-                    let address = address
-                        .as_str()
-                        .and_then(|address| address.split('/').next())
+                    let address_text = address.as_str().ok_or_else(|| {
+                        RuntimeError::new("tun_helper_config", "protected TUN address is invalid")
+                    })?;
+                    expected_prefixes.push(
+                        crate::config::canonical_tun_prefix(address_text).map_err(|_| {
+                            RuntimeError::new(
+                                "tun_helper_config",
+                                "protected TUN address prefix is invalid",
+                            )
+                        })?,
+                    );
+                    let address = address_text
+                        .split('/')
+                        .next()
                         .and_then(|address| address.parse::<IpAddr>().ok())
                         .ok_or_else(|| {
                             RuntimeError::new(
@@ -1394,27 +1431,47 @@ mod windows {
             })?;
         let selected_is_bridge =
             selected.get("type").and_then(serde_json::Value::as_str) == Some("socks");
-        let upstream_binding_valid = if selected_is_bridge {
-            route.get("default_interface").is_none()
-                && selected.get("server").and_then(serde_json::Value::as_str) == Some("127.0.0.1")
-                && selected.get("bind_interface").is_none()
-                && direct
-                    .get("bind_interface")
+        let bootstrap_valid = if let Some(server) = ipv4_dns_server {
+            bootstrap.get("type").and_then(serde_json::Value::as_str) == Some("tcp")
+                && bootstrap
+                    .get("server")
                     .and_then(serde_json::Value::as_str)
-                    == Some(upstream_alias)
+                    .is_some_and(|value| value == server.to_string())
+                && bootstrap
+                    .get("server_port")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(53)
                 && bootstrap
                     .get("bind_interface")
                     .and_then(serde_json::Value::as_str)
                     == Some(upstream_alias)
         } else {
-            route
-                .get("default_interface")
-                .and_then(serde_json::Value::as_str)
-                == Some(upstream_alias)
-                && selected.get("bind_interface").is_none()
-                && direct.get("bind_interface").is_none()
-                && bootstrap.get("bind_interface").is_none()
+            bootstrap.get("type").and_then(serde_json::Value::as_str) == Some("local")
         };
+        let upstream_binding_valid = bootstrap_valid
+            && if selected_is_bridge {
+                route.get("default_interface").is_none()
+                    && selected.get("server").and_then(serde_json::Value::as_str)
+                        == Some("127.0.0.1")
+                    && selected.get("bind_interface").is_none()
+                    && direct
+                        .get("bind_interface")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(upstream_alias)
+                    && (ipv4_dns_server.is_some()
+                        || bootstrap
+                            .get("bind_interface")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(upstream_alias))
+            } else {
+                route
+                    .get("default_interface")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(upstream_alias)
+                    && selected.get("bind_interface").is_none()
+                    && direct.get("bind_interface").is_none()
+                    && (ipv4_dns_server.is_some() || bootstrap.get("bind_interface").is_none())
+            };
         if tun_count != 1 || route.get("auto_detect_interface").is_some() || !upstream_binding_valid
         {
             return Err(RuntimeError::new(
@@ -1428,7 +1485,466 @@ mod windows {
                 "protected TUN DNS port hijack is missing or ambiguous",
             )
         })?;
+        crate::config::validate_tun_own_prefix_guard(&root, &expected_prefixes).map_err(|_| {
+            RuntimeError::new(
+                "tun_helper_config",
+                "protected TUN own-prefix guard is invalid",
+            )
+        })?;
+        validate_tun_traffic_rules(&root, expected_families)?;
         Ok(expected_families)
+    }
+
+    fn validate_tun_traffic_rules(
+        root: &serde_json::Value,
+        expected_families: ExpectedFamilies,
+    ) -> Result<(), RuntimeError> {
+        let rejected = || {
+            RuntimeError::new(
+                "tun_helper_config",
+                "protected TUN traffic rules are invalid",
+            )
+        };
+        let rules = root
+            .pointer("/route/rules")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(rejected)?;
+        if rules.len() < 3 {
+            return Err(rejected());
+        }
+        let route = root
+            .get("route")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(rejected)?;
+        if !matches!(
+            route.get("final").and_then(serde_json::Value::as_str),
+            Some("direct" | "selected")
+        ) || route
+            .get("default_domain_resolver")
+            .and_then(serde_json::Value::as_str)
+            != Some("bootstrap")
+        {
+            return Err(rejected());
+        }
+        let mut index = 3;
+        let ipv6_guard = serde_json::json!({"ip_version": 6, "action": "reject"});
+        if !expected_families.ipv6 {
+            if rules.get(index) != Some(&ipv6_guard) {
+                return Err(rejected());
+            }
+            index += 1;
+        } else if rules.get(index) == Some(&ipv6_guard) {
+            return Err(rejected());
+        }
+        let mut count = 0;
+        while let Some(rule) = rules.get(index) {
+            let is_candidate = rule.get("port").is_some() || rule.get("network").is_some();
+            if !is_candidate {
+                break;
+            }
+            let network = rule
+                .pointer("/network/0")
+                .and_then(serde_json::Value::as_str)
+                .filter(|network| matches!(*network, "tcp" | "udp"))
+                .ok_or_else(rejected)?;
+            if rule
+                .get("network")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(|networks| networks.len() != 1)
+            {
+                return Err(rejected());
+            }
+            let port = rule
+                .get("port")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|port| *port > 0 && *port <= u16::MAX as u64 && *port != 53)
+                .ok_or_else(rejected)?;
+            let expected = match rule.get("action").and_then(serde_json::Value::as_str) {
+                Some("reject") => serde_json::json!({
+                    "inbound": ["tun-in"], "network": [network], "port": port,
+                    "action": "reject", "method": "default", "no_drop": true
+                }),
+                Some("route") => {
+                    let outbound = rule
+                        .get("outbound")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|outbound| matches!(*outbound, "direct" | "selected"))
+                        .ok_or_else(rejected)?;
+                    serde_json::json!({
+                        "inbound": ["tun-in"], "network": [network], "port": port,
+                        "action": "route", "outbound": outbound
+                    })
+                }
+                _ => return Err(rejected()),
+            };
+            if rule != &expected {
+                return Err(rejected());
+            }
+            count += 1;
+            if count > 32 {
+                return Err(rejected());
+            }
+            index += 1;
+        }
+        let mut app_count = 0;
+        while let Some(rule) = rules.get(index) {
+            let Some(paths) = rule
+                .get("process_path")
+                .and_then(serde_json::Value::as_array)
+            else {
+                break;
+            };
+            let exact_app = rule.as_object().is_some_and(|object| object.len() == 3)
+                && rule.get("action").and_then(serde_json::Value::as_str) == Some("route")
+                && matches!(
+                    rule.get("outbound").and_then(serde_json::Value::as_str),
+                    Some("direct" | "selected")
+                )
+                && paths.len() == 1
+                && paths[0].as_str().is_some_and(|path| {
+                    !path.is_empty()
+                        && path.encode_utf16().count() <= 32_767
+                        && !path.chars().any(char::is_control)
+                });
+            if !exact_app {
+                return Err(rejected());
+            }
+            app_count += 1;
+            if app_count > crate::domain::MAX_APP_RULES {
+                return Err(rejected());
+            }
+            index += 1;
+        }
+        if rules.get(index)
+            == Some(&serde_json::json!({
+                "ip_is_private": true, "action": "route", "outbound": "direct"
+            }))
+        {
+            index += 1;
+        }
+        if index != rules.len() {
+            return Err(rejected());
+        }
+        Ok(())
+    }
+
+    // This is an elevation boundary, not merely sing-box syntax validation. Keep the
+    // accepted field graph closed: engine support for a new file, plugin, listener,
+    // or route feature must never implicitly grant that capability to this helper.
+    // Values such as HTTP paths and process_path matchers are data, not file APIs.
+    fn validate_generated_config_fields(root: &serde_json::Value) -> Result<(), RuntimeError> {
+        use serde_json::Value;
+
+        fn rejected() -> RuntimeError {
+            RuntimeError::new(
+                "tun_helper_config",
+                "protected TUN configuration field schema was rejected",
+            )
+        }
+        fn object<'a>(
+            value: &'a Value,
+            fields: &[&str],
+        ) -> Result<&'a serde_json::Map<String, Value>, RuntimeError> {
+            let value = value.as_object().ok_or_else(rejected)?;
+            if value.keys().any(|key| !fields.contains(&key.as_str())) {
+                return Err(rejected());
+            }
+            Ok(value)
+        }
+        fn strings(value: &Value) -> Result<(), RuntimeError> {
+            let array = value.as_array().ok_or_else(rejected)?;
+            if array.iter().any(|value| !value.is_string()) {
+                return Err(rejected());
+            }
+            Ok(())
+        }
+        fn string_map(value: &Value) -> Result<(), RuntimeError> {
+            if value
+                .as_object()
+                .ok_or_else(rejected)?
+                .values()
+                .any(|value| !value.is_string())
+            {
+                return Err(rejected());
+            }
+            Ok(())
+        }
+        fn fields(
+            value: &Value,
+            text: &[&str],
+            flags: &[&str],
+            lists: &[&str],
+            ports: &[&str],
+            nested: &[&str],
+        ) -> Result<(), RuntimeError> {
+            let allowed = [text, flags, lists, ports, nested].concat();
+            for (key, value) in object(value, &allowed)? {
+                if text.contains(&key.as_str()) && !value.is_string()
+                    || flags.contains(&key.as_str()) && !value.is_boolean()
+                    || ports.contains(&key.as_str())
+                        && !value
+                            .as_u64()
+                            .is_some_and(|port| port > 0 && port <= u16::MAX as u64)
+                {
+                    return Err(rejected());
+                }
+                if lists.contains(&key.as_str()) {
+                    strings(value)?;
+                }
+            }
+            Ok(())
+        }
+        fn tls(value: &Value) -> Result<(), RuntimeError> {
+            fields(
+                value,
+                &["server_name"],
+                &["enabled", "insecure"],
+                &["alpn", "certificate_public_key_sha256"],
+                &[],
+                &["utls", "reality", "ech"],
+            )?;
+            if let Some(value) = value.get("utls") {
+                fields(value, &["fingerprint"], &["enabled"], &[], &[], &[])?;
+            }
+            if let Some(value) = value.get("reality") {
+                fields(
+                    value,
+                    &["public_key", "short_id"],
+                    &["enabled"],
+                    &[],
+                    &[],
+                    &[],
+                )?;
+            }
+            if let Some(value) = value.get("ech") {
+                fields(value, &[], &["enabled"], &["config"], &[], &[])?;
+            }
+            Ok(())
+        }
+        object(root, &["log", "dns", "inbounds", "outbounds", "route"])?;
+        if let Some(log) = root.get("log") {
+            fields(log, &["level"], &["timestamp"], &[], &[], &[])?;
+            if log.get("level").is_some_and(|v| v != "error")
+                || log.get("timestamp").is_some_and(|v| v != false)
+            {
+                return Err(rejected());
+            }
+        }
+        let dns = root.get("dns").ok_or_else(rejected)?;
+        fields(dns, &["final", "strategy"], &[], &[], &[], &["servers"])?;
+        for server in dns
+            .get("servers")
+            .and_then(Value::as_array)
+            .ok_or_else(rejected)?
+        {
+            match server.get("tag").and_then(Value::as_str) {
+                Some("bootstrap") => {
+                    fields(
+                        server,
+                        &["type", "tag", "bind_interface", "server"],
+                        &[],
+                        &[],
+                        &["server_port"],
+                        &[],
+                    )?;
+                    if !matches!(
+                        server.get("type").and_then(Value::as_str),
+                        Some("local" | "tcp")
+                    ) {
+                        return Err(rejected());
+                    }
+                }
+                Some("remote-dns") => {
+                    fields(
+                        server,
+                        &["type", "tag", "server", "path", "detour"],
+                        &[],
+                        &[],
+                        &["server_port"],
+                        &["tls"],
+                    )?;
+                    if server.get("type").and_then(Value::as_str) != Some("https") {
+                        return Err(rejected());
+                    }
+                    if let Some(value) = server.get("tls") {
+                        tls(value)?;
+                    }
+                }
+                _ => return Err(rejected()),
+            }
+        }
+        for inbound in root
+            .get("inbounds")
+            .and_then(Value::as_array)
+            .ok_or_else(rejected)?
+        {
+            match inbound.get("type").and_then(Value::as_str) {
+                Some("tun") => fields(
+                    inbound,
+                    &["type", "tag", "interface_name", "stack"],
+                    &["auto_route", "strict_route"],
+                    &["address"],
+                    &[],
+                    &[],
+                )?,
+                Some("http" | "socks") => {
+                    fields(
+                        inbound,
+                        &["type", "tag", "listen"],
+                        &[],
+                        &[],
+                        &["listen_port"],
+                        &["users"],
+                    )?;
+                    if let Some(users) = inbound.get("users") {
+                        for user in users.as_array().ok_or_else(rejected)? {
+                            fields(user, &["username", "password"], &[], &[], &[], &[])?;
+                        }
+                    }
+                }
+                _ => return Err(rejected()),
+            }
+        }
+        for outbound in root
+            .get("outbounds")
+            .and_then(Value::as_array)
+            .ok_or_else(rejected)?
+        {
+            let common = ["type", "tag", "server", "domain_resolver"];
+            match outbound.get("type").and_then(Value::as_str) {
+                Some("direct") => fields(
+                    outbound,
+                    &["type", "tag", "bind_interface"],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                )?,
+                Some("socks") => fields(
+                    outbound,
+                    &[common.as_slice(), &["version"]].concat(),
+                    &[],
+                    &[],
+                    &["server_port"],
+                    &[],
+                )?,
+                Some("vless") => fields(
+                    outbound,
+                    &[common.as_slice(), &["uuid", "flow", "packet_encoding"]].concat(),
+                    &[],
+                    &[],
+                    &["server_port"],
+                    &["tls", "transport"],
+                )?,
+                Some("hysteria2") => fields(
+                    outbound,
+                    &[common.as_slice(), &["password", "hop_interval"]].concat(),
+                    &[],
+                    &["server_ports"],
+                    &["server_port"],
+                    &["tls", "obfs"],
+                )?,
+                Some("naive") => fields(
+                    outbound,
+                    &[common.as_slice(), &["username", "password"]].concat(),
+                    &["quic"],
+                    &[],
+                    &["server_port"],
+                    &["tls", "extra_headers", "udp_over_tcp"],
+                )?,
+                _ => return Err(rejected()),
+            }
+            if let Some(value) = outbound.get("tls") {
+                tls(value)?;
+            }
+            if let Some(value) = outbound.get("extra_headers") {
+                string_map(value)?;
+            }
+            if let Some(value) = outbound.get("udp_over_tcp") {
+                if outbound.get("type").and_then(Value::as_str) != Some("naive") {
+                    return Err(rejected());
+                }
+                fields(value, &[], &["enabled"], &[], &["version"], &[])?;
+                if value.get("enabled").and_then(Value::as_bool) != Some(true)
+                    || value.get("version").and_then(Value::as_u64) != Some(2)
+                {
+                    return Err(rejected());
+                }
+            }
+            if let Some(value) = outbound.get("obfs") {
+                fields(value, &["type", "password"], &[], &[], &[], &[])?;
+                if value.get("type").and_then(Value::as_str) != Some("salamander") {
+                    return Err(rejected());
+                }
+            }
+            if let Some(value) = outbound.get("transport") {
+                match value.get("type").and_then(Value::as_str) {
+                    Some("ws") => {
+                        fields(value, &["type", "path"], &[], &[], &[], &["headers"])?;
+                        if let Some(headers) = value.get("headers") {
+                            object(headers, &["Host"])?;
+                            string_map(headers)?;
+                        }
+                    }
+                    Some("grpc") => fields(value, &["type", "service_name"], &[], &[], &[], &[])?,
+                    _ => return Err(rejected()),
+                }
+            }
+        }
+        let route = root.get("route").ok_or_else(rejected)?;
+        fields(
+            route,
+            &["final", "default_domain_resolver", "default_interface"],
+            &[],
+            &[],
+            &[],
+            &["rules"],
+        )?;
+        for rule in route
+            .get("rules")
+            .and_then(Value::as_array)
+            .ok_or_else(rejected)?
+        {
+            match rule.get("action").and_then(Value::as_str) {
+                Some("route") => fields(
+                    rule,
+                    &["action", "outbound"],
+                    &["ip_is_private"],
+                    &["inbound", "process_path", "network"],
+                    &["port"],
+                    &[],
+                )?,
+                Some("hijack-dns") => fields(
+                    rule,
+                    &["action"],
+                    &[],
+                    &["inbound", "network"],
+                    &["port"],
+                    &[],
+                )?,
+                Some("reject") => {
+                    fields(
+                        rule,
+                        &["action", "method"],
+                        &["no_drop"],
+                        &["inbound", "ip_cidr", "network"],
+                        &["port"],
+                        &["ip_version"],
+                    )?;
+                    if rule
+                        .get("method")
+                        .is_some_and(|v| v != "drop" && v != "default")
+                        || rule
+                            .get("ip_version")
+                            .is_some_and(|v| v.as_u64() != Some(6))
+                    {
+                        return Err(rejected());
+                    }
+                }
+                _ => return Err(rejected()),
+            }
+        }
+        Ok(())
     }
 
     struct HelperInvocation {
@@ -1849,6 +2365,7 @@ mod windows {
         tunnel_type: i32,
         physical_address_length: u32,
         oper_status: i32,
+        ipv4_dns_servers: Vec<Ipv4Addr>,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1861,10 +2378,7 @@ mod windows {
     }
 
     fn adapter_states() -> Result<Vec<AdapterState>, RuntimeError> {
-        let flags = GAA_FLAG_SKIP_ANYCAST
-            | GAA_FLAG_SKIP_MULTICAST
-            | GAA_FLAG_SKIP_DNS_SERVER
-            | GAA_FLAG_SKIP_UNICAST;
+        let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_UNICAST;
         let mut size = 16 * 1024_u32;
         for _ in 0..3 {
             let mut buffer = vec![0_u8; size as usize];
@@ -1885,6 +2399,21 @@ mod windows {
             let mut current = first;
             while !current.is_null() {
                 let adapter = unsafe { &*current };
+                let mut ipv4_dns_servers = Vec::new();
+                let mut dns = adapter.FirstDnsServerAddress;
+                let mut dns_count = 0_usize;
+                while !dns.is_null() && dns_count < 64 {
+                    dns_count += 1;
+                    let address = unsafe { (*dns).Address.lpSockaddr };
+                    unsafe {
+                        push_ipv4_dns_from_sockaddr(
+                            &mut ipv4_dns_servers,
+                            address,
+                            (*dns).Address.iSockaddrLength,
+                        )
+                    };
+                    dns = unsafe { (*dns).Next };
+                }
                 output.push(AdapterState {
                     luid: unsafe { adapter.Luid.Value },
                     if_index: unsafe { adapter.Anonymous1.Anonymous.IfIndex },
@@ -1894,6 +2423,7 @@ mod windows {
                     tunnel_type: adapter.TunnelType,
                     physical_address_length: adapter.PhysicalAddressLength,
                     oper_status: adapter.OperStatus,
+                    ipv4_dns_servers,
                 });
                 current = adapter.Next;
             }
@@ -2045,14 +2575,53 @@ mod windows {
             interface_luid: adapter.luid,
             interface_index: adapter.if_index,
             interface_alias: adapter.friendly_name.clone(),
+            ipv4_dns_server: adapter.ipv4_dns_servers.first().copied(),
         })
+    }
+
+    fn usable_ipv4_dns(address: Ipv4Addr) -> bool {
+        !address.is_unspecified()
+            && !address.is_loopback()
+            && !address.is_multicast()
+            && address != Ipv4Addr::BROADCAST
+    }
+
+    unsafe fn ipv4_dns_from_sockaddr(address: *const SOCKADDR, length: i32) -> Option<Ipv4Addr> {
+        if address.is_null() || length < size_of::<SOCKADDR_IN>() as i32 {
+            return None;
+        }
+        if unsafe { (*address).sa_family } != AF_INET {
+            return None;
+        }
+        let raw = unsafe { &*address.cast::<SOCKADDR_IN>() };
+        Some(Ipv4Addr::from(
+            unsafe { raw.sin_addr.S_un.S_addr }.to_ne_bytes(),
+        ))
+    }
+
+    unsafe fn push_ipv4_dns_from_sockaddr(
+        output: &mut Vec<Ipv4Addr>,
+        address: *const SOCKADDR,
+        length: i32,
+    ) {
+        if let Some(value) = unsafe { ipv4_dns_from_sockaddr(address, length) } {
+            if usable_ipv4_dns(value) && !output.contains(&value) {
+                output.push(value);
+            }
+        }
     }
 
     fn exact_upstream_adapter<'a>(
         adapters: &'a [AdapterState],
         expected: &TunUpstreamIdentity,
+        verify_dns_snapshot: bool,
     ) -> Option<&'a AdapterState> {
-        if physical_upstream_from(adapters, expected.interface_luid).as_ref() != Some(expected) {
+        let current = physical_upstream_from(adapters, expected.interface_luid)?;
+        if current.interface_luid != expected.interface_luid
+            || current.interface_index != expected.interface_index
+            || current.interface_alias != expected.interface_alias
+            || (verify_dns_snapshot && current.ipv4_dns_server != expected.ipv4_dns_server)
+        {
             return None;
         }
         adapters.iter().find(|adapter| {
@@ -2075,7 +2644,7 @@ mod windows {
                 "another full-tunnel VPN is active; turn it off before starting RouteDeck TUN",
             ));
         }
-        if exact_upstream_adapter(&adapters, upstream).is_none()
+        if exact_upstream_adapter(&adapters, upstream, true).is_none()
             || best_route_luid_v4([1, 1, 1, 1])? != upstream.interface_luid
         {
             return Err(RuntimeError::new(
@@ -2109,7 +2678,9 @@ mod windows {
         upstream: &TunUpstreamIdentity,
     ) -> Result<(), RuntimeError> {
         let adapters = adapter_states()?;
-        if exact_upstream_adapter(&adapters, upstream).is_none()
+        // DNS is sealed and revalidated before launch. A later DHCP refresh must not
+        // silently terminate an otherwise healthy owned TUN session.
+        if exact_upstream_adapter(&adapters, upstream, false).is_none()
             || best_route_luid_v4_on_interface([1, 1, 1, 1], upstream.interface_luid)?
                 != upstream.interface_luid
         {
@@ -2678,6 +3249,18 @@ mod windows {
         owned_routes: Vec<RouteState>,
     }
 
+    impl CleanupJournal for TunJournal {
+        fn owned_luid(&self) -> Option<u64> {
+            self.owned_luid
+        }
+        fn complete(&mut self) -> Result<(), RuntimeError> {
+            TunJournal::complete(self)
+        }
+        fn mark_conflict(&mut self) -> Result<(), RuntimeError> {
+            TunJournal::mark_conflict(self)
+        }
+    }
+
     impl TunJournal {
         fn create(
             session_directory: &Path,
@@ -3068,6 +3651,215 @@ mod windows {
 
         use super::*;
 
+        struct CleanupFixtureChild {
+            events: Arc<Mutex<Vec<&'static str>>>,
+            stop_fails: bool,
+        }
+        impl ManagedChild for CleanupFixtureChild {
+            fn pid(&self) -> u32 {
+                123
+            }
+            fn is_alive(&mut self) -> Result<bool, RuntimeError> {
+                Ok(true)
+            }
+            fn stop(&mut self) -> Result<(), RuntimeError> {
+                self.events.lock().unwrap().push("stop");
+                if self.stop_fails {
+                    Err(RuntimeError::new("stop_engine", "fixture stop failed"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        struct CleanupFixtureJournal {
+            events: Arc<Mutex<Vec<&'static str>>>,
+            luid: Option<u64>,
+            retained: bool,
+            complete_fails: bool,
+            conflict_fails: bool,
+        }
+        impl CleanupJournal for CleanupFixtureJournal {
+            fn owned_luid(&self) -> Option<u64> {
+                self.luid
+            }
+            fn complete(&mut self) -> Result<(), RuntimeError> {
+                self.events.lock().unwrap().push("complete");
+                if self.complete_fails {
+                    return Err(RuntimeError::new(
+                        "session_storage",
+                        "fixture complete failed",
+                    ));
+                }
+                self.retained = false;
+                Ok(())
+            }
+            fn mark_conflict(&mut self) -> Result<(), RuntimeError> {
+                self.events.lock().unwrap().push("conflict");
+                if self.conflict_fails {
+                    Err(RuntimeError::new(
+                        "session_storage",
+                        "fixture conflict write failed",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        fn cleanup_fixtures() -> (CleanupFixtureChild, CleanupFixtureJournal) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            (
+                CleanupFixtureChild {
+                    events: events.clone(),
+                    stop_fails: false,
+                },
+                CleanupFixtureJournal {
+                    events,
+                    luid: None,
+                    retained: true,
+                    complete_fails: false,
+                    conflict_fails: false,
+                },
+            )
+        }
+
+        #[test]
+        fn every_startup_and_running_failure_crosses_verified_cleanup_boundary() {
+            // These checkpoints cover failures before identity is durable, after an
+            // adapter was observed, and before/during the running IPC loop. No native
+            // process, adapter, route or named pipe is created by this fault matrix.
+            for (when, checkpoints) in [
+                (
+                    CleanupWhen::OnFailure,
+                    &[
+                        "creation_time",
+                        "mark_running",
+                        "find_adapter",
+                        "mark_adapter",
+                        "capture_routes",
+                        "mark_capture",
+                        "upstream",
+                    ] as &[&str],
+                ),
+                (
+                    CleanupWhen::Always,
+                    &[
+                        "started_write",
+                        "parent_identity",
+                        "frame_read",
+                        "wrong_session",
+                        "protocol_state",
+                        "child_query",
+                        "status_write",
+                    ] as &[&str],
+                ),
+            ] {
+                for checkpoint in checkpoints {
+                    for luid in [None, Some(7)] {
+                        let (mut child, mut journal) = cleanup_fixtures();
+                        let events = child.events.clone();
+                        let result: Result<(), RuntimeError> = with_tun_cleanup(
+                            &mut child,
+                            &mut journal,
+                            when,
+                            |_, journal| {
+                                journal.luid = luid;
+                                Err(RuntimeError::new("fixture_failure", *checkpoint))
+                            },
+                            |observed| {
+                                assert_eq!(observed, luid);
+                                events.lock().unwrap().push("verify");
+                                CleanupState::Complete
+                            },
+                        );
+                        let error = result.unwrap_err();
+                        assert_eq!(error.stage(), "fixture_failure");
+                        assert_eq!(error.message(), *checkpoint);
+                        assert_eq!(*events.lock().unwrap(), ["stop", "verify", "complete"]);
+                        assert!(!journal.retained);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn cleanup_fault_matrix_preserves_evidence_and_never_reports_success() {
+            for stop_fails in [false, true] {
+                for capture_conflicts in [false, true] {
+                    for complete_fails in [false, true] {
+                        for conflict_fails in [false, true] {
+                            let (mut child, mut journal) = cleanup_fixtures();
+                            child.stop_fails = stop_fails;
+                            journal.complete_fails = complete_fails;
+                            journal.conflict_fails = conflict_fails;
+                            journal.luid = Some(7);
+                            let events = child.events.clone();
+                            let result = with_tun_cleanup(
+                                &mut child,
+                                &mut journal,
+                                CleanupWhen::Always,
+                                |_, _| Ok(()),
+                                |luid| {
+                                    assert_eq!(luid, Some(7));
+                                    events.lock().unwrap().push("verify");
+                                    if capture_conflicts {
+                                        CleanupState::Conflict
+                                    } else {
+                                        CleanupState::Complete
+                                    }
+                                },
+                            );
+                            let failed = stop_fails || capture_conflicts || complete_fails;
+                            assert_eq!(journal.retained, failed);
+                            if failed {
+                                assert_eq!(result.unwrap_err().stage(), "session_recovery");
+                                assert_eq!(events.lock().unwrap().last(), Some(&"conflict"));
+                            } else {
+                                result.unwrap();
+                            }
+                            let events = events.lock().unwrap();
+                            assert_eq!(&events[..2], ["stop", "verify"]);
+                            assert_eq!(
+                                events.contains(&"complete"),
+                                !stop_fails && !capture_conflicts
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn startup_success_keeps_owner_and_normal_stop_finalizes_once() {
+            let (mut child, mut journal) = cleanup_fixtures();
+            with_tun_cleanup(
+                &mut child,
+                &mut journal,
+                CleanupWhen::OnFailure,
+                |_, journal| {
+                    journal.luid = Some(7);
+                    Ok(())
+                },
+                |_| panic!("successful startup must keep its engine running"),
+            )
+            .unwrap();
+            assert!(journal.retained);
+            assert!(child.events.lock().unwrap().is_empty());
+            let events = child.events.clone();
+            with_tun_cleanup(
+                &mut child,
+                &mut journal,
+                CleanupWhen::Always,
+                |_, _| Ok(()),
+                |_| {
+                    events.lock().unwrap().push("verify");
+                    CleanupState::Complete
+                },
+            )
+            .unwrap();
+            assert_eq!(*events.lock().unwrap(), ["stop", "verify", "complete"]);
+            assert!(!journal.retained);
+        }
+
         #[test]
         fn helper_arguments_have_one_fixed_pathless_shape() {
             let session = "01".repeat(16);
@@ -3163,7 +3955,7 @@ mod windows {
         fn strict_tun_config_rejects_non_tun_and_non_loopback_inputs() {
             let valid = serde_json::json!({
                 "log": {},
-                "dns": {"servers":[{"tag":"bootstrap"}]},
+                "dns": {"servers":[{"type":"local","tag":"bootstrap"}]},
                 "inbounds": [
                     {"type":"http","listen":"127.0.0.1"},
                     {"type":"tun","tag":"tun-in","interface_name":"RouteDeck","address":["172.19.0.1/30"],"auto_route":true,"strict_route":true,"stack":"system"}
@@ -3172,9 +3964,11 @@ mod windows {
                     {"type":"hysteria2","tag":"selected"},
                     {"type":"direct","tag":"direct"}
                 ],
-                "route": {"default_interface":"Ethernet","rules":[
+                "route": {"default_interface":"Ethernet","final":"selected","default_domain_resolver":"bootstrap","rules":[
                     {"inbound":["health-in"],"action":"route","outbound":"selected"},
-                    {"inbound":["tun-in"],"network":["tcp","udp"],"port":53,"action":"hijack-dns"}
+                    {"inbound":["tun-in"],"network":["tcp","udp"],"port":53,"action":"hijack-dns"},
+                    {"inbound":["tun-in"],"ip_cidr":["172.19.0.0/30"],"action":"reject","method":"drop"},
+                    {"ip_version":6,"action":"reject"}
                 ]}
             });
             assert_eq!(
@@ -3184,6 +3978,14 @@ mod windows {
                     ipv6: false,
                 }
             );
+            let mut gvisor = valid.clone();
+            gvisor["inbounds"][1]["stack"] = serde_json::json!("gvisor");
+            assert!(validate_tun_config(&gvisor.to_string(), "Ethernet").is_ok());
+            for rejected in ["mixed", "Gvisor", ""] {
+                let mut invalid_stack = valid.clone();
+                invalid_stack["inbounds"][1]["stack"] = serde_json::json!(rejected);
+                assert!(validate_tun_config(&invalid_stack.to_string(), "Ethernet").is_err());
+            }
             let mut dual = valid.clone();
             let mut legacy_dns = valid.clone();
             legacy_dns["route"]["rules"][1] =
@@ -3200,6 +4002,9 @@ mod windows {
             assert!(validate_tun_config(&reordered_dns.to_string(), "Ethernet").is_err());
             dual["inbounds"][1]["address"] =
                 serde_json::json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"]);
+            dual["route"]["rules"][2]["ip_cidr"] =
+                serde_json::json!(["172.19.0.0/30", "fdfe:dcba:9876::/126"]);
+            dual["route"]["rules"].as_array_mut().unwrap().remove(3);
             assert_eq!(
                 validate_tun_config(&dual.to_string(), "Ethernet").unwrap(),
                 ExpectedFamilies {
@@ -3227,7 +4032,7 @@ mod windows {
             assert!(validate_tun_config(&native_dns_override.to_string(), "Ethernet").is_err());
             let bridge = serde_json::json!({
                 "log": {},
-                "dns": {"servers":[{"tag":"bootstrap","bind_interface":"Ethernet"}]},
+                "dns": {"servers":[{"type":"local","tag":"bootstrap","bind_interface":"Ethernet"}]},
                 "inbounds": [
                     {"type":"http","listen":"127.0.0.1"},
                     {"type":"tun","tag":"tun-in","interface_name":"RouteDeck","address":["172.19.0.1/30"],"auto_route":true,"strict_route":true,"stack":"system"}
@@ -3236,9 +4041,11 @@ mod windows {
                     {"type":"socks","tag":"selected","server":"127.0.0.1","server_port":19090},
                     {"type":"direct","tag":"direct","bind_interface":"Ethernet"}
                 ],
-                "route": {"rules":[
+                "route": {"final":"selected","default_domain_resolver":"bootstrap","rules":[
                     {"inbound":["health-in"],"action":"route","outbound":"selected"},
-                    {"inbound":["tun-in"],"network":["tcp","udp"],"port":53,"action":"hijack-dns"}
+                    {"inbound":["tun-in"],"network":["tcp","udp"],"port":53,"action":"hijack-dns"},
+                    {"inbound":["tun-in"],"ip_cidr":["172.19.0.0/30"],"action":"reject","method":"drop"},
+                    {"ip_version":6,"action":"reject"}
                 ]}
             });
             assert!(validate_tun_config(&bridge.to_string(), "Ethernet").is_ok());
@@ -3265,6 +4072,418 @@ mod windows {
             assert!(validate_tun_config(&no_tun.to_string(), "Ethernet").is_err());
         }
 
+        fn generated_tun_fixture(
+            link: &str,
+            bridge: bool,
+            ipv6: bool,
+            naive_udp_over_tcp: bool,
+        ) -> serde_json::Value {
+            use crate::config::{
+                CaptureMode, ConfigRequest, LocalPorts, SocksBridge, TunSettings, TunUpstream,
+                VpnDnsServer,
+            };
+            use crate::domain::{
+                AppRoute, AppRouteAction, DefaultRoute, DnsPolicy, Ipv6Policy, LanPolicy,
+                RoutePolicy,
+            };
+            let node = crate::subscription::import_subscription(link.as_bytes())
+                .unwrap()
+                .nodes
+                .remove(0);
+            let policy = RoutePolicy {
+                default: DefaultRoute::Vpn,
+                apps: vec![AppRoute {
+                    process_path: r"C:\Fixture\Browser.exe".into(),
+                    process_name: None,
+                    action: AppRouteAction::Direct,
+                }],
+                lan: LanPolicy::Direct,
+                ipv6: if ipv6 {
+                    Ipv6Policy::Enabled
+                } else {
+                    Ipv6Policy::Disabled
+                },
+                dns: DnsPolicy::Vpn,
+            };
+            let request = ConfigRequest {
+                node: &node,
+                policy: &policy,
+                mode: CaptureMode::Tun(TunSettings::default()),
+                ports: LocalPorts {
+                    http: 18080,
+                    socks: 18081,
+                    health: 18082,
+                },
+                health_password: "fixture-health-secret".into(),
+                vpn_dns: Some(VpnDnsServer {
+                    server: "192.0.2.1".parse().unwrap(),
+                    server_name: "dns.example.test".into(),
+                    path: "/dns-query".into(),
+                }),
+                insecure_approval: None,
+                tun_upstream: Some(TunUpstream {
+                    interface_alias: "Ethernet".into(),
+                    ipv4_dns_server: None,
+                }),
+                naive_udp_over_tcp,
+            };
+            let config = if bridge {
+                crate::config::generate_socks_bridge_config(
+                    request,
+                    SocksBridge { server_port: 19090 },
+                )
+                .unwrap()
+            } else {
+                crate::config::generate_config(request).unwrap()
+            };
+            serde_json::from_str(config.as_str()).unwrap()
+        }
+
+        #[test]
+        fn closed_helper_schema_accepts_real_generated_protocols_and_policies() {
+            let cases = [
+                ("hysteria2://fixture-password@example.test:443?alpn=h3&obfs=salamander&obfs-password=fixture-obfs&sni=example.test", false),
+                ("naive+quic://fixture-user:fixture-pass@example.test:443", false),
+                ("vless://11111111-2222-3333-4444-555555555555@example.test:443?security=tls&type=ws&path=%2Fsocket&host=cdn.test&sni=cover.test", false),
+                ("vless://11111111-2222-3333-4444-555555555555@example.test:443?security=tls&type=grpc&serviceName=route&sni=cover.test", false),
+                ("vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&type=tcp&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2", true),
+            ];
+            for (link, bridge) in cases {
+                for ipv6 in [false, true] {
+                    let config = generated_tun_fixture(link, bridge, ipv6, false);
+                    assert_eq!(
+                        validate_tun_config(&config.to_string(), "Ethernet").unwrap(),
+                        ExpectedFamilies { ipv4: true, ipv6 }
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn helper_allows_only_exact_naive_udp_over_tcp_v2() {
+            let valid = generated_tun_fixture(
+                "naive+https://fixture-user:fixture-pass@example.test:443",
+                false,
+                true,
+                true,
+            );
+            assert_eq!(
+                valid.pointer("/outbounds/0/udp_over_tcp"),
+                Some(&serde_json::json!({"enabled":true,"version":2}))
+            );
+            assert!(validate_tun_config(&valid.to_string(), "Ethernet").is_ok());
+
+            for replacement in [
+                serde_json::json!({"enabled":false,"version":2}),
+                serde_json::json!({"enabled":true,"version":1}),
+                serde_json::json!({"enabled":true,"version":2,"extra":true}),
+                serde_json::json!({"enabled":true}),
+                serde_json::json!({"version":2}),
+                serde_json::json!(true),
+            ] {
+                let mut attack = valid.clone();
+                attack["outbounds"][0]["udp_over_tcp"] = replacement;
+                assert!(validate_tun_config(&attack.to_string(), "Ethernet").is_err());
+            }
+
+            let mut non_naive = generated_tun_fixture(
+                "hysteria2://fixture-password@example.test:443?sni=example.test",
+                false,
+                true,
+                false,
+            );
+            non_naive["outbounds"][0]["udp_over_tcp"] =
+                serde_json::json!({"enabled":true,"version":2});
+            assert!(validate_tun_config(&non_naive.to_string(), "Ethernet").is_err());
+
+            let bridge = generated_tun_fixture(
+                "vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&type=tcp&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2",
+                true,
+                true,
+                false,
+            );
+            let mut bridge_attack = bridge;
+            bridge_attack["outbounds"][0]["udp_over_tcp"] =
+                serde_json::json!({"enabled":true,"version":2});
+            assert!(validate_tun_config(&bridge_attack.to_string(), "Ethernet").is_err());
+        }
+
+        #[test]
+        fn helper_seals_pinned_dns_to_authenticated_upstream() {
+            let mut valid = generated_tun_fixture(
+                "hysteria2://fixture-password@example.test:443?sni=example.test",
+                false,
+                true,
+                false,
+            );
+            valid["dns"]["servers"][0] = serde_json::json!({
+                "type":"tcp", "tag":"bootstrap", "server":"192.0.2.53",
+                "server_port":53, "bind_interface":"Ethernet"
+            });
+            let expected: Ipv4Addr = "192.0.2.53".parse().unwrap();
+            assert!(validate_tun_config_for_upstream(
+                &valid.to_string(),
+                "Ethernet",
+                Some(expected)
+            )
+            .is_ok());
+            assert!(validate_tun_config(&valid.to_string(), "Ethernet").is_err());
+
+            for (field, replacement) in [
+                ("server", serde_json::json!("192.0.2.54")),
+                ("server_port", serde_json::json!(54)),
+                ("type", serde_json::json!("udp")),
+                ("bind_interface", serde_json::json!("Wi-Fi")),
+            ] {
+                let mut attack = valid.clone();
+                attack["dns"]["servers"][0][field] = replacement;
+                assert!(validate_tun_config_for_upstream(
+                    &attack.to_string(),
+                    "Ethernet",
+                    Some(expected)
+                )
+                .is_err());
+            }
+            let mut downgrade = valid.clone();
+            downgrade["dns"]["servers"][0] = serde_json::json!({"type":"local","tag":"bootstrap"});
+            assert!(validate_tun_config_for_upstream(
+                &downgrade.to_string(),
+                "Ethernet",
+                Some(expected)
+            )
+            .is_err());
+            let mut extra = valid.clone();
+            extra["dns"]["servers"][0]["detour"] = serde_json::json!("selected");
+            assert!(validate_tun_config_for_upstream(
+                &extra.to_string(),
+                "Ethernet",
+                Some(expected)
+            )
+            .is_err());
+
+            let mut bridge = generated_tun_fixture(
+                "vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&type=tcp&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2",
+                true,
+                true,
+                false,
+            );
+            bridge["dns"]["servers"][0] = valid["dns"]["servers"][0].clone();
+            assert!(validate_tun_config_for_upstream(
+                &bridge.to_string(),
+                "Ethernet",
+                Some(expected)
+            )
+            .is_ok());
+        }
+
+        #[test]
+        fn helper_accepts_only_bounded_ordered_tun_traffic_rule_shapes() {
+            let valid = generated_tun_fixture(
+                "hysteria2://fixture-password@example.test:443?sni=example.test",
+                false,
+                true,
+                false,
+            );
+            assert!(validate_tun_config(&valid.to_string(), "Ethernet").is_ok());
+            let traffic = valid.pointer("/route/rules/3").unwrap();
+            assert_eq!(
+                traffic,
+                &serde_json::json!({
+                    "inbound":["tun-in"], "network":["udp"], "port":443,
+                    "action":"reject", "method":"default", "no_drop":true
+                })
+            );
+
+            for (pointer, replacement) in [
+                ("/route/rules/3/inbound/0", serde_json::json!("health-in")),
+                ("/route/rules/3/network/0", serde_json::json!("icmp")),
+                ("/route/rules/3/port", serde_json::json!(53)),
+                ("/route/rules/3/action", serde_json::json!("route")),
+                ("/route/rules/3/method", serde_json::json!("drop")),
+                ("/route/rules/3/no_drop", serde_json::json!(false)),
+            ] {
+                let mut attack = valid.clone();
+                *attack.pointer_mut(pointer).unwrap() = replacement;
+                assert!(validate_tun_config(&attack.to_string(), "Ethernet").is_err());
+            }
+            for invalid_port in [
+                serde_json::json!(0),
+                serde_json::json!(65536),
+                serde_json::json!("443"),
+                serde_json::json!(443.5),
+            ] {
+                let mut attack = valid.clone();
+                attack["route"]["rules"][3]["port"] = invalid_port;
+                assert!(validate_tun_config(&attack.to_string(), "Ethernet").is_err());
+            }
+            for missing in ["port", "network", "inbound", "no_drop", "method"] {
+                let mut attack = valid.clone();
+                attack["route"]["rules"][3]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(missing);
+                assert!(validate_tun_config(&attack.to_string(), "Ethernet").is_err());
+            }
+            for networks in [serde_json::json!([]), serde_json::json!(["udp", "tcp"])] {
+                let mut attack = valid.clone();
+                attack["route"]["rules"][3]["network"] = networks;
+                assert!(validate_tun_config(&attack.to_string(), "Ethernet").is_err());
+            }
+            for inbounds in [
+                serde_json::json!(["http-in"]),
+                serde_json::json!(["tun-in", "health-in"]),
+            ] {
+                let mut attack = valid.clone();
+                attack["route"]["rules"][3]["inbound"] = inbounds;
+                assert!(validate_tun_config(&attack.to_string(), "Ethernet").is_err());
+            }
+            let mut extra = valid.clone();
+            extra["route"]["rules"][3]["process_path"] = serde_json::json!(["fixture.exe"]);
+            assert!(validate_tun_config(&extra.to_string(), "Ethernet").is_err());
+
+            let mut whole_tun_bypass = valid.clone();
+            whole_tun_bypass["route"]["rules"][3] = serde_json::json!({
+                "inbound":["tun-in"], "action":"route", "outbound":"direct"
+            });
+            assert!(validate_tun_config(&whole_tun_bypass.to_string(), "Ethernet").is_err());
+            let mut foreign_final = valid.clone();
+            foreign_final["route"]["final"] = serde_json::json!("other");
+            assert!(validate_tun_config(&foreign_final.to_string(), "Ethernet").is_err());
+
+            let mut reordered = valid.clone();
+            reordered["route"]["rules"]
+                .as_array_mut()
+                .unwrap()
+                .swap(3, 4);
+            assert!(validate_tun_config(&reordered.to_string(), "Ethernet").is_err());
+
+            let mut disabled = valid.clone();
+            disabled["route"]["rules"].as_array_mut().unwrap().remove(3);
+            assert!(validate_tun_config(&disabled.to_string(), "Ethernet").is_ok());
+            let mut late = disabled.clone();
+            late["route"]["rules"]
+                .as_array_mut()
+                .unwrap()
+                .push(traffic.clone());
+            assert!(validate_tun_config(&late.to_string(), "Ethernet").is_err());
+
+            let mut oversized = valid.clone();
+            let rule = oversized.pointer("/route/rules/3").unwrap().clone();
+            let rules = oversized["route"]["rules"].as_array_mut().unwrap();
+            for _ in 0..32 {
+                rules.insert(3, rule.clone());
+            }
+            assert!(validate_tun_config(&oversized.to_string(), "Ethernet").is_err());
+
+            let mut direct = valid.clone();
+            direct["route"]["rules"][3] = serde_json::json!({
+                "inbound":["tun-in"], "network":["tcp"], "port":8443,
+                "action":"route", "outbound":"direct"
+            });
+            assert!(validate_tun_config(&direct.to_string(), "Ethernet").is_ok());
+            direct["route"]["rules"][3]["outbound"] = serde_json::json!("selected");
+            assert!(validate_tun_config(&direct.to_string(), "Ethernet").is_ok());
+            direct["route"]["rules"][3]["outbound"] = serde_json::json!("other");
+            assert!(validate_tun_config(&direct.to_string(), "Ethernet").is_err());
+
+            let ipv4_only = generated_tun_fixture(
+                "hysteria2://fixture-password@example.test:443?sni=example.test",
+                false,
+                false,
+                false,
+            );
+            for swap in [(3, 4), (4, 5)] {
+                let mut attack = ipv4_only.clone();
+                attack["route"]["rules"]
+                    .as_array_mut()
+                    .unwrap()
+                    .swap(swap.0, swap.1);
+                assert!(validate_tun_config(&attack.to_string(), "Ethernet").is_err());
+            }
+        }
+
+        #[test]
+        fn closed_helper_schema_rejects_privileged_file_and_extension_fields() {
+            let valid = generated_tun_fixture(
+                "hysteria2://fixture-password@example.test:443?sni=example.test",
+                false,
+                true,
+                false,
+            );
+            let attacks = [
+                (
+                    "/log",
+                    "output",
+                    serde_json::json!(r"C:\Windows\fixture.log"),
+                ),
+                ("/dns", "cache_file", serde_json::json!("fixture.db")),
+                (
+                    "/dns/servers/0",
+                    "hosts_path",
+                    serde_json::json!(["fixture-hosts"]),
+                ),
+                (
+                    "/dns/servers/1/tls",
+                    "certificate_path",
+                    serde_json::json!("fixture.pem"),
+                ),
+                ("/inbounds/0", "set_system_proxy", serde_json::json!(true)),
+                ("/inbounds/2/users/0", "extension", serde_json::json!(true)),
+                (
+                    "/inbounds/3",
+                    "route_address",
+                    serde_json::json!(["0.0.0.0/0"]),
+                ),
+                ("/outbounds/0", "plugin", serde_json::json!("fixture.exe")),
+                (
+                    "/outbounds/0/tls",
+                    "key_path",
+                    serde_json::json!("fixture.key"),
+                ),
+                (
+                    "/route",
+                    "rule_set",
+                    serde_json::json!([{ "type": "local", "path": "fixture.srs" }]),
+                ),
+                (
+                    "/route/rules/0",
+                    "override_address",
+                    serde_json::json!("fixture.test"),
+                ),
+            ];
+            for (pointer, key, value) in attacks {
+                let mut config = valid.clone();
+                config
+                    .pointer_mut(pointer)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(key.into(), value);
+                assert!(
+                    validate_tun_config(&config.to_string(), "Ethernet").is_err(),
+                    "accepted extension at {pointer}/{key}"
+                );
+            }
+            for (pointer, value) in [
+                ("/inbounds/0/type", serde_json::json!("direct")),
+                ("/outbounds/0/type", serde_json::json!("ssh")),
+                ("/dns/servers/0/type", serde_json::json!("hosts")),
+                (
+                    "/outbounds/0/password",
+                    serde_json::json!({ "path": "fixture.secret" }),
+                ),
+                ("/inbounds/0/listen_port", serde_json::json!(70000)),
+                ("/outbounds/0/tls/enabled", serde_json::json!("true")),
+            ] {
+                let mut config = valid.clone();
+                *config.pointer_mut(pointer).unwrap() = value;
+                assert!(
+                    validate_tun_config(&config.to_string(), "Ethernet").is_err(),
+                    "accepted invalid field at {pointer}"
+                );
+            }
+        }
+
         #[test]
         fn duplicated_config_path_must_resolve_to_a_generated_session() {
             let root = std::env::temp_dir().join(format!(
@@ -3274,9 +4493,11 @@ mod windows {
             let sessions = root.join("sessions");
             let config = SessionConfig::create(&sessions, "{}").unwrap();
             let guard = config.revalidate_for_launch().unwrap();
+            // Hosted Windows may expose TEMP through an 8.3 alias while the
+            // handle-derived path expands it. Compare the actual directories.
             assert_eq!(
-                protected_config_directory(&guard).unwrap(),
-                config.path().parent().unwrap()
+                fs::canonicalize(protected_config_directory(&guard).unwrap()).unwrap(),
+                fs::canonicalize(config.path().parent().unwrap()).unwrap()
             );
             let mut journal = TunJournal::create(
                 config.path().parent().unwrap(),
@@ -3361,6 +4582,7 @@ mod windows {
                 tunnel_type: TUNNEL_TYPE_NONE,
                 physical_address_length: physical,
                 oper_status: IfOperStatusUp,
+                ipv4_dns_servers: Vec::new(),
             }
         }
 
@@ -3410,22 +4632,110 @@ mod windows {
 
         #[test]
         fn physical_upstream_requires_the_exact_active_hardware_default() {
-            let ethernet = adapter(7, "Ethernet", IF_TYPE_ETHERNET_CSMACD, 6);
+            let mut ethernet = adapter(7, "Ethernet", IF_TYPE_ETHERNET_CSMACD, 6);
+            ethernet.ipv4_dns_servers =
+                vec!["192.0.2.53".parse().unwrap(), "192.0.2.54".parse().unwrap()];
             assert_eq!(
                 physical_upstream_from(std::slice::from_ref(&ethernet), 7),
                 Some(TunUpstreamIdentity {
                     interface_luid: 7,
                     interface_index: 7,
                     interface_alias: "Ethernet".into(),
+                    ipv4_dns_server: Some("192.0.2.53".parse().unwrap()),
                 })
             );
             assert!(physical_upstream_from(std::slice::from_ref(&ethernet), 8).is_none());
+
+            let expected = physical_upstream_from(std::slice::from_ref(&ethernet), 7).unwrap();
+            let mut omitted = expected.clone();
+            omitted.ipv4_dns_server = None;
+            assert!(
+                exact_upstream_adapter(std::slice::from_ref(&ethernet), &omitted, true).is_none()
+            );
+            let mut refreshed = ethernet.clone();
+            refreshed.ipv4_dns_servers = vec!["192.0.2.54".parse().unwrap()];
+            assert!(
+                exact_upstream_adapter(std::slice::from_ref(&refreshed), &expected, true).is_none()
+            );
+            assert!(
+                exact_upstream_adapter(std::slice::from_ref(&refreshed), &expected, false)
+                    .is_some()
+            );
 
             let mut down = ethernet.clone();
             down.oper_status = 2;
             assert!(physical_upstream_from(&[down], 7).is_none());
             let tunnel = adapter(9, "xray_tun", IF_TYPE_TUNNEL, 0);
             assert!(physical_upstream_from(&[tunnel], 9).is_none());
+        }
+
+        #[test]
+        fn physical_dns_filter_rejects_unsafe_ipv4_addresses() {
+            for rejected in ["0.0.0.0", "127.0.0.1", "224.0.0.1", "255.255.255.255"] {
+                assert!(!usable_ipv4_dns(rejected.parse().unwrap()));
+            }
+            for accepted in ["169.254.1.1", "192.0.2.53", "8.8.8.8"] {
+                assert!(usable_ipv4_dns(accepted.parse().unwrap()));
+            }
+        }
+
+        #[test]
+        fn physical_dns_sockaddr_parser_is_length_family_and_byte_order_strict() {
+            let mut ipv4: SOCKADDR_IN = unsafe { std::mem::zeroed() };
+            ipv4.sin_family = AF_INET;
+            ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes([192, 0, 2, 53]);
+            let pointer = std::ptr::from_ref(&ipv4).cast::<SOCKADDR>();
+            assert_eq!(
+                unsafe { ipv4_dns_from_sockaddr(pointer, size_of::<SOCKADDR_IN>() as i32) },
+                Some("192.0.2.53".parse().unwrap())
+            );
+            for length in [-1, 0, size_of::<SOCKADDR_IN>() as i32 - 1] {
+                assert_eq!(unsafe { ipv4_dns_from_sockaddr(pointer, length) }, None);
+            }
+            assert_eq!(
+                unsafe {
+                    ipv4_dns_from_sockaddr(std::ptr::null(), size_of::<SOCKADDR_IN>() as i32)
+                },
+                None
+            );
+
+            let mut ipv6: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
+            ipv6.sin6_family = AF_INET6;
+            assert_eq!(
+                unsafe {
+                    ipv4_dns_from_sockaddr(
+                        std::ptr::from_ref(&ipv6).cast::<SOCKADDR>(),
+                        size_of::<SOCKADDR_IN6>() as i32,
+                    )
+                },
+                None
+            );
+
+            let mut second: SOCKADDR_IN = unsafe { std::mem::zeroed() };
+            second.sin_family = AF_INET;
+            second.sin_addr.S_un.S_addr = u32::from_ne_bytes([192, 0, 2, 54]);
+            let mut ordered = Vec::new();
+            unsafe {
+                push_ipv4_dns_from_sockaddr(
+                    &mut ordered,
+                    std::ptr::from_ref(&ipv6).cast::<SOCKADDR>(),
+                    size_of::<SOCKADDR_IN6>() as i32,
+                );
+                push_ipv4_dns_from_sockaddr(&mut ordered, pointer, size_of::<SOCKADDR_IN>() as i32);
+                push_ipv4_dns_from_sockaddr(&mut ordered, pointer, size_of::<SOCKADDR_IN>() as i32);
+                push_ipv4_dns_from_sockaddr(
+                    &mut ordered,
+                    std::ptr::from_ref(&second).cast::<SOCKADDR>(),
+                    size_of::<SOCKADDR_IN>() as i32,
+                );
+            }
+            assert_eq!(
+                ordered,
+                vec![
+                    "192.0.2.53".parse::<Ipv4Addr>().unwrap(),
+                    "192.0.2.54".parse::<Ipv4Addr>().unwrap()
+                ]
+            );
         }
 
         #[test]
@@ -3611,6 +4921,7 @@ mod windows {
                 interface_luid: 7,
                 interface_index: 9,
                 interface_alias: "Ethernet".into(),
+                ipv4_dns_server: None,
             };
             let base = preflight_digest(&"01".repeat(32), &"02".repeat(32), &upstream);
             assert_ne!(
@@ -3630,6 +4941,7 @@ mod windows {
                         interface_luid: 8,
                         interface_index: 9,
                         interface_alias: "Ethernet".into(),
+                        ipv4_dns_server: None,
                     },
                 )
             );

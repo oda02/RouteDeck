@@ -11,7 +11,8 @@
     "dev": "vite",
     "build": "tsc && vite build && node tests/assert-production-bundle.mjs",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test:browser-ui": "node scripts/test-browser-ui.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",
@@ -23,6 +24,7 @@
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.5",
     "@vitejs/plugin-react": "6.1.1",
+    "playwright": "1.62.1",
     "typescript": "7.0.2",
     "vite": "8.2.2"
   }

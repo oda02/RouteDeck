@@ -1,18 +1,20 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    app_instance::AppInstanceGuard,
     config::{
-        generate_config, generate_socks_bridge_config, CaptureMode, ConfigRequest, SocksBridge,
-        TunSettings, TunUpstream,
+        default_tun_traffic_rules, generate_config, generate_socks_bridge_config,
+        validate_tun_traffic_rules, CaptureMode, ConfigRequest, SocksBridge, TunSettings, TunStack,
+        TunTrafficRule, TunUpstream,
     },
     domain::{
         AppRoute, AppRouteAction, DefaultRoute, DnsPolicy, Ipv6Policy, LanPolicy, Node,
@@ -32,8 +34,13 @@ use crate::{
         HttpsSubscriptionFetcher, SubscriptionFetchError, SubscriptionFetchErrorKind,
         SubscriptionFetchStage, SubscriptionFetcher,
     },
-    subscription_store::SubscriptionStore,
-    system_proxy::{SystemProxyControl, SystemProxyManager, SystemProxyRestoreOutcome},
+    subscription_store::{
+        valid_source_name, validate_sources, SourceKind, StoredSource, SubscriptionStore,
+        LEGACY_SOURCE_ID, MAX_LIBRARY_NODES,
+    },
+    system_proxy::{
+        SystemProxyControl, SystemProxyDiagnostics, SystemProxyManager, SystemProxyRestoreOutcome,
+    },
     tun_helper::{reconcile_stale_tun_sessions, select_physical_upstream, TunUpstreamIdentity},
     xray_config::{generate_xray_bridge_config, XrayBridgeRequest},
 };
@@ -121,6 +128,8 @@ pub struct RuntimeStatus {
     pub node_id: Option<String>,
     pub ports: Option<PublicPorts>,
     pub route_check_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steady_latency_ms: Option<u64>,
     pub engine_version: Option<String>,
     pub proofs: Vec<ProofRow>,
     pub error: Option<PublicError>,
@@ -137,6 +146,7 @@ impl Default for RuntimeStatus {
             node_id: None,
             ports: None,
             route_check_ms: None,
+            steady_latency_ms: None,
             engine_version: None,
             proofs: default_proofs(),
             error: None,
@@ -226,6 +236,16 @@ pub struct PreviewNode {
     pub display_name: String,
     pub protocol: ProtocolKind,
     pub insecure_tls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<SourceKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_refreshable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_updated_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -246,12 +266,15 @@ pub struct ConfirmedImport {
 pub struct Diagnostics {
     pub status: RuntimeStatus,
     pub lines: Vec<String>,
+    pub system_proxy: SystemProxyDiagnostics,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SystemProxyRouting {
     pub default_route: DefaultRoute,
+    #[serde(default)]
+    pub naive_udp_over_tcp: bool,
     #[serde(default)]
     pub apps: Vec<SystemProxyAppRoute>,
 }
@@ -261,7 +284,13 @@ pub struct SystemProxyRouting {
 pub struct TunRouting {
     pub default_route: DefaultRoute,
     #[serde(default)]
+    pub naive_udp_over_tcp: bool,
+    #[serde(default)]
     pub apps: Vec<SystemProxyAppRoute>,
+    #[serde(default)]
+    pub stack: TunStack,
+    #[serde(default = "default_tun_traffic_rules")]
+    pub traffic_rules: Vec<TunTrafficRule>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -355,6 +384,7 @@ pub(crate) trait EngineProvider: Send + Sync {
                 interface_luid: 7,
                 interface_index: 9,
                 interface_alias: "Ethernet".into(),
+                ipv4_dns_server: None,
             })
         }
         #[cfg(not(test))]
@@ -473,6 +503,7 @@ impl Drop for RealityProcessPair {
 }
 
 struct RuntimeServices {
+    recover_sessions: fn(&Path) -> Result<(), RuntimeError>,
     engine: Arc<dyn EngineProvider>,
     listener: Arc<dyn ListenerVerifier>,
     prober: Arc<dyn TrafficProber>,
@@ -481,9 +512,15 @@ struct RuntimeServices {
     tun_privilege: Arc<dyn TunPrivilegeControl>,
 }
 
+fn reconcile_all_sessions(root: &Path) -> Result<(), RuntimeError> {
+    reconcile_stale_tun_sessions(root).and_then(|_| reconcile_stale_sessions(root))
+}
+
 struct PendingImport {
     report: ImportReport,
     source_content: String,
+    source_kind: SourceKind,
+    source_url: Option<String>,
 }
 
 const MAX_PENDING_IMPORT_PREVIEWS: usize = 4;
@@ -519,6 +556,8 @@ impl PreviewSlot {
         preview_id: String,
         report: ImportReport,
         source_content: String,
+        source_kind: SourceKind,
+        source_url: Option<String>,
     ) -> Result<(), PublicError> {
         let mut state = self
             .state
@@ -538,6 +577,8 @@ impl PreviewSlot {
             PendingImport {
                 report,
                 source_content,
+                source_kind,
+                source_url,
             },
         );
         Ok(())
@@ -560,6 +601,9 @@ impl Drop for PreviewSlot {
 struct StoredNode {
     node: Node,
     config_identity: String,
+    source_id: String,
+    source_name: String,
+    source_kind: SourceKind,
 }
 
 struct ActiveSession {
@@ -571,6 +615,9 @@ struct ActiveSession {
     mode: RuntimeMode,
     default_route: DefaultRoute,
     routing: RoutePolicy,
+    tun_stack: Option<TunStack>,
+    tun_traffic_rules: Option<Vec<TunTrafficRule>>,
+    naive_udp_over_tcp: bool,
     system_proxy_requires_restore: bool,
     ports: crate::config::LocalPorts,
     health_route: HealthRoute,
@@ -585,6 +632,7 @@ struct ActiveSession {
 struct State {
     nodes: HashMap<String, StoredNode>,
     node_order: Vec<String>,
+    sources: Vec<StoredSource>,
     pending: HashMap<String, PendingImport>,
     preview_inflight: usize,
     active: Option<ActiveSession>,
@@ -597,12 +645,15 @@ type EventSink = Arc<dyn Fn(RuntimeStatus) + Send + Sync>;
 
 pub struct ApplicationController {
     state: Arc<Mutex<State>>,
+    published_status: Mutex<RuntimeStatus>,
     operation: Mutex<()>,
     services: RuntimeServices,
     session_root: PathBuf,
     subscription_store: Option<SubscriptionStore>,
     diagnostics: Arc<Mutex<DiagnosticBuffer>>,
     event_sink: Mutex<Option<EventSink>>,
+    // Drop the lease after the session state and its owned child handles.
+    _instance_guard: Option<AppInstanceGuard>,
 }
 
 impl ApplicationController {
@@ -631,9 +682,25 @@ impl ApplicationController {
         system_proxy: Arc<dyn SystemProxyControl>,
         expected_tun_helper_sha256: Option<&'static str>,
     ) -> Result<Arc<Self>, RuntimeError> {
-        let engine_recovery_error = reconcile_stale_tun_sessions(&session_root)
-            .and_then(|_| reconcile_stale_sessions(&session_root))
-            .err();
+        Self::production_with_recovery(
+            session_root,
+            event_sink,
+            system_proxy,
+            expected_tun_helper_sha256,
+            reconcile_all_sessions,
+        )
+    }
+
+    fn production_with_recovery(
+        session_root: PathBuf,
+        event_sink: EventSink,
+        system_proxy: Arc<dyn SystemProxyControl>,
+        expected_tun_helper_sha256: Option<&'static str>,
+        recover_sessions: fn(&Path) -> Result<(), RuntimeError>,
+    ) -> Result<Arc<Self>, RuntimeError> {
+        let instance_guard =
+            AppInstanceGuard::acquire(session_root.parent().unwrap_or(&session_root))?;
+        let engine_recovery_error = recover_sessions(&session_root).err();
         let proxy_recovery_error = system_proxy.reconcile_stale_journal().err();
         let subscription_store = SubscriptionStore::new(
             session_root
@@ -653,6 +720,8 @@ impl ApplicationController {
             system_proxy,
         );
         controller.subscription_store = Some(subscription_store);
+        controller.services.recover_sessions = recover_sessions;
+        controller._instance_guard = Some(instance_guard);
         controller.restore_persisted_subscription();
         let controller = Arc::new(controller);
         if engine_recovery_error.is_some() || proxy_recovery_error.is_some() {
@@ -726,7 +795,7 @@ impl ApplicationController {
         subscription_fetcher: Arc<dyn SubscriptionFetcher>,
         system_proxy: Arc<dyn SystemProxyControl>,
     ) -> Self {
-        Self::with_services_and_controls(
+        let mut controller = Self::with_services_and_controls(
             session_root,
             event_sink,
             engine,
@@ -734,7 +803,11 @@ impl ApplicationController {
             prober,
             subscription_fetcher,
             system_proxy,
-        )
+        );
+        // Unit fixtures own only their temporary files. Production TUN recovery
+        // inspects host adapters and must never participate in these tests.
+        controller.services.recover_sessions = reconcile_stale_sessions;
+        controller
     }
 
     fn with_services_and_controls(
@@ -748,8 +821,10 @@ impl ApplicationController {
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(State::default())),
+            published_status: Mutex::new(RuntimeStatus::default()),
             operation: Mutex::new(()),
             services: RuntimeServices {
+                recover_sessions: reconcile_all_sessions,
                 engine,
                 listener,
                 prober,
@@ -761,6 +836,7 @@ impl ApplicationController {
             subscription_store: None,
             diagnostics: Arc::new(Mutex::new(DiagnosticBuffer::default())),
             event_sink: Mutex::new(Some(event_sink)),
+            _instance_guard: None,
         }
     }
 
@@ -768,37 +844,41 @@ impl ApplicationController {
         let Some(store) = &self.subscription_store else {
             return;
         };
-        let restored = store
-            .load()
-            .and_then(|content| {
-                content
-                    .map(|content| {
-                        import_subscription(content.as_bytes()).map_err(|_| {
-                            std::io::Error::new(
+        let restored = store.load().and_then(|sources| {
+            sources
+                .map(|sources| {
+                    let mut nodes = Vec::new();
+                    for source in &sources {
+                        let report =
+                            import_subscription(source.content.as_bytes()).map_err(|_| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "stored subscription content was rejected",
+                                )
+                            })?;
+                        if nodes.len() + report.nodes.len() > MAX_LIBRARY_NODES {
+                            return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
-                                "stored subscription content was rejected",
-                            )
-                        })
-                    })
-                    .transpose()
-            })
-            .and_then(|report| {
-                report
-                    .map(|report| {
-                        prepare_stored_nodes(report.nodes).map_err(|_| {
+                                "stored library contains too many nodes",
+                            ));
+                        }
+                        nodes.extend(prepare_stored_nodes(report.nodes, source).map_err(|_| {
                             std::io::Error::other("could not restore stored subscription")
-                        })
-                    })
-                    .transpose()
-            });
+                        })?);
+                    }
+                    Ok((sources, nodes))
+                })
+                .transpose()
+        });
 
         match restored {
-            Ok(Some(nodes)) => {
+            Ok(Some((sources, nodes))) => {
                 let count = nodes.len();
                 let node_order = nodes.iter().map(|(id, _)| id.clone()).collect();
                 let mut state = self.lock_state();
                 state.nodes = nodes.into_iter().collect();
                 state.node_order = node_order;
+                state.sources = sources;
                 drop(state);
                 self.diagnostics
                     .lock()
@@ -829,6 +909,20 @@ impl ApplicationController {
                     display_name: safe_preview_name(&stored.node, protocol, index),
                     protocol,
                     insecure_tls: stored.node.requires_insecure_approval(),
+                    source_id: Some(stored.source_id.clone()),
+                    source_name: Some(stored.source_name.clone()),
+                    source_kind: Some(stored.source_kind),
+                    source_refreshable: Some(
+                        state
+                            .sources
+                            .iter()
+                            .any(|source| source.id == stored.source_id && source.url.is_some()),
+                    ),
+                    source_updated_at_ms: state
+                        .sources
+                        .iter()
+                        .find(|source| source.id == stored.source_id)
+                        .and_then(|source| source.updated_at_ms),
                 }
             })
             .collect()
@@ -852,7 +946,7 @@ impl ApplicationController {
                 Redactor::default().redact(&error.to_string()),
             )
         })?;
-        self.commit_import_preview(slot, report, content)
+        self.commit_import_preview(slot, report, content, SourceKind::Manual, None)
     }
 
     pub fn preview_import_url(&self, url: String) -> Result<ImportPreview, PublicError> {
@@ -869,6 +963,7 @@ impl ApplicationController {
         url: String,
         slot: PreviewSlot,
     ) -> Result<ImportPreview, PublicError> {
+        crate::subscription_fetch::validate_url(&url).map_err(public_subscription_fetch_error)?;
         let content = self
             .services
             .subscription_fetcher
@@ -881,7 +976,7 @@ impl ApplicationController {
                 "subscription.content.rejected",
             )
         })?;
-        self.commit_import_preview(slot, report, content)
+        self.commit_import_preview(slot, report, content, SourceKind::Subscription, Some(url))
     }
 
     fn commit_import_preview(
@@ -889,11 +984,13 @@ impl ApplicationController {
         slot: PreviewSlot,
         report: ImportReport,
         source_content: String,
+        source_kind: SourceKind,
+        source_url: Option<String>,
     ) -> Result<ImportPreview, PublicError> {
         let preview_id =
             random_hex(16).map_err(|error| public_runtime_error(error, &Redactor::default()))?;
         let preview = preview_from_report(&preview_id, &report);
-        slot.commit(preview_id, report, source_content)?;
+        slot.commit(preview_id, report, source_content, source_kind, source_url)?;
         Ok(preview)
     }
 
@@ -908,19 +1005,27 @@ impl ApplicationController {
     }
 
     pub fn confirm_import(&self, preview_id: &str) -> Result<ConfirmedImport, PublicError> {
+        self.confirm_import_named(preview_id, None)
+    }
+
+    pub fn confirm_import_named(
+        &self,
+        preview_id: &str,
+        source_name: Option<&str>,
+    ) -> Result<ConfirmedImport, PublicError> {
         let mut state = self.lock_state();
         if state.recovery_required {
             return Err(PublicError::fixed(
                 PublicErrorCode::RecoveryRequired,
                 PublicErrorStage::Import,
-                "Import replacement is blocked until session recovery completes",
+                "Import is blocked until session recovery completes",
             ));
         }
         if state.active.is_some() {
             return Err(PublicError::fixed(
                 PublicErrorCode::ActiveSessionConflict,
                 PublicErrorStage::Import,
-                "Stop the active local proxy before replacing imported nodes",
+                "Stop the active local proxy before adding imported nodes",
             ));
         }
         if state.pending.is_empty() {
@@ -944,13 +1049,65 @@ impl ApplicationController {
                 "No import preview is pending",
             )
         })?;
-        let prepared = prepare_stored_nodes(pending.report.nodes.clone())?;
+        if pending.report.nodes.is_empty() {
+            return Err(source_import_error("subscription.content.rejected"));
+        }
+        let ordinal = state
+            .sources
+            .iter()
+            .filter(|source| source.kind == pending.source_kind)
+            .count()
+            + 1;
+        let source_name = match source_name.map(str::trim).filter(|name| !name.is_empty()) {
+            Some(name)
+                if valid_source_name(name)
+                    && pending.report.nodes.iter().all(|node| {
+                        Redactor::from_nodes(std::slice::from_ref(node)).redact(name) == name
+                    }) =>
+            {
+                name.to_owned()
+            }
+            Some(_) => {
+                return Err(PublicError::fixed(
+                    PublicErrorCode::ImportRejected,
+                    PublicErrorStage::Import,
+                    "import.source_name.invalid",
+                ))
+            }
+            None => match pending.source_kind {
+                SourceKind::Subscription => format!("Подписка {ordinal}"),
+                SourceKind::Manual => format!("Добавленные вручную {ordinal}"),
+            },
+        };
+        let source = StoredSource {
+            id: random_hex(16)
+                .map_err(|error| public_runtime_error(error, &Redactor::default()))?,
+            name: source_name,
+            kind: pending.source_kind,
+            content: pending.source_content.clone(),
+            url: pending.source_url.clone(),
+            updated_at_ms: Some(subscription_timestamp_ms()),
+            revision: 0,
+            node_ids: Vec::new(),
+        };
+        let mut sources = state.sources.clone();
+        sources.push(source.clone());
+        if validate_sources(&sources).is_err()
+            || state.nodes.len() + pending.report.nodes.len() > MAX_LIBRARY_NODES
+        {
+            return Err(PublicError::fixed(
+                PublicErrorCode::ImportRejected,
+                PublicErrorStage::Import,
+                "import.library.limit",
+            ));
+        }
+        let prepared = prepare_stored_nodes(pending.report.nodes.clone(), &source)?;
         let node_ids = prepared
             .iter()
             .map(|(node_id, _)| node_id.clone())
             .collect::<Vec<_>>();
         if let Some(store) = &self.subscription_store {
-            store.save(&pending.source_content).map_err(|_| {
+            store.save(&sources).map_err(|_| {
                 PublicError::fixed(
                     PublicErrorCode::RuntimeFailure,
                     PublicErrorStage::SessionStorage,
@@ -959,12 +1116,178 @@ impl ApplicationController {
             })?;
         }
         state.pending.remove(&key);
-        state.nodes = prepared.into_iter().collect();
-        state.node_order = node_ids.clone();
+        state.nodes.extend(prepared);
+        state.node_order.extend(node_ids.clone());
+        state.sources = sources;
         Ok(ConfirmedImport {
             imported: node_ids.len(),
             node_ids,
         })
+    }
+
+    pub fn refresh_source(
+        &self,
+        source_id: &str,
+        url: Option<&str>,
+    ) -> Result<ConfirmedImport, PublicError> {
+        let slot = self.reserve_preview_slot()?;
+        self.refresh_source_reserved(source_id, url, slot)
+    }
+
+    pub(crate) fn refresh_source_reserved(
+        &self,
+        source_id: &str,
+        url: Option<&str>,
+        _slot: PreviewSlot,
+    ) -> Result<ConfirmedImport, PublicError> {
+        validate_source_id(source_id)?;
+        // Share the bounded fetch budget with previews. No state lock is held
+        // during network I/O; a concurrent removal or refresh wins over this
+        // stale snapshot and cannot be undone by the completed request.
+        let original = {
+            let state = self.lock_state();
+            ensure_source_mutation_allowed(&state, source_id)?;
+            state
+                .sources
+                .iter()
+                .find(|source| source.id == source_id)
+                .cloned()
+                .ok_or_else(|| source_import_error("subscription.source_missing"))?
+        };
+        if original.kind != SourceKind::Subscription {
+            return Err(source_import_error("subscription.refresh_manual"));
+        }
+        let url = url
+            .or(original.url.as_deref())
+            .ok_or_else(|| source_import_error("subscription.url_required"))?;
+        crate::subscription_fetch::validate_url(url).map_err(public_subscription_fetch_error)?;
+        let content = self
+            .services
+            .subscription_fetcher
+            .fetch(url)
+            .map_err(public_subscription_fetch_error)?;
+        let report = import_subscription(content.as_bytes())
+            .map_err(|_| source_import_error("subscription.content.rejected"))?;
+        if report.nodes.is_empty() || !report.rejected.is_empty() {
+            return Err(source_import_error("subscription.refresh_incomplete"));
+        }
+        let mut state = self.lock_state();
+        ensure_source_mutation_allowed(&state, source_id)?;
+        let index = state
+            .sources
+            .iter()
+            .position(|source| source.id == source_id)
+            .ok_or_else(|| source_import_error("subscription.source_changed"))?;
+        if state.sources[index] != original {
+            return Err(source_import_error("subscription.source_changed"));
+        }
+        let mut existing_ids: HashMap<String, VecDeque<String>> = HashMap::new();
+        let mut old_count = 0;
+        for id in &state.node_order {
+            if let Some(stored) = state
+                .nodes
+                .get(id)
+                .filter(|stored| stored.source_id == source_id)
+            {
+                old_count += 1;
+                existing_ids
+                    .entry(stored.node.update_key().to_owned())
+                    .or_default()
+                    .push_back(id.clone());
+            }
+        }
+        let mut replacement = original.clone();
+        replacement.node_ids = report
+            .nodes
+            .iter()
+            .map(|node| {
+                existing_ids
+                    .get_mut(node.update_key())
+                    .and_then(VecDeque::pop_front)
+                    .map(Ok)
+                    .unwrap_or_else(|| {
+                        random_hex(16)
+                            .map(|id| format!("{source_id}-{id}"))
+                            .map_err(|error| public_runtime_error(error, &Redactor::default()))
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        replacement.content = content;
+        replacement.url = Some(url.to_owned());
+        replacement.updated_at_ms = Some(subscription_timestamp_ms());
+        replacement.revision = original
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| source_import_error("subscription.source_changed"))?;
+        let mut sources = state.sources.clone();
+        sources[index] = replacement.clone();
+        if validate_sources(&sources).is_err()
+            || state.nodes.len() - old_count + report.nodes.len() > MAX_LIBRARY_NODES
+        {
+            return Err(source_import_error("import.library.limit"));
+        }
+        let prepared = prepare_stored_nodes(report.nodes, &replacement)?;
+        let node_ids: Vec<_> = prepared.iter().map(|(id, _)| id.clone()).collect();
+        if let Some(store) = &self.subscription_store {
+            store.save(&sources).map_err(|_| source_storage_error())?;
+        }
+        let insertion = state
+            .node_order
+            .iter()
+            .position(|id| {
+                state
+                    .nodes
+                    .get(id)
+                    .is_some_and(|stored| stored.source_id == source_id)
+            })
+            .unwrap_or(state.node_order.len());
+        state
+            .nodes
+            .retain(|_, stored| stored.source_id != source_id);
+        let mut order: Vec<_> = state
+            .node_order
+            .iter()
+            .filter(|id| state.nodes.contains_key(*id))
+            .cloned()
+            .collect();
+        order.splice(insertion..insertion, node_ids.clone());
+        state.node_order = order;
+        state.nodes.extend(prepared);
+        state.sources = sources;
+        Ok(ConfirmedImport {
+            imported: node_ids.len(),
+            node_ids,
+        })
+    }
+
+    pub fn remove_source(&self, source_id: &str) -> Result<(), PublicError> {
+        validate_source_id(source_id)?;
+        let mut state = self.lock_state();
+        ensure_source_mutation_allowed(&state, source_id)?;
+        if !state.sources.iter().any(|source| source.id == source_id) {
+            return Ok(());
+        }
+        let sources: Vec<_> = state
+            .sources
+            .iter()
+            .filter(|source| source.id != source_id)
+            .cloned()
+            .collect();
+        if let Some(store) = &self.subscription_store {
+            store.save(&sources).map_err(|_| source_storage_error())?;
+        }
+        state
+            .nodes
+            .retain(|_, stored| stored.source_id != source_id);
+        let order = state
+            .node_order
+            .iter()
+            .filter(|id| state.nodes.contains_key(*id))
+            .cloned()
+            .collect();
+        state.node_order = order;
+        state.sources = sources;
+        Ok(())
     }
 
     pub fn reset_local_state(&self) -> Result<(), PublicError> {
@@ -991,6 +1314,7 @@ impl ApplicationController {
         }
         state.nodes.clear();
         state.node_order.clear();
+        state.sources.clear();
         state.pending.clear();
         Ok(())
     }
@@ -1187,6 +1511,9 @@ impl ApplicationController {
             config_identity,
             policy,
             RuntimeMode::LocalOnly,
+            None,
+            None,
+            false,
             redactor.clone(),
         );
         if let Err(error) = result {
@@ -1257,6 +1584,7 @@ impl ApplicationController {
         node_id: &str,
         routing: SystemProxyRouting,
     ) -> Result<RuntimeStatus, PublicError> {
+        let requested_naive_udp_over_tcp = routing.naive_udp_over_tcp;
         let policy = routing.into_policy();
         policy.validate().map_err(|_| {
             PublicError::fixed(
@@ -1270,6 +1598,11 @@ impl ApplicationController {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut state = self.lock_state();
+        let naive_udp_over_tcp = requested_naive_udp_over_tcp
+            && state
+                .nodes
+                .get(node_id)
+                .is_some_and(|stored| matches!(stored.node.protocol(), NodeProtocol::Naive(_)));
         if state.shutting_down {
             return Err(PublicError::fixed(
                 PublicErrorCode::RuntimeFailure,
@@ -1289,6 +1622,7 @@ impl ApplicationController {
                 active.mode == RuntimeMode::SystemProxy
                     && active.node_id == node_id
                     && active.routing == policy
+                    && active.naive_udp_over_tcp == naive_udp_over_tcp
                     && state
                         .nodes
                         .get(node_id)
@@ -1327,6 +1661,7 @@ impl ApplicationController {
                 active.mode == RuntimeMode::SystemProxy
                     && active.node_id == node_id
                     && active.routing == policy
+                    && active.naive_udp_over_tcp == naive_udp_over_tcp
             });
             if !still_exact {
                 return Err(PublicError::fixed(
@@ -1409,13 +1744,19 @@ impl ApplicationController {
             stored.config_identity,
             policy,
             RuntimeMode::SystemProxy,
+            None,
+            None,
+            naive_udp_over_tcp,
             redactor.clone(),
         );
         let Err(error) = result else {
             return Ok(state.status.clone());
         };
 
-        let proxy_may_be_published = state.status.phase == RuntimePhase::ApplyingSystemProxy;
+        let proxy_may_be_published = state
+            .active
+            .as_ref()
+            .is_some_and(|active| active.system_proxy_requires_restore);
         Self::mark_failed_proof(&mut state, error.stage());
         self.record_runtime_failure(&error, &redactor);
         self.update_status(
@@ -1492,6 +1833,16 @@ impl ApplicationController {
         node_id: &str,
         routing: TunRouting,
     ) -> Result<RuntimeStatus, PublicError> {
+        let stack = routing.stack;
+        let traffic_rules = routing.traffic_rules.clone();
+        let requested_naive_udp_over_tcp = routing.naive_udp_over_tcp;
+        validate_tun_traffic_rules(&traffic_rules).map_err(|_| {
+            PublicError::fixed(
+                PublicErrorCode::RuntimeFailure,
+                PublicErrorStage::Start,
+                "TUN traffic rules are invalid",
+            )
+        })?;
         let policy = routing.into_policy();
         policy.validate().map_err(|_| {
             PublicError::fixed(
@@ -1520,6 +1871,11 @@ impl ApplicationController {
             ));
         }
         let mut state = self.lock_state();
+        let naive_udp_over_tcp = requested_naive_udp_over_tcp
+            && state
+                .nodes
+                .get(node_id)
+                .is_some_and(|stored| matches!(stored.node.protocol(), NodeProtocol::Naive(_)));
         if state.shutting_down {
             return Err(PublicError::fixed(
                 PublicErrorCode::RuntimeFailure,
@@ -1539,6 +1895,9 @@ impl ApplicationController {
                 active.mode == RuntimeMode::Tun
                     && active.node_id == node_id
                     && active.routing == policy
+                    && active.tun_stack == Some(stack)
+                    && active.tun_traffic_rules.as_deref() == Some(traffic_rules.as_slice())
+                    && active.naive_udp_over_tcp == naive_udp_over_tcp
                     && state
                         .nodes
                         .get(node_id)
@@ -1578,6 +1937,9 @@ impl ApplicationController {
                 active.mode == RuntimeMode::Tun
                     && active.node_id == node_id
                     && active.routing == policy
+                    && active.tun_stack == Some(stack)
+                    && active.tun_traffic_rules.as_deref() == Some(traffic_rules.as_slice())
+                    && active.naive_udp_over_tcp == naive_udp_over_tcp
             });
             if !still_exact {
                 return Err(PublicError::fixed(
@@ -1690,6 +2052,9 @@ impl ApplicationController {
             stored.config_identity,
             policy,
             RuntimeMode::Tun,
+            Some(stack),
+            Some(traffic_rules),
+            naive_udp_over_tcp,
             redactor.clone(),
         );
         let Err(error) = result else {
@@ -1766,6 +2131,9 @@ impl ApplicationController {
         config_identity: String,
         policy: RoutePolicy,
         mode: RuntimeMode,
+        tun_stack: Option<TunStack>,
+        tun_traffic_rules: Option<Vec<TunTrafficRule>>,
+        naive_udp_over_tcp: bool,
         redactor: Redactor,
     ) -> Result<(), RuntimeError> {
         let session_id = random_hex(16)?;
@@ -1793,15 +2161,35 @@ impl ApplicationController {
         let capture_mode = match mode {
             RuntimeMode::LocalOnly => CaptureMode::LocalProxy,
             RuntimeMode::SystemProxy => CaptureMode::SystemProxy,
-            RuntimeMode::Tun => CaptureMode::Tun(TunSettings::default()),
+            RuntimeMode::Tun => CaptureMode::Tun(TunSettings {
+                stack: tun_stack.unwrap_or_default(),
+                traffic_rules: tun_traffic_rules
+                    .clone()
+                    .unwrap_or_else(default_tun_traffic_rules),
+                ..TunSettings::default()
+            }),
         };
         let tun_upstream_identity = if mode == RuntimeMode::Tun {
             Some(self.services.engine.select_tun_upstream()?)
         } else {
             None
         };
+        if let Some(upstream) = &tun_upstream_identity {
+            self.diagnostics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(
+                    if upstream.ipv4_dns_server.is_some() {
+                        "tun_dns=physical_ipv4_tcp"
+                    } else {
+                        "tun_dns=local_fallback_no_ipv4"
+                    }
+                    .into(),
+                );
+        }
         let tun_upstream = tun_upstream_identity.as_ref().map(|upstream| TunUpstream {
             interface_alias: upstream.interface_alias.clone(),
+            ipv4_dns_server: upstream.ipv4_dns_server,
         });
         let request = || ConfigRequest {
             node,
@@ -1812,6 +2200,7 @@ impl ApplicationController {
             vpn_dns: None,
             insecure_approval: None,
             tun_upstream: tun_upstream.clone(),
+            naive_udp_over_tcp,
         };
         let mut bridge_reservation = None;
         let generated = if reality {
@@ -1933,6 +2322,9 @@ impl ApplicationController {
             mode,
             default_route: policy.default,
             routing: policy,
+            tun_stack,
+            tun_traffic_rules,
+            naive_udp_over_tcp,
             system_proxy_requires_restore: false,
             ports,
             health_route: health_route.clone(),
@@ -2078,10 +2470,14 @@ impl ApplicationController {
                 .as_mut()
                 .expect("active session disappeared")
                 .system_proxy_requires_restore = true;
-            self.services
-                .system_proxy
-                .publish_loopback(ports.http)
-                .map_err(|error| RuntimeError::new("system_proxy_publish", error.to_string()))?;
+            if let Err(error) = self.services.system_proxy.publish_loopback(ports.http) {
+                state
+                    .active
+                    .as_mut()
+                    .expect("active session disappeared")
+                    .system_proxy_requires_restore = error.may_have_changed();
+                return Err(RuntimeError::new("system_proxy_publish", error.to_string()));
+            }
             if !self
                 .services
                 .system_proxy
@@ -2133,11 +2529,21 @@ impl ApplicationController {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut state = self.lock_state();
+        self.stop_active_locked(&mut state, None)
+    }
+
+    // Every teardown path retains the session until restoration and explicit
+    // child cleanup succeed. Dropping a child is never evidence of cleanup.
+    fn stop_active_locked(
+        &self,
+        state: &mut State,
+        terminal_failure: Option<PublicError>,
+    ) -> Result<RuntimeStatus, PublicError> {
         if state.active.is_none() {
             if state.recovery_required {
                 return Ok(state.status.clone());
             }
-            self.reset_disconnected(&mut state);
+            self.reset_disconnected(state);
             return Ok(state.status.clone());
         }
         let node_id = state.status.node_id.clone();
@@ -2148,7 +2554,7 @@ impl ApplicationController {
         let mut proxy_conflict = None;
         if system_proxy_requires_restore {
             self.update_status(
-                &mut state,
+                state,
                 RuntimePhase::RestoringSystemProxy,
                 node_id.clone(),
                 None,
@@ -2161,7 +2567,7 @@ impl ApplicationController {
                         .expect("active session disappeared")
                         .system_proxy_requires_restore = false;
                     Self::set_proof(
-                        &mut state,
+                        state,
                         ProofKind::SystemProxyOwnership,
                         ProofState::Passed,
                         None,
@@ -2174,7 +2580,7 @@ impl ApplicationController {
                         .expect("active session disappeared")
                         .system_proxy_requires_restore = false;
                     Self::set_proof(
-                        &mut state,
+                        state,
                         ProofKind::SystemProxyOwnership,
                         ProofState::Failed,
                         None,
@@ -2193,7 +2599,7 @@ impl ApplicationController {
                         "Windows System Proxy ownership could not be restored safely",
                     );
                     self.update_status(
-                        &mut state,
+                        state,
                         RuntimePhase::RecoveryRequired,
                         node_id,
                         Some(public.clone()),
@@ -2202,12 +2608,7 @@ impl ApplicationController {
                 }
             }
         }
-        self.update_status(
-            &mut state,
-            RuntimePhase::StoppingCore,
-            node_id.clone(),
-            None,
-        );
+        self.update_status(state, RuntimePhase::StoppingCore, node_id.clone(), None);
         let stop_result = state
             .active
             .as_mut()
@@ -2223,7 +2624,7 @@ impl ApplicationController {
             let public = public_runtime_error(error, &redactor);
             state.recovery_required = true;
             self.update_status(
-                &mut state,
+                state,
                 RuntimePhase::RecoveryRequired,
                 node_id,
                 Some(public.clone()),
@@ -2231,7 +2632,7 @@ impl ApplicationController {
             return Err(public);
         }
         let active = state.active.take();
-        Self::clear_active_metadata(&mut state);
+        Self::clear_active_metadata(state);
         drop(active);
         state.recovery_required = reconcile_stale_sessions(&self.session_root).is_err();
         if state.recovery_required {
@@ -2241,7 +2642,7 @@ impl ApplicationController {
                 "Session data remains and requires review",
             );
             self.update_status(
-                &mut state,
+                state,
                 RuntimePhase::RecoveryRequired,
                 node_id,
                 Some(public.clone()),
@@ -2251,14 +2652,25 @@ impl ApplicationController {
         if let Some(public) = proxy_conflict {
             state.status.session_id = None;
             self.update_status(
-                &mut state,
+                state,
                 RuntimePhase::DisconnectedWithError,
                 node_id,
                 Some(public.clone()),
             );
             return Err(public);
         }
-        self.reset_disconnected(&mut state);
+        if let Some(error) = terminal_failure {
+            // Cleanup succeeded, but retain the failed proof and attempted mode
+            // for diagnostics. Do not publish a transient normal disconnect.
+            self.update_status(
+                state,
+                RuntimePhase::DisconnectedWithError,
+                node_id,
+                Some(error),
+            );
+        } else {
+            self.reset_disconnected(state);
+        }
         Ok(state.status.clone())
     }
 
@@ -2268,14 +2680,15 @@ impl ApplicationController {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
-            let state = self.lock_state();
+            let mut state = self.lock_state();
             if !state.recovery_required {
                 return Ok(state.status.clone());
             }
+            if state.active.is_some() {
+                return self.stop_active_locked(&mut state, None);
+            }
         }
-        if let Err(error) = reconcile_stale_tun_sessions(&self.session_root)
-            .and_then(|_| reconcile_stale_sessions(&self.session_root))
-        {
+        if let Err(error) = (self.services.recover_sessions)(&self.session_root) {
             let public = public_runtime_error(error, &Redactor::default());
             let mut state = self.lock_state();
             state.recovery_required = true;
@@ -2315,7 +2728,12 @@ impl ApplicationController {
     }
 
     pub fn status(&self) -> RuntimeStatus {
-        self.lock_state().status.clone()
+        // Observation must not wait for UAC, engine validation or a network
+        // proof holding the lifecycle state. Return the last complete revision.
+        self.published_status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn diagnostics(&self) -> Diagnostics {
@@ -2326,7 +2744,38 @@ impl ApplicationController {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .snapshot(),
+            system_proxy: self.services.system_proxy.diagnostics(),
         }
+    }
+
+    pub fn clear_stale_system_proxy(&self, token: &str) -> Result<Diagnostics, PublicError> {
+        let _operation = self
+            .operation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            let state = self.lock_state();
+            let active_session_blocks_cleanup = state.active.as_ref().is_some_and(|active| {
+                active.mode != RuntimeMode::Tun || state.status.phase != RuntimePhase::TunReady
+            });
+            if active_session_blocks_cleanup || state.shutting_down || state.recovery_required {
+                return Err(PublicError::fixed(
+                    PublicErrorCode::ActiveSessionConflict,
+                    PublicErrorStage::SystemProxyRestore,
+                    "Wait for RouteDeck to become stable and resolve session recovery before clearing a foreign System Proxy",
+                ));
+            }
+        }
+        self.services
+            .system_proxy
+            .clear_stale(token)
+            .map_err(|error| PublicError {
+                code: PublicErrorCode::CommandFailed,
+                stage: PublicErrorStage::SystemProxyRestore,
+                message: "Could not clear stale Windows System Proxy settings".into(),
+                detail: Some(error.to_string()),
+            })?;
+        Ok(self.diagnostics())
     }
 
     pub fn shutdown(&self) -> bool {
@@ -2385,42 +2834,13 @@ impl ApplicationController {
             Err(error) => Some(public_runtime_error(error, &active.redactor)),
         };
         if let Some(error) = process_error {
-            let node_id = active.node_id.clone();
-            let mode = active.mode;
-            let proxy_recovery_failed = mode == RuntimeMode::SystemProxy
-                && matches!(
-                    self.services.system_proxy.restore_if_owned(),
-                    Ok(SystemProxyRestoreOutcome::NoJournal) | Err(_)
-                );
-            let stale = state.active.take();
             Self::set_proof(
                 &mut state,
                 ProofKind::EngineProcess,
                 ProofState::Failed,
                 None,
             );
-            Self::clear_active_metadata(&mut state);
-            drop(stale);
-            if proxy_recovery_failed || reconcile_stale_sessions(&self.session_root).is_err() {
-                state.recovery_required = true;
-                self.update_status(
-                    &mut state,
-                    RuntimePhase::RecoveryRequired,
-                    Some(node_id),
-                    Some(PublicError::fixed(
-                        PublicErrorCode::RecoveryRequired,
-                        PublicErrorStage::SessionRecovery,
-                        "Session data remains and requires review",
-                    )),
-                );
-            } else {
-                self.update_status(
-                    &mut state,
-                    RuntimePhase::DisconnectedWithError,
-                    Some(node_id),
-                    Some(error),
-                );
-            }
+            let _ = self.stop_active_locked(&mut state, Some(error));
             return;
         }
         if active.mode == RuntimeMode::SystemProxy {
@@ -2548,40 +2968,13 @@ impl ApplicationController {
         };
         if let Err(error) = ownership {
             let public = public_runtime_error(error, &snapshot.redactor);
-            let proxy_recovery_failed = snapshot.mode == RuntimeMode::SystemProxy
-                && matches!(
-                    self.services.system_proxy.restore_if_owned(),
-                    Ok(SystemProxyRestoreOutcome::NoJournal) | Err(_)
-                );
-            let stale = state.active.take();
             Self::set_proof(
                 &mut state,
                 ProofKind::LocalScopeOwnership,
                 ProofState::Failed,
                 None,
             );
-            Self::clear_active_metadata(&mut state);
-            drop(stale);
-            if proxy_recovery_failed || reconcile_stale_sessions(&self.session_root).is_err() {
-                state.recovery_required = true;
-                self.update_status(
-                    &mut state,
-                    RuntimePhase::RecoveryRequired,
-                    Some(snapshot.node_id),
-                    Some(PublicError::fixed(
-                        PublicErrorCode::RecoveryRequired,
-                        PublicErrorStage::SessionRecovery,
-                        "Session data remains and requires review",
-                    )),
-                );
-            } else {
-                self.update_status(
-                    &mut state,
-                    RuntimePhase::DisconnectedWithError,
-                    Some(snapshot.node_id),
-                    Some(public),
-                );
-            }
+            let _ = self.stop_active_locked(&mut state, Some(public));
             return;
         }
         match proof {
@@ -2608,12 +3001,17 @@ impl ApplicationController {
                         None,
                     );
                 }
-                self.update_status(
-                    &mut state,
-                    RuntimePhase::OutboundVerified,
-                    Some(snapshot.node_id.clone()),
-                    None,
-                );
+                if !matches!(
+                    state.status.phase,
+                    RuntimePhase::SystemProxyReady | RuntimePhase::TunReady
+                ) {
+                    self.update_status(
+                        &mut state,
+                        RuntimePhase::OutboundVerified,
+                        Some(snapshot.node_id.clone()),
+                        None,
+                    );
+                }
                 self.update_status(
                     &mut state,
                     match snapshot.mode {
@@ -2624,11 +3022,56 @@ impl ApplicationController {
                     Some(snapshot.node_id),
                     None,
                 );
+                if matches!(snapshot.mode, RuntimeMode::SystemProxy | RuntimeMode::Tun) {
+                    // Finish the original proof and TUN counter attribution first.
+                    // Optional UX traffic must not help satisfy the cold proof.
+                    drop(state);
+                    let latency = self.services.prober.warm_latency(&snapshot.route);
+                    state = self.lock_state();
+                    if state.recovery_required
+                        || state.status.error.is_some()
+                        || !matches!(
+                            state.status.phase,
+                            RuntimePhase::SystemProxyReady | RuntimePhase::TunReady
+                        )
+                    {
+                        return;
+                    }
+                    let Some(active) = state.active.as_mut().filter(|active| {
+                        active.generation == snapshot.generation
+                            && active.session_id == snapshot.session_id
+                    }) else {
+                        return;
+                    };
+                    let process_error = match active.child.is_alive() {
+                        Ok(true) => None,
+                        Ok(false) => Some(PublicError::fixed(
+                            PublicErrorCode::RuntimeFailure,
+                            PublicErrorStage::EngineProcess,
+                            "The local proxy process exited during latency measurement",
+                        )),
+                        Err(error) => Some(public_runtime_error(error, &snapshot.redactor)),
+                    };
+                    if let Some(error) = process_error {
+                        Self::set_proof(
+                            &mut state,
+                            ProofKind::EngineProcess,
+                            ProofState::Failed,
+                            None,
+                        );
+                        let _ = self.stop_active_locked(&mut state, Some(error));
+                        return;
+                    }
+                    state.status.steady_latency_ms = latency;
+                    state.status.revision = state.status.revision.saturating_add(1);
+                    self.emit_status(state.status.clone());
+                }
             }
             Err(error) => {
                 active.consecutive_probe_failures =
                     active.consecutive_probe_failures.saturating_add(1);
                 let threshold_reached = active.consecutive_probe_failures >= 2;
+                let had_steady_latency = state.status.steady_latency_ms.take().is_some();
                 if threshold_reached {
                     state.status.route_check_ms = None;
                     Self::set_proof(
@@ -2644,6 +3087,11 @@ impl ApplicationController {
                         Some(snapshot.node_id),
                         Some(public),
                     );
+                } else if had_steady_latency {
+                    // Keep the existing one-failure readiness grace, but never
+                    // display an old successful latency as a current sample.
+                    state.status.revision = state.status.revision.saturating_add(1);
+                    self.emit_status(state.status.clone());
                 }
             }
         }
@@ -2659,6 +3107,14 @@ impl ApplicationController {
         state.status.phase = phase;
         state.status.node_id = node_id;
         state.status.error = error;
+        if state.status.error.is_some()
+            || !matches!(
+                phase,
+                RuntimePhase::SystemProxyReady | RuntimePhase::TunReady
+            )
+        {
+            state.status.steady_latency_ms = None;
+        }
         if !matches!(
             phase,
             RuntimePhase::OutboundVerified
@@ -2676,6 +3132,7 @@ impl ApplicationController {
     fn clear_active_metadata(state: &mut State) {
         state.status.ports = None;
         state.status.route_check_ms = None;
+        state.status.steady_latency_ms = None;
         state.status.engine_version = None;
     }
 
@@ -2744,6 +3201,10 @@ impl ApplicationController {
     }
 
     fn emit_status(&self, status: RuntimeStatus) {
+        *self
+            .published_status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = status.clone();
         let sink = self
             .event_sink
             .lock()
@@ -2789,10 +3250,90 @@ fn public_subscription_fetch_error(error: SubscriptionFetchError) -> PublicError
     PublicError::fixed(code, stage, localization_key)
 }
 
-fn prepare_stored_nodes(nodes: Vec<Node>) -> Result<Vec<(String, StoredNode)>, PublicError> {
+fn subscription_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(8_640_000_000_000_000) as u64
+}
+
+fn source_import_error(message: &'static str) -> PublicError {
+    PublicError::fixed(
+        PublicErrorCode::ImportRejected,
+        PublicErrorStage::Import,
+        message,
+    )
+}
+
+fn source_storage_error() -> PublicError {
+    PublicError::fixed(
+        PublicErrorCode::RuntimeFailure,
+        PublicErrorStage::SessionStorage,
+        "subscription.save_failed",
+    )
+}
+
+fn validate_source_id(source_id: &str) -> Result<(), PublicError> {
+    if source_id.len() != 32
+        || !source_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(source_import_error("subscription.source_invalid"));
+    }
+    Ok(())
+}
+
+fn ensure_source_mutation_allowed(state: &State, source_id: &str) -> Result<(), PublicError> {
+    if state.recovery_required || state.shutting_down {
+        return Err(PublicError::fixed(
+            PublicErrorCode::RecoveryRequired,
+            PublicErrorStage::Import,
+            "Import is blocked until session recovery completes",
+        ));
+    }
+    if state
+        .active
+        .as_ref()
+        .and_then(|active| state.nodes.get(&active.node_id))
+        .is_some_and(|node| node.source_id == source_id)
+    {
+        return Err(PublicError::fixed(
+            PublicErrorCode::ActiveSessionConflict,
+            PublicErrorStage::Import,
+            "Stop the active connection before changing its source",
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_stored_nodes(
+    nodes: Vec<Node>,
+    source: &StoredSource,
+) -> Result<Vec<(String, StoredNode)>, PublicError> {
+    if !source.node_ids.is_empty() && source.node_ids.len() != nodes.len() {
+        return Err(source_import_error("subscription.content.rejected"));
+    }
+    let safe_source_name = if nodes.iter().all(|node| {
+        Redactor::from_nodes(std::slice::from_ref(node)).redact(&source.name) == source.name
+    }) {
+        source.name.clone()
+    } else {
+        "Сохранённые серверы".into()
+    };
     nodes
         .into_iter()
-        .map(|node| {
+        .enumerate()
+        .map(|(index, mut node)| {
+            // Keep legacy IDs intact on migration; every new source owns a separate
+            // namespace, including when the same endpoint is imported twice.
+            if source.id != LEGACY_SOURCE_ID {
+                node.id = format!("{}-{}", source.id, node.id());
+            }
+            if let Some(id) = source.node_ids.get(index) {
+                node.id = id.clone();
+            }
             let node_id = node.id().to_owned();
             let config_identity = random_hex(16)
                 .map_err(|error| public_runtime_error(error, &Redactor::default()))?;
@@ -2801,6 +3342,9 @@ fn prepare_stored_nodes(nodes: Vec<Node>) -> Result<Vec<(String, StoredNode)>, P
                 StoredNode {
                     node,
                     config_identity,
+                    source_id: source.id.clone(),
+                    source_name: safe_source_name.clone(),
+                    source_kind: source.kind,
                 },
             ))
         })
@@ -2821,6 +3365,11 @@ fn preview_from_report(preview_id: &str, report: &ImportReport) -> ImportPreview
                     display_name: safe_preview_name(node, protocol, index),
                     protocol,
                     insecure_tls: node.requires_insecure_approval(),
+                    source_id: None,
+                    source_name: None,
+                    source_kind: None,
+                    source_refreshable: None,
+                    source_updated_at_ms: None,
                 }
             })
             .collect(),
@@ -3027,6 +3576,7 @@ mod tests {
         owned: AtomicBool,
         foreign: AtomicBool,
         fail_publish: AtomicBool,
+        reject_publish_unchanged: AtomicBool,
         fail_restore: AtomicBool,
         publishes: AtomicUsize,
         restores: AtomicUsize,
@@ -3048,6 +3598,7 @@ mod tests {
                 owned: AtomicBool::new(false),
                 foreign: AtomicBool::new(false),
                 fail_publish: AtomicBool::new(false),
+                reject_publish_unchanged: AtomicBool::new(false),
                 fail_restore: AtomicBool::new(false),
                 publishes: AtomicUsize::new(0),
                 restores: AtomicUsize::new(0),
@@ -3063,6 +3614,11 @@ mod tests {
         ) -> Result<(), crate::system_proxy::SystemProxyError> {
             assert!(self.alive.load(Ordering::SeqCst));
             self.publishes.fetch_add(1, Ordering::SeqCst);
+            if self.reject_publish_unchanged.load(Ordering::SeqCst) {
+                return Err(crate::system_proxy::SystemProxyError::Unchanged(
+                    "fixture foreign proxy is active",
+                ));
+            }
             if self.fail_publish.load(Ordering::SeqCst) {
                 return Err(crate::system_proxy::SystemProxyError::fixed(
                     "fixture publish failure",
@@ -3598,6 +4154,35 @@ mod tests {
 
     struct DistinctLatencyProber;
 
+    struct WarmFixtureProber {
+        cold_enabled: Arc<AtomicBool>,
+        warm_enabled: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+        gate: Option<(Arc<Barrier>, Arc<Barrier>)>,
+    }
+
+    impl TrafficProber for WarmFixtureProber {
+        fn prove(&self, _route: &HealthRoute) -> Result<ProofResult, RuntimeError> {
+            if self.cold_enabled.load(Ordering::SeqCst) {
+                Ok(ProofResult { latency_ms: 420 })
+            } else {
+                Err(RuntimeError::new(
+                    "prove_traffic",
+                    "fixture cold proof failed",
+                ))
+            }
+        }
+
+        fn warm_latency(&self, _route: &HealthRoute) -> Option<u64> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some((entered, release)) = &self.gate {
+                entered.wait();
+                release.wait();
+            }
+            self.warm_enabled.load(Ordering::SeqCst).then_some(17)
+        }
+    }
+
     impl TrafficProber for DistinctLatencyProber {
         fn prove(&self, _route: &HealthRoute) -> Result<ProofResult, RuntimeError> {
             Ok(ProofResult { latency_ms: 17 })
@@ -3951,6 +4536,132 @@ mod tests {
     }
 
     #[test]
+    fn multiple_sources_keep_independent_ids_order_and_names_after_restart() {
+        let session_root =
+            std::env::temp_dir().join(format!("routedeck-library-test-{}", random_hex(8).unwrap()));
+        let persisted_path = session_root.with_extension("subscription.json");
+        let controller = controller_at(session_root.clone());
+        for name in ["Личный сервер", "Резервный сервер"] {
+            let preview = controller.preview_import_content(NODE.into()).unwrap();
+            let serialized = serde_json::to_value(&preview).unwrap();
+            assert!(serialized["nodes"][0].get("sourceId").is_none());
+            controller
+                .confirm_import_named(&preview.preview_id, Some(name))
+                .unwrap();
+        }
+        let nodes = controller.confirmed_nodes();
+        assert_eq!(nodes.len(), 2);
+        assert_ne!(nodes[0].id, nodes[1].id);
+        assert_ne!(nodes[0].source_id, nodes[1].source_id);
+        assert_eq!(nodes[0].source_name.as_deref(), Some("Личный сервер"));
+        assert_eq!(nodes[1].source_name.as_deref(), Some("Резервный сервер"));
+        assert_eq!(nodes[0].source_kind, Some(SourceKind::Manual));
+        drop(controller);
+        assert_eq!(
+            serde_json::to_value(controller_at(session_root).confirmed_nodes()).unwrap(),
+            serde_json::to_value(nodes).unwrap()
+        );
+        std::fs::remove_file(persisted_path).unwrap();
+    }
+
+    #[test]
+    fn legacy_subscription_is_retained_when_a_new_source_is_added() {
+        let session_root = std::env::temp_dir().join(format!(
+            "routedeck-legacy-library-test-{}",
+            random_hex(8).unwrap()
+        ));
+        let persisted_path = session_root.with_extension("subscription.json");
+        std::fs::write(
+            &persisted_path,
+            serde_json::to_vec(&serde_json::json!({"version": 1, "content": NODE})).unwrap(),
+        )
+        .unwrap();
+        let controller = controller_at(session_root.clone());
+        let original_id = import_subscription(NODE.as_bytes()).unwrap().nodes[0]
+            .id()
+            .to_owned();
+        assert_eq!(controller.confirmed_nodes()[0].id, original_id);
+        assert_eq!(
+            controller.confirmed_nodes()[0].source_id.as_deref(),
+            Some(LEGACY_SOURCE_ID)
+        );
+        let new_id = import_node(&controller);
+        assert_ne!(new_id, original_id);
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&persisted_path).unwrap()).unwrap();
+        assert_eq!(stored["version"], 3);
+        assert_eq!(stored["sources"].as_array().unwrap().len(), 2);
+        drop(controller);
+        let restored = controller_at(session_root).confirmed_nodes();
+        assert_eq!(restored[0].id, original_id);
+        assert_eq!(restored[1].id, new_id);
+        std::fs::remove_file(persisted_path).unwrap();
+    }
+
+    #[test]
+    fn source_kind_is_bound_to_preview_origin_and_source_name_errors_are_secret_free() {
+        let controller = controller_with_fetcher(Arc::new(FakeSubscriptionFetcher {
+            result: Ok(NODE.into()),
+        }));
+        let preview = controller
+            .preview_import_url("https://provider.test/private-token".into())
+            .unwrap();
+        for name in [
+            "https://provider.test/private-token",
+            "user:secret@host",
+            "example.test",
+            "password=private-token",
+            "bad\nname",
+        ] {
+            let error = controller
+                .confirm_import_named(&preview.preview_id, Some(name))
+                .unwrap_err();
+            assert_eq!(error.message, "import.source_name.invalid");
+            assert!(error.detail.is_none());
+            assert!(controller.confirmed_nodes().is_empty());
+            assert!(controller
+                .lock_state()
+                .pending
+                .contains_key(&preview.preview_id));
+        }
+        controller
+            .confirm_import_named(&preview.preview_id, Some("Моя подписка"))
+            .unwrap();
+        import_node(&controller);
+        let nodes = controller.confirmed_nodes();
+        assert_eq!(nodes[0].source_kind, Some(SourceKind::Subscription));
+        assert_eq!(nodes[1].source_kind, Some(SourceKind::Manual));
+        let public = serde_json::to_string(&nodes).unwrap();
+        assert!(!public.contains("private-token"));
+        assert!(!public.contains("example.test"));
+    }
+
+    #[test]
+    fn additive_library_node_limit_preserves_existing_data_and_preview() {
+        let (controller, _, _) = controller(false, true, true);
+        let content = std::iter::repeat_n(NODE, MAX_LIBRARY_NODES)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preview = controller.preview_import_content(content).unwrap();
+        assert_eq!(
+            controller
+                .confirm_import(&preview.preview_id)
+                .unwrap()
+                .imported,
+            MAX_LIBRARY_NODES
+        );
+        let overflow = controller.preview_import_content(NODE.into()).unwrap();
+        let error = controller.confirm_import(&overflow.preview_id).unwrap_err();
+        assert_eq!(error.message, "import.library.limit");
+        assert_eq!(controller.confirmed_nodes().len(), MAX_LIBRARY_NODES);
+        assert_eq!(controller.lock_state().sources.len(), 1);
+        assert!(controller
+            .lock_state()
+            .pending
+            .contains_key(&overflow.preview_id));
+    }
+
+    #[test]
     fn corrupt_subscription_does_not_block_startup_or_later_replacement() {
         let session_root = std::env::temp_dir().join(format!(
             "routedeck-corrupt-persistence-test-{}",
@@ -3996,7 +4707,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_persistent_replace_keeps_preview_retryable_and_old_nodes_atomic() {
+    fn failed_persistent_add_keeps_preview_retryable_and_old_nodes_atomic() {
         let session_root = std::env::temp_dir().join(format!(
             "routedeck-transactional-persistence-test-{}",
             random_hex(8).expect("test random")
@@ -4027,11 +4738,564 @@ mod tests {
 
         controller.subscription_store = Some(SubscriptionStore::new(persisted_path.clone()));
         let confirmed = controller.confirm_import(&replacement.preview_id).unwrap();
-        assert_eq!(confirmed.node_ids, vec![replacement.nodes[0].id.clone()]);
-        assert_eq!(controller.confirmed_nodes()[0].id, replacement.nodes[0].id);
+        assert_ne!(confirmed.node_ids[0], replacement.nodes[0].id);
+        let nodes = controller.confirmed_nodes();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].id, old_node);
+        assert_eq!(nodes[1].id, confirmed.node_ids[0]);
+        assert_eq!(controller.lock_state().sources.len(), 2);
+        assert_eq!(
+            controller_at(session_root)
+                .confirmed_nodes()
+                .iter()
+                .map(|node| &node.id)
+                .collect::<Vec<_>>(),
+            nodes.iter().map(|node| &node.id).collect::<Vec<_>>()
+        );
 
         std::fs::remove_file(persisted_path).unwrap();
         std::fs::remove_dir(blocked_path).unwrap();
+    }
+
+    struct MutableSubscriptionFetcher {
+        result: Mutex<Result<String, SubscriptionFetchError>>,
+        calls: AtomicUsize,
+    }
+
+    impl SubscriptionFetcher for MutableSubscriptionFetcher {
+        fn fetch(&self, _url: &str) -> Result<String, SubscriptionFetchError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.result.lock().unwrap().clone()
+        }
+    }
+
+    fn refresh_fixture(
+        content: &str,
+    ) -> (
+        ApplicationController,
+        Arc<MutableSubscriptionFetcher>,
+        String,
+    ) {
+        let fetcher = Arc::new(MutableSubscriptionFetcher {
+            result: Mutex::new(Ok(content.into())),
+            calls: AtomicUsize::new(0),
+        });
+        let controller = controller_with_fetcher(fetcher.clone());
+        let preview = controller
+            .preview_import_url("https://provider.test/private-fixture-token".into())
+            .unwrap();
+        controller
+            .confirm_import_named(&preview.preview_id, Some("Мои серверы"))
+            .unwrap();
+        let source_id = controller.confirmed_nodes()[0].source_id.clone().unwrap();
+        (controller, fetcher, source_id)
+    }
+
+    #[test]
+    fn refresh_url_is_private_and_only_subscription_groups_are_refreshable() {
+        let (controller, _, source_id) = refresh_fixture(NODE);
+        import_node(&controller);
+        let nodes = controller.confirmed_nodes();
+        assert_eq!(nodes[0].source_refreshable, Some(true));
+        assert!(nodes[0].source_updated_at_ms.is_some());
+        assert_eq!(nodes[1].source_refreshable, Some(false));
+        let state = controller.lock_state();
+        assert!(state.sources[0]
+            .url
+            .as_ref()
+            .unwrap()
+            .contains("private-fixture-token"));
+        assert!(!format!("{:?}", state.sources).contains("private-fixture-token"));
+        drop(state);
+        let public = serde_json::to_string(&nodes).unwrap();
+        assert!(!public.contains("provider.test"));
+        assert!(!public.contains("private-fixture-token"));
+        assert_eq!(nodes[0].source_id.as_deref(), Some(source_id.as_str()));
+    }
+
+    struct ExactUrlSubscriptionFetcher {
+        expected_url: &'static str,
+        calls: AtomicUsize,
+    }
+
+    impl SubscriptionFetcher for ExactUrlSubscriptionFetcher {
+        fn fetch(&self, raw_url: &str) -> Result<String, SubscriptionFetchError> {
+            assert_eq!(raw_url, self.expected_url);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(NODE.into())
+        }
+    }
+
+    #[test]
+    fn initial_url_import_retains_refresh_url_through_confirmation_save_and_restart() {
+        const FIXTURE_URL: &str = "https://provider.test/subscription?token=fixture-only";
+        let root = std::env::temp_dir().join(format!(
+            "routedeck-url-import-roundtrip-{}",
+            random_hex(8).unwrap()
+        ));
+        let path = root.with_extension("subscription.json");
+        let fetcher = Arc::new(ExactUrlSubscriptionFetcher {
+            expected_url: FIXTURE_URL,
+            calls: AtomicUsize::new(0),
+        });
+        let mut controller = controller_at(root.clone());
+        controller.services.subscription_fetcher = fetcher.clone();
+        let preview = controller.preview_import_url(FIXTURE_URL.into()).unwrap();
+        assert!(!serde_json::to_string(&preview)
+            .unwrap()
+            .contains("fixture-only"));
+        let imported = controller
+            .confirm_import_named(&preview.preview_id, Some("Подписка"))
+            .unwrap();
+        let source_id = controller.confirmed_nodes()[0].source_id.clone().unwrap();
+        assert_eq!(
+            controller.confirmed_nodes()[0].source_refreshable,
+            Some(true)
+        );
+        drop(controller);
+
+        let mut controller = controller_at(root.clone());
+        controller.services.subscription_fetcher = fetcher.clone();
+        assert_eq!(
+            controller.confirmed_nodes()[0].source_refreshable,
+            Some(true)
+        );
+        assert_eq!(
+            controller
+                .refresh_source(&source_id, None)
+                .unwrap()
+                .node_ids,
+            imported.node_ids
+        );
+        drop(controller);
+
+        let mut controller = controller_at(root);
+        controller.services.subscription_fetcher = fetcher.clone();
+        assert_eq!(
+            controller
+                .refresh_source(&source_id, None)
+                .unwrap()
+                .node_ids,
+            imported.node_ids
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 3);
+        assert!(!serde_json::to_string(&controller.confirmed_nodes())
+            .unwrap()
+            .contains("fixture-only"));
+        drop(controller);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn migrated_v2_subscription_needs_url_once_and_reuses_it_after_restart() {
+        const FIXTURE_URL: &str = "https://provider.test/legacy?token=fixture-only";
+        const SOURCE_ID: &str = "1234567890abcdef1234567890abcdef";
+        let root = std::env::temp_dir().join(format!(
+            "routedeck-v2-refresh-roundtrip-{}",
+            random_hex(8).unwrap()
+        ));
+        let path = root.with_extension("subscription.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 2,
+                "sources": [{ "id": SOURCE_ID, "name": "Старая подписка",
+                    "kind": "subscription", "content": NODE }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let fetcher = Arc::new(ExactUrlSubscriptionFetcher {
+            expected_url: FIXTURE_URL,
+            calls: AtomicUsize::new(0),
+        });
+        let mut controller = controller_at(root.clone());
+        controller.services.subscription_fetcher = fetcher.clone();
+        let original_node_id = controller.confirmed_nodes()[0].id.clone();
+        assert_eq!(
+            controller.confirmed_nodes()[0].source_refreshable,
+            Some(false)
+        );
+        assert_eq!(
+            controller
+                .refresh_source(SOURCE_ID, None)
+                .unwrap_err()
+                .message,
+            "subscription.url_required"
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            controller
+                .refresh_source(SOURCE_ID, Some(FIXTURE_URL))
+                .unwrap()
+                .node_ids,
+            vec![original_node_id.clone()]
+        );
+        drop(controller);
+
+        let mut controller = controller_at(root);
+        controller.services.subscription_fetcher = fetcher.clone();
+        assert_eq!(
+            controller.confirmed_nodes()[0].source_refreshable,
+            Some(true)
+        );
+        assert_eq!(
+            controller.confirmed_nodes()[0].source_name.as_deref(),
+            Some("Старая подписка")
+        );
+        assert_eq!(
+            controller.refresh_source(SOURCE_ID, None).unwrap().node_ids,
+            vec![original_node_id]
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+        drop(controller);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn refresh_reorders_and_rotates_credentials_without_changing_existing_ids_after_restart() {
+        let second = NODE.replace("example.test", "second.test");
+        let (mut controller, fetcher, source_id) = refresh_fixture(&format!("{NODE}\n{second}"));
+        let other_id = import_node(&controller);
+        let before = controller.confirmed_nodes();
+        let other_identity = controller.lock_state().nodes[&other_id]
+            .config_identity
+            .clone();
+        let old_identity = controller.lock_state().nodes[&before[0].id]
+            .config_identity
+            .clone();
+        let path = controller.session_root.with_extension("subscription.json");
+        controller.subscription_store = Some(SubscriptionStore::new(path.clone()));
+        let third = NODE.replace("example.test", "third.test");
+        let changed = NODE.replace("fixture-secret", "rotated-fixture-secret");
+        *fetcher.result.lock().unwrap() = Ok(format!("{second}\n{changed}\n{third}"));
+        let refreshed = controller.refresh_source(&source_id, None).unwrap();
+        assert_eq!(refreshed.imported, 3);
+        assert_eq!(refreshed.node_ids[0], before[1].id);
+        assert_eq!(refreshed.node_ids[1], before[0].id);
+        let after = controller.confirmed_nodes();
+        assert_eq!(after[3].id, other_id);
+        assert_eq!(after[0].source_name.as_deref(), Some("Мои серверы"));
+        assert_eq!(
+            controller.lock_state().nodes[&other_id].config_identity,
+            other_identity
+        );
+        assert_ne!(
+            controller.lock_state().nodes[&before[0].id].config_identity,
+            old_identity
+        );
+        assert_eq!(controller.lock_state().sources[0].revision, 1);
+        let restored = controller_at(controller.session_root.clone()).confirmed_nodes();
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(restored).unwrap()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn refresh_preserves_duplicate_occurrence_ids_and_can_run_beside_another_active_group() {
+        let (controller, fetcher, source_id) = refresh_fixture(&format!("{NODE}\n{NODE}"));
+        let other = import_node(&controller);
+        let before = controller.confirmed_nodes();
+        controller
+            .start_local_proxy(&other, DefaultRoute::Vpn)
+            .unwrap();
+        *fetcher.result.lock().unwrap() = Ok(format!("{NODE}\n{NODE}"));
+        let refreshed = controller.refresh_source(&source_id, None).unwrap();
+        assert_eq!(
+            refreshed.node_ids,
+            vec![before[0].id.clone(), before[1].id.clone()]
+        );
+        assert_ne!(refreshed.node_ids[0], refreshed.node_ids[1]);
+        assert_eq!(
+            controller.lock_state().active.as_ref().unwrap().node_id,
+            other
+        );
+        controller.remove_source(&source_id).unwrap();
+        assert_eq!(controller.confirmed_nodes().len(), 1);
+        controller.stop().unwrap();
+    }
+
+    #[test]
+    fn refresh_and_remove_refuse_the_active_group_without_fetching_or_changing_state() {
+        let (controller, fetcher, source_id) = refresh_fixture(NODE);
+        let before = serde_json::to_value(controller.confirmed_nodes()).unwrap();
+        let node = controller.confirmed_nodes()[0].id.clone();
+        controller
+            .start_local_proxy(&node, DefaultRoute::Vpn)
+            .unwrap();
+        assert_eq!(
+            controller
+                .refresh_source(&source_id, None)
+                .unwrap_err()
+                .code,
+            PublicErrorCode::ActiveSessionConflict
+        );
+        assert_eq!(
+            controller.remove_source(&source_id).unwrap_err().code,
+            PublicErrorCode::ActiveSessionConflict
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            serde_json::to_value(controller.confirmed_nodes()).unwrap(),
+            before
+        );
+        controller.stop().unwrap();
+    }
+
+    #[test]
+    fn refresh_rejects_empty_partial_or_failed_responses_without_losing_saved_nodes() {
+        let (controller, fetcher, source_id) = refresh_fixture(NODE);
+        let before = serde_json::to_value(controller.confirmed_nodes()).unwrap();
+        for result in [
+            Ok(String::new()),
+            Ok(format!("{NODE}\nnaive+https://broken:70000")),
+            Ok("not a subscription".into()),
+            Err(SubscriptionFetchError::new(
+                SubscriptionFetchErrorKind::Timeout,
+                SubscriptionFetchStage::Fetch,
+            )),
+        ] {
+            *fetcher.result.lock().unwrap() = result;
+            assert!(controller.refresh_source(&source_id, None).is_err());
+            assert_eq!(
+                serde_json::to_value(controller.confirmed_nodes()).unwrap(),
+                before
+            );
+            assert_eq!(controller.lock_state().sources[0].revision, 0);
+            assert_eq!(controller.lock_state().preview_inflight, 0);
+        }
+    }
+
+    #[test]
+    fn refresh_and_remove_save_failure_leave_memory_and_disk_unchanged() {
+        let (mut controller, fetcher, source_id) = refresh_fixture(NODE);
+        let path = controller.session_root.with_extension("subscription.json");
+        let store = SubscriptionStore::new(path.clone());
+        store.save(&controller.lock_state().sources).unwrap();
+        let disk_before = std::fs::read(&path).unwrap();
+        let before = serde_json::to_value(controller.confirmed_nodes()).unwrap();
+        let blocked = controller.session_root.with_extension("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        controller.subscription_store = Some(SubscriptionStore::new(blocked.clone()));
+        *fetcher.result.lock().unwrap() = Ok(NODE.replace("example.test", "replacement.test"));
+        assert_eq!(
+            controller
+                .refresh_source(&source_id, None)
+                .unwrap_err()
+                .stage,
+            PublicErrorStage::SessionStorage
+        );
+        assert!(controller.remove_source(&source_id).is_err());
+        assert_eq!(
+            serde_json::to_value(controller.confirmed_nodes()).unwrap(),
+            before
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+        controller.subscription_store = Some(SubscriptionStore::new(path.clone()));
+        controller.remove_source(&source_id).unwrap();
+        controller.remove_source(&source_id).unwrap();
+        assert!(controller.confirmed_nodes().is_empty());
+        assert!(controller_at(controller.session_root.clone())
+            .confirmed_nodes()
+            .is_empty());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(blocked).unwrap();
+    }
+
+    #[test]
+    fn legacy_subscription_refresh_accepts_a_new_url_and_manual_sources_cannot_refresh() {
+        let (controller, fetcher, source_id) = refresh_fixture(NODE);
+        controller.lock_state().sources[0].url = None;
+        assert_eq!(
+            controller.confirmed_nodes()[0].source_refreshable,
+            Some(false)
+        );
+        assert_eq!(
+            controller
+                .refresh_source(&source_id, None)
+                .unwrap_err()
+                .message,
+            "subscription.url_required"
+        );
+        controller
+            .refresh_source(
+                &source_id,
+                Some("https://replacement-provider.test/fixture"),
+            )
+            .unwrap();
+        assert_eq!(
+            controller.confirmed_nodes()[0].source_refreshable,
+            Some(true)
+        );
+        assert_eq!(
+            controller.lock_state().sources[0].url.as_deref(),
+            Some("https://replacement-provider.test/fixture")
+        );
+        import_node(&controller);
+        let manual_id = controller.confirmed_nodes()[1].source_id.clone().unwrap();
+        assert_eq!(
+            controller
+                .refresh_source(&manual_id, Some("https://provider.test/fixture"))
+                .unwrap_err()
+                .message,
+            "subscription.refresh_manual"
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn refresh_hostile_source_ids_and_urls_are_rejected_before_fetch_without_secret_errors() {
+        let (controller, fetcher, source_id) = refresh_fixture(NODE);
+        for url in [
+            "http://provider.test/secret",
+            "file:///secret",
+            "https://127.0.0.1/secret",
+            "https://localhost/secret",
+            "https://user:secret@provider.test/",
+            "https://provider.test/#secret",
+        ] {
+            let error = controller
+                .refresh_source(&source_id, Some(url))
+                .unwrap_err();
+            assert!(!serde_json::to_string(&error).unwrap().contains("secret"));
+        }
+        assert!(controller
+            .refresh_source(
+                &source_id,
+                Some(&format!("https://provider.test/{}", "a".repeat(4096)))
+            )
+            .is_err());
+        for id in ["../private-secret", "", "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"] {
+            assert!(controller.refresh_source(id, None).is_err());
+            assert!(controller.remove_source(id).is_err());
+        }
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.lock_state().preview_inflight, 0);
+        assert_eq!(controller.confirmed_nodes().len(), 1);
+    }
+
+    #[test]
+    fn deleted_source_is_not_resurrected_by_an_inflight_refresh() {
+        let (mut controller, _, source_id) = refresh_fixture(NODE);
+        let ready = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        controller.services.subscription_fetcher = Arc::new(BlockingSubscriptionFetcher {
+            ready: ready.clone(),
+            release: release.clone(),
+        });
+        let controller = Arc::new(controller);
+        let worker_controller = controller.clone();
+        let worker_id = source_id.clone();
+        let worker = thread::spawn(move || worker_controller.refresh_source(&worker_id, None));
+        ready.wait();
+        controller.remove_source(&source_id).unwrap();
+        release.wait();
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().message,
+            "subscription.source_changed"
+        );
+        assert!(controller.confirmed_nodes().is_empty());
+        assert_eq!(controller.lock_state().preview_inflight, 0);
+    }
+
+    #[test]
+    fn refresh_is_bounded_by_the_shared_import_fetch_budget() {
+        let (controller, fetcher, source_id) = refresh_fixture(NODE);
+        let slots: Vec<_> = (0..MAX_PENDING_IMPORT_PREVIEWS)
+            .map(|_| controller.reserve_preview_slot().unwrap())
+            .collect();
+        assert!(controller.refresh_source(&source_id, None).is_err());
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        drop(slots);
+        controller.refresh_source(&source_id, None).unwrap();
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn refresh_cannot_replace_a_source_that_became_active_during_fetch() {
+        let (mut controller, _, source_id) = refresh_fixture(NODE);
+        let before = controller.confirmed_nodes()[0].id.clone();
+        let ready = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        controller.services.subscription_fetcher = Arc::new(BlockingSubscriptionFetcher {
+            ready: ready.clone(),
+            release: release.clone(),
+        });
+        let controller = Arc::new(controller);
+        let worker_controller = controller.clone();
+        let worker_id = source_id.clone();
+        let worker = thread::spawn(move || worker_controller.refresh_source(&worker_id, None));
+        ready.wait();
+        controller
+            .start_local_proxy(&before, DefaultRoute::Vpn)
+            .unwrap();
+        release.wait();
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().code,
+            PublicErrorCode::ActiveSessionConflict
+        );
+        assert_eq!(controller.lock_state().sources[0].revision, 0);
+        assert_eq!(
+            controller.lock_state().active.as_ref().unwrap().node_id,
+            before
+        );
+        controller.stop().unwrap();
+    }
+
+    #[test]
+    fn restored_source_id_mapping_must_match_the_parsed_nodes() {
+        let (mut controller, _, _) = refresh_fixture(NODE);
+        let path = controller.session_root.with_extension("subscription.json");
+        let mut sources = controller.lock_state().sources.clone();
+        sources[0].node_ids = vec![
+            format!("{}-{}", sources[0].id, "a".repeat(32)),
+            format!("{}-{}", sources[0].id, "b".repeat(32)),
+        ];
+        let store = SubscriptionStore::new(path.clone());
+        store.save(&sources).unwrap();
+        controller.subscription_store = Some(store);
+        assert!(controller_at(controller.session_root.clone())
+            .confirmed_nodes()
+            .is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn only_one_concurrent_refresh_can_commit_the_same_source_revision() {
+        let (mut controller, _, source_id) = refresh_fixture(NODE);
+        let ready = Arc::new(Barrier::new(3));
+        let release = Arc::new(Barrier::new(3));
+        controller.services.subscription_fetcher = Arc::new(BlockingSubscriptionFetcher {
+            ready: ready.clone(),
+            release: release.clone(),
+        });
+        let controller = Arc::new(controller);
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let controller = controller.clone();
+                let source_id = source_id.clone();
+                thread::spawn(move || controller.refresh_source(&source_id, None))
+            })
+            .collect();
+        ready.wait();
+        release.wait();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .find_map(|result| result.as_ref().err())
+                .unwrap()
+                .message,
+            "subscription.source_changed"
+        );
+        assert_eq!(controller.lock_state().sources[0].revision, 1);
+        assert_eq!(controller.lock_state().preview_inflight, 0);
     }
 
     #[test]
@@ -4675,7 +5939,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_import_atomically_replaces_obsolete_nodes() {
+    fn confirmed_import_adds_nodes_without_invalidating_previous_nodes() {
         let (controller, _, _) = controller(false, true, true);
         let obsolete = import_node(&controller);
         let replacement = controller
@@ -4685,12 +5949,13 @@ mod tests {
             )
             .unwrap();
         let confirmed = controller.confirm_import(&replacement.preview_id).unwrap();
-        assert_eq!(controller.lock_state().nodes.len(), 1);
+        assert_eq!(controller.lock_state().nodes.len(), 2);
         assert_ne!(confirmed.node_ids[0], obsolete);
-        let error = controller
+        let status = controller
             .start_local_proxy(&obsolete, DefaultRoute::Vpn)
-            .unwrap_err();
-        assert_eq!(error.code, PublicErrorCode::NodeNotFound);
+            .unwrap();
+        assert_eq!(status.node_id.as_deref(), Some(obsolete.as_str()));
+        controller.stop().unwrap();
     }
 
     #[test]
@@ -4723,6 +5988,9 @@ mod tests {
         assert!(controller.status().error.is_some());
         assert!(controller.status().ports.is_none());
         assert!(controller.status().engine_version.is_none());
+        assert!(controller.status().proofs.iter().any(|proof| {
+            proof.kind == ProofKind::EngineProcess && proof.state == ProofState::Failed
+        }));
     }
 
     #[test]
@@ -4742,6 +6010,9 @@ mod tests {
             RuntimePhase::DisconnectedWithError
         );
         assert!(controller.status().ports.is_none());
+        assert!(controller.status().proofs.iter().any(|proof| {
+            proof.kind == ProofKind::LocalScopeOwnership && proof.state == ProofState::Failed
+        }));
     }
 
     #[test]
@@ -4839,15 +6110,17 @@ mod tests {
             "routedeck-recovery-controller-{}",
             random_hex(8).expect("test random")
         ));
-        let stale = root.join("session-0123456789abcdef0123456789abcdef");
+        let sessions = root.join("sessions");
+        let stale = sessions.join("session-0123456789abcdef0123456789abcdef");
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::write(stale.join("config.json"), b"fixture-secret").unwrap();
         let proxy = Arc::new(FakeSystemProxy::new(Arc::new(AtomicBool::new(false))));
-        let controller = ApplicationController::production_with_system_proxy(
-            root.clone(),
+        let controller = ApplicationController::production_with_recovery(
+            sessions.clone(),
             Arc::new(|_| {}),
             proxy,
             None,
+            reconcile_stale_sessions,
         )
         .unwrap();
         assert_eq!(controller.status().phase, RuntimePhase::RecoveryRequired);
@@ -4872,6 +6145,42 @@ mod tests {
             1
         );
         drop(controller);
+        std::fs::remove_file(root.join("controller.lock")).unwrap();
+        std::fs::remove_file(root.join("subscription.json")).unwrap();
+        std::fs::remove_dir(sessions).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn second_instance_is_rejected_before_any_startup_recovery() {
+        let root = std::env::temp_dir().join(format!(
+            "routedeck-instance-controller-{}",
+            random_hex(8).unwrap()
+        ));
+        let proxy = Arc::new(FakeSystemProxy::new(Arc::new(AtomicBool::new(false))));
+        let first = ApplicationController::production_with_recovery(
+            root.join("sessions"),
+            Arc::new(|_| {}),
+            proxy.clone(),
+            None,
+            reconcile_stale_sessions,
+        )
+        .unwrap();
+        assert_eq!(proxy.restores.load(Ordering::SeqCst), 1);
+        let second = ApplicationController::production_with_recovery(
+            root.join("sessions"),
+            Arc::new(|_| {}),
+            proxy.clone(),
+            None,
+            reconcile_stale_sessions,
+        );
+        assert!(matches!(second, Err(error) if error.stage() == "app_instance"));
+        assert_eq!(proxy.restores.load(Ordering::SeqCst), 1);
+        drop(first);
+        std::fs::remove_file(root.join("controller.lock")).unwrap();
+        if root.join("sessions").exists() {
+            std::fs::remove_dir(root.join("sessions")).unwrap();
+        }
         std::fs::remove_dir(root).unwrap();
     }
 
@@ -4917,6 +6226,184 @@ mod tests {
         controller.monitor_tick();
         assert_eq!(controller.status().phase, RuntimePhase::LocalProxyReady);
         assert!(controller.status().error.is_none());
+    }
+
+    #[test]
+    fn optional_warm_latency_never_replaces_or_degrades_the_cold_proof() {
+        let cold_enabled = Arc::new(AtomicBool::new(true));
+        let warm_enabled = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (controller, _, _, _) = controller_with_system_proxy(Arc::new(WarmFixtureProber {
+            cold_enabled: cold_enabled.clone(),
+            warm_enabled: warm_enabled.clone(),
+            calls: calls.clone(),
+            gate: None,
+        }));
+        let node = import_node(&controller);
+        let startup = controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Vpn))
+            .unwrap();
+        assert_eq!(startup.steady_latency_ms, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        controller.lock_state().active.as_mut().unwrap().last_probe =
+            Instant::now() - Duration::from_secs(11);
+        controller.monitor_tick();
+        let measured = controller.status();
+        assert_eq!(measured.steady_latency_ms, Some(17));
+        assert_eq!(measured.route_check_ms, Some(420));
+        assert_eq!(
+            measured
+                .proofs
+                .iter()
+                .find(|proof| proof.kind == ProofKind::SelectedOutboundHttps)
+                .unwrap()
+                .latency_ms,
+            Some(420)
+        );
+        warm_enabled.store(false, Ordering::SeqCst);
+        controller.lock_state().active.as_mut().unwrap().last_probe =
+            Instant::now() - Duration::from_secs(11);
+        controller.monitor_tick();
+        assert_eq!(controller.status().steady_latency_ms, None);
+        assert_eq!(controller.status().phase, RuntimePhase::SystemProxyReady);
+        assert_eq!(controller.status().proofs, measured.proofs);
+        warm_enabled.store(true, Ordering::SeqCst);
+        controller.lock_state().active.as_mut().unwrap().last_probe =
+            Instant::now() - Duration::from_secs(11);
+        controller.monitor_tick();
+        assert_eq!(controller.status().steady_latency_ms, Some(17));
+        let warm_calls = calls.load(Ordering::SeqCst);
+        cold_enabled.store(false, Ordering::SeqCst);
+        controller.lock_state().active.as_mut().unwrap().last_probe =
+            Instant::now() - Duration::from_secs(11);
+        controller.monitor_tick();
+        assert_eq!(controller.status().steady_latency_ms, None);
+        assert_eq!(controller.status().phase, RuntimePhase::SystemProxyReady);
+        assert_eq!(calls.load(Ordering::SeqCst), warm_calls);
+        controller.stop().unwrap();
+        assert_eq!(controller.status().steady_latency_ms, None);
+    }
+
+    #[test]
+    fn warm_latency_is_outside_state_lock_and_cannot_publish_into_a_replacement_session() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let (controller, _, _, _) = controller_with_system_proxy(Arc::new(WarmFixtureProber {
+            cold_enabled: Arc::new(AtomicBool::new(true)),
+            warm_enabled: Arc::new(AtomicBool::new(true)),
+            calls: Arc::new(AtomicUsize::new(0)),
+            gate: Some((entered.clone(), release.clone())),
+        }));
+        let controller = Arc::new(controller);
+        let node = import_node(&controller);
+        let initial = controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Vpn))
+            .unwrap();
+        controller.lock_state().active.as_mut().unwrap().last_probe =
+            Instant::now() - Duration::from_secs(11);
+        let monitor_controller = controller.clone();
+        let monitor = thread::spawn(move || monitor_controller.monitor_tick());
+        entered.wait();
+        // Both observation and teardown must finish while the network sample is blocked.
+        assert_eq!(controller.status().phase, RuntimePhase::SystemProxyReady);
+        controller.stop().unwrap();
+        let replacement = controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Vpn))
+            .unwrap();
+        assert_ne!(replacement.session_id, initial.session_id);
+        release.wait();
+        monitor.join().unwrap();
+        assert_eq!(controller.status().session_id, replacement.session_id);
+        assert_eq!(controller.status().steady_latency_ms, None);
+        controller.stop().unwrap();
+    }
+
+    #[test]
+    fn healthy_same_session_refresh_keeps_previous_warm_sample_until_replacement() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let (controller, _, _, _) = controller_with_system_proxy(Arc::new(WarmFixtureProber {
+            cold_enabled: Arc::new(AtomicBool::new(true)),
+            warm_enabled: Arc::new(AtomicBool::new(true)),
+            calls: Arc::new(AtomicUsize::new(0)),
+            gate: Some((entered.clone(), release.clone())),
+        }));
+        let controller = Arc::new(controller);
+        let node = import_node(&controller);
+        controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Vpn))
+            .unwrap();
+        {
+            let mut state = controller.lock_state();
+            state.status.steady_latency_ms = Some(29);
+            state.active.as_mut().unwrap().last_probe = Instant::now() - Duration::from_secs(11);
+        }
+        let monitor_controller = controller.clone();
+        let monitor = thread::spawn(move || monitor_controller.monitor_tick());
+        entered.wait();
+        assert_eq!(controller.status().phase, RuntimePhase::SystemProxyReady);
+        assert_eq!(controller.status().steady_latency_ms, Some(29));
+        release.wait();
+        monitor.join().unwrap();
+        assert_eq!(controller.status().steady_latency_ms, Some(17));
+        controller.stop().unwrap();
+    }
+
+    #[test]
+    fn process_death_during_optional_latency_uses_existing_owned_cleanup_path() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let (controller, _, _, alive) = controller_with_system_proxy(Arc::new(WarmFixtureProber {
+            cold_enabled: Arc::new(AtomicBool::new(true)),
+            warm_enabled: Arc::new(AtomicBool::new(true)),
+            calls: Arc::new(AtomicUsize::new(0)),
+            gate: Some((entered.clone(), release.clone())),
+        }));
+        let controller = Arc::new(controller);
+        let node = import_node(&controller);
+        controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Vpn))
+            .unwrap();
+        controller.lock_state().active.as_mut().unwrap().last_probe =
+            Instant::now() - Duration::from_secs(11);
+        let monitor_controller = controller.clone();
+        let monitor = thread::spawn(move || monitor_controller.monitor_tick());
+        entered.wait();
+        alive.store(false, Ordering::SeqCst);
+        release.wait();
+        monitor.join().unwrap();
+        assert_ne!(controller.status().phase, RuntimePhase::SystemProxyReady);
+        assert_eq!(controller.status().steady_latency_ms, None);
+        assert!(controller.status().error.is_some());
+    }
+
+    #[test]
+    fn steady_latency_is_omitted_by_default_and_cleared_on_transitions_and_errors() {
+        assert!(serde_json::to_value(RuntimeStatus::default())
+            .unwrap()
+            .get("steadyLatencyMs")
+            .is_none());
+        let (controller, _, _) = controller(false, true, true);
+        let mut state = controller.lock_state();
+        state.status.steady_latency_ms = Some(17);
+        assert_eq!(
+            serde_json::to_value(&state.status).unwrap()["steadyLatencyMs"],
+            17
+        );
+        controller.update_status(&mut state, RuntimePhase::Preparing, None, None);
+        assert_eq!(state.status.steady_latency_ms, None);
+        state.status.steady_latency_ms = Some(17);
+        controller.update_status(
+            &mut state,
+            RuntimePhase::SystemProxyReady,
+            None,
+            Some(PublicError::fixed(
+                PublicErrorCode::RuntimeFailure,
+                PublicErrorStage::Monitor,
+                "fixture error",
+            )),
+        );
+        assert_eq!(state.status.steady_latency_ms, None);
     }
 
     #[test]
@@ -4983,9 +6470,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn startup_status_and_diagnostics_do_not_wait_for_the_engine_proof() {
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let (controller, _, _) = controller_with_prober(Arc::new(BlockingProber {
+            calls: AtomicUsize::new(2),
+            gate: gate.clone(),
+        }));
+        let controller = Arc::new(controller);
+        let node = import_node(&controller);
+        let start_controller = controller.clone();
+        let start =
+            thread::spawn(move || start_controller.start_local_proxy(&node, DefaultRoute::Vpn));
+        let (lock, wake) = &*gate;
+        let mut flags = lock.lock().unwrap();
+        while !flags.0 {
+            flags = wake.wait(flags).unwrap();
+        }
+        drop(flags);
+
+        let (tx, rx) = mpsc::channel();
+        let observer = controller.clone();
+        let observation = thread::spawn(move || {
+            tx.send((observer.status(), observer.diagnostics().status))
+                .unwrap();
+        });
+        let observed = rx.recv_timeout(Duration::from_millis(500));
+        // Always release the worker before asserting, including on regression.
+        let mut flags = lock.lock().unwrap();
+        flags.1 = true;
+        wake.notify_all();
+        drop(flags);
+        let ready = start.join().unwrap().unwrap();
+        observation.join().unwrap();
+
+        let (status, diagnostics) =
+            observed.expect("startup observation blocked on lifecycle state");
+        assert_eq!(status.phase, RuntimePhase::ProvingTraffic);
+        assert_eq!(diagnostics.revision, status.revision);
+        assert!(ready.revision > status.revision);
+        assert_eq!(controller.status().revision, ready.revision);
+        let stopped = controller.stop().unwrap();
+        assert_eq!(controller.status().revision, stopped.revision);
+        assert_eq!(controller.status().phase, RuntimePhase::Disconnected);
+    }
+
     fn system_routing(default_route: DefaultRoute) -> SystemProxyRouting {
         SystemProxyRouting {
             default_route,
+            naive_udp_over_tcp: false,
             apps: vec![SystemProxyAppRoute {
                 process_path: r"C:\Program Files\Browser\browser.exe".into(),
                 process_name: Some("browser.exe".into()),
@@ -5001,6 +6534,9 @@ mod tests {
     fn tun_routing(default_route: DefaultRoute) -> TunRouting {
         TunRouting {
             default_route,
+            naive_udp_over_tcp: false,
+            stack: TunStack::default(),
+            traffic_rules: default_tun_traffic_rules(),
             apps: vec![SystemProxyAppRoute {
                 process_path: r"C:\Program Files\Browser\browser.exe".into(),
                 process_name: Some("browser.exe".into()),
@@ -5011,6 +6547,205 @@ mod tests {
                 },
             }],
         }
+    }
+
+    #[test]
+    fn routing_defaults_are_closed_and_backward_compatible() {
+        let legacy: TunRouting = serde_json::from_value(serde_json::json!({
+            "defaultRoute": "vpn",
+            "apps": []
+        }))
+        .unwrap();
+        assert_eq!(legacy.stack, TunStack::Gvisor);
+        assert!(!legacy.naive_udp_over_tcp);
+        assert_eq!(legacy.traffic_rules, default_tun_traffic_rules());
+        let gvisor: TunRouting = serde_json::from_value(serde_json::json!({
+            "defaultRoute": "vpn",
+            "apps": [],
+            "stack": "gvisor"
+        }))
+        .unwrap();
+        assert_eq!(gvisor.stack, TunStack::Gvisor);
+        assert_eq!(gvisor.traffic_rules, default_tun_traffic_rules());
+        let disabled: TunRouting = serde_json::from_value(serde_json::json!({
+            "defaultRoute": "vpn",
+            "apps": [],
+            "trafficRules": []
+        }))
+        .unwrap();
+        assert!(disabled.traffic_rules.is_empty());
+        let explicit_system: TunRouting = serde_json::from_value(serde_json::json!({
+            "defaultRoute": "vpn", "apps": [], "stack": "system",
+            "naiveUdpOverTcp": true
+        }))
+        .unwrap();
+        assert_eq!(explicit_system.stack, TunStack::System);
+        assert!(explicit_system.naive_udp_over_tcp);
+        let system_proxy: SystemProxyRouting = serde_json::from_value(serde_json::json!({
+            "defaultRoute": "vpn", "apps": []
+        }))
+        .unwrap();
+        assert!(!system_proxy.naive_udp_over_tcp);
+        for stack in ["mixed", "Gvisor", ""] {
+            assert!(serde_json::from_value::<TunRouting>(serde_json::json!({
+                "defaultRoute": "vpn",
+                "apps": [],
+                "stack": stack
+            }))
+            .is_err());
+        }
+        for traffic_rule in [
+            serde_json::json!({"network":"icmp","port":443,"action":"block"}),
+            serde_json::json!({"network":"UDP","port":443,"action":"block"}),
+            serde_json::json!({"network":"udp","port":443,"action":"reject"}),
+            serde_json::json!({"network":"udp","port":443,"action":"Block"}),
+            serde_json::json!({"network":"udp","port":"443","action":"block"}),
+            serde_json::json!({"network":"udp","port":65536,"action":"block"}),
+            serde_json::json!({"network":"udp","port":443,"action":"block","extra":true}),
+        ] {
+            assert!(serde_json::from_value::<TunRouting>(serde_json::json!({
+                "defaultRoute": "vpn",
+                "apps": [],
+                "trafficRules": [traffic_rule]
+            }))
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_tun_traffic_rules_fail_before_privilege_or_runtime_work() {
+        let (controller, stops, alive) = controller_with_tun(false, true, false);
+        let node = import_node(&controller);
+        for rules in [
+            vec![TunTrafficRule {
+                network: crate::config::TunTrafficNetwork::Udp,
+                port: 53,
+                action: crate::config::TunTrafficAction::Block,
+            }],
+            vec![default_tun_traffic_rules()[0].clone(); 33],
+        ] {
+            let mut routing = tun_routing(DefaultRoute::Vpn);
+            routing.traffic_rules = rules;
+            let error = controller.start_tun(&node, routing).unwrap_err();
+            assert_eq!(error.stage, PublicErrorStage::Start);
+            assert_eq!(error.message, "TUN traffic rules are invalid");
+        }
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert!(!alive.load(Ordering::SeqCst));
+        assert_eq!(controller.status().phase, RuntimePhase::Disconnected);
+    }
+
+    #[test]
+    fn active_tun_traffic_rule_change_requires_stop_before_restart() {
+        let (controller, stops, _) = controller_with_tun(true, true, false);
+        let node = import_node(&controller);
+        controller
+            .start_tun(&node, tun_routing(DefaultRoute::Vpn))
+            .unwrap();
+        let mut disabled = tun_routing(DefaultRoute::Vpn);
+        disabled.traffic_rules.clear();
+        let error = controller.start_tun(&node, disabled).unwrap_err();
+        assert_eq!(error.code, PublicErrorCode::ActiveSessionConflict);
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        controller.stop().unwrap();
+    }
+
+    #[test]
+    fn active_tun_stack_change_requires_stop_before_restart() {
+        let (controller, stops, _) = controller_with_tun(true, true, false);
+        let node = import_node(&controller);
+        let mut system = tun_routing(DefaultRoute::Vpn);
+        system.stack = TunStack::System;
+        controller.start_tun(&node, system).unwrap();
+        assert_eq!(
+            controller.lock_state().active.as_ref().unwrap().tun_stack,
+            Some(TunStack::System)
+        );
+
+        let error = controller
+            .start_tun(&node, tun_routing(DefaultRoute::Vpn))
+            .unwrap_err();
+        assert_eq!(error.code, PublicErrorCode::ActiveSessionConflict);
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        controller.stop().unwrap();
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn active_naive_udp_over_tcp_change_requires_restart_and_non_naive_ignores_it() {
+        let (controller, stops, _) = controller_with_tun(true, true, false);
+        let naive = import_node_from(
+            &controller,
+            "naive+https://fixture-user:fixture-pass@example.test:443",
+        );
+        controller
+            .start_tun(&naive, tun_routing(DefaultRoute::Vpn))
+            .unwrap();
+        assert!(
+            !controller
+                .lock_state()
+                .active
+                .as_ref()
+                .unwrap()
+                .naive_udp_over_tcp
+        );
+        let mut enabled = tun_routing(DefaultRoute::Vpn);
+        enabled.naive_udp_over_tcp = true;
+        let error = controller.start_tun(&naive, enabled).unwrap_err();
+        assert_eq!(error.code, PublicErrorCode::ActiveSessionConflict);
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        controller.stop().unwrap();
+
+        let non_naive = import_node(&controller);
+        controller
+            .start_tun(&non_naive, tun_routing(DefaultRoute::Vpn))
+            .unwrap();
+        let mut ignored = tun_routing(DefaultRoute::Vpn);
+        ignored.naive_udp_over_tcp = true;
+        controller.start_tun(&non_naive, ignored).unwrap();
+        assert!(
+            !controller
+                .lock_state()
+                .active
+                .as_ref()
+                .unwrap()
+                .naive_udp_over_tcp
+        );
+        controller.stop().unwrap();
+    }
+
+    #[test]
+    fn foreign_proxy_cleanup_gate_preserves_active_tun_and_blocks_transitions() {
+        let (controller, stops, alive) = controller_with_tun(true, true, false);
+        let node = import_node(&controller);
+        controller
+            .start_tun(&node, tun_routing(DefaultRoute::Vpn))
+            .unwrap();
+        // The fixture proxy backend refuses cleanup. Reaching that backend in
+        // a stable TUN session demonstrates that the lifecycle gate permits it;
+        // no platform settings are read or changed by this test.
+        let error = controller
+            .clear_stale_system_proxy(&"a".repeat(64))
+            .unwrap_err();
+        assert_eq!(error.code, PublicErrorCode::CommandFailed);
+        for phase in [RuntimePhase::StartingCore, RuntimePhase::RecoveryRequired] {
+            controller.lock_state().status.phase = phase;
+            let error = controller
+                .clear_stale_system_proxy(&"a".repeat(64))
+                .unwrap_err();
+            assert_eq!(error.code, PublicErrorCode::ActiveSessionConflict);
+        }
+        controller.lock_state().status.phase = RuntimePhase::TunReady;
+        controller.lock_state().shutting_down = true;
+        assert_eq!(
+            controller
+                .clear_stale_system_proxy(&"a".repeat(64))
+                .unwrap_err()
+                .code,
+            PublicErrorCode::ActiveSessionConflict
+        );
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert!(alive.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -5141,7 +6876,10 @@ mod tests {
         assert!(!alive.load(Ordering::SeqCst));
         assert_eq!(
             controller.diagnostics().lines,
-            vec!["tun_capture: fixture TUN capture failed"]
+            vec![
+                "tun_dns=local_fallback_no_ipv4",
+                "tun_capture: fixture TUN capture failed"
+            ]
         );
     }
 
@@ -5157,6 +6895,7 @@ mod tests {
         assert_eq!(
             controller.diagnostics().lines,
             vec![
+                "tun_dns=local_fallback_no_ipv4",
                 "prove_traffic: fixture selected outbound failed",
                 "stop_engine: fixture process refused to stop",
             ]
@@ -5181,6 +6920,7 @@ mod tests {
         assert_eq!(active.routing.default, DefaultRoute::Direct);
         assert_eq!(active.routing.apps.len(), 1);
         assert_eq!(active.routing.apps[0].action, AppRouteAction::Vpn);
+        assert_eq!(active.tun_stack, Some(TunStack::Gvisor));
         drop(state);
         assert!(alive.load(Ordering::SeqCst));
 
@@ -5213,7 +6953,10 @@ mod tests {
         assert!(!alive.load(Ordering::SeqCst));
         assert_eq!(
             controller.diagnostics().lines,
-            vec!["prove_traffic: fixture selected outbound failed"]
+            vec![
+                "tun_dns=local_fallback_no_ipv4",
+                "prove_traffic: fixture selected outbound failed"
+            ]
         );
     }
 
@@ -5425,6 +7168,94 @@ mod tests {
     }
 
     #[test]
+    fn monitor_listener_loss_retains_live_proxy_until_restore_can_be_retried() {
+        let (mut controller, proxy, stops, alive) =
+            controller_with_system_proxy(Arc::new(FakeProber(true)));
+        let listener = Arc::new(AtomicBool::new(true));
+        controller.services.listener = Arc::new(ToggleListener(listener.clone()));
+        let node = import_node(&controller);
+        controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Vpn))
+            .unwrap();
+        let original = controller.status();
+        listener.store(false, Ordering::SeqCst);
+        proxy.fail_restore.store(true, Ordering::SeqCst);
+        controller.lock_state().active.as_mut().unwrap().last_probe =
+            Instant::now() - Duration::from_secs(11);
+
+        controller.monitor_tick();
+
+        assert_eq!(controller.status().phase, RuntimePhase::RecoveryRequired);
+        let ports = |status: RuntimeStatus| {
+            status
+                .ports
+                .map(|ports| (ports.http, ports.socks, ports.health))
+        };
+        assert_eq!(ports(controller.status()), ports(original.clone()));
+        assert_eq!(controller.status().session_id, original.session_id);
+        assert!(controller.lock_state().active.is_some());
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert!(alive.load(Ordering::SeqCst));
+        assert!(proxy.restore_saw_live_core.load(Ordering::SeqCst));
+        assert!(controller.retry_session_recovery().is_err());
+        assert!(controller.lock_state().active.is_some());
+
+        proxy.fail_restore.store(false, Ordering::SeqCst);
+        assert_eq!(
+            controller.retry_session_recovery().unwrap().phase,
+            RuntimePhase::Disconnected
+        );
+        assert!(controller.lock_state().active.is_none());
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert!(!alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn monitor_process_death_keeps_recovery_handle_when_proxy_restore_fails() {
+        let (controller, proxy, _, alive) =
+            controller_with_system_proxy(Arc::new(FakeProber(true)));
+        let node = import_node(&controller);
+        controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Vpn))
+            .unwrap();
+        alive.store(false, Ordering::SeqCst);
+        proxy.fail_restore.store(true, Ordering::SeqCst);
+        controller.monitor_tick();
+        assert_eq!(controller.status().phase, RuntimePhase::RecoveryRequired);
+        assert!(controller.lock_state().active.is_some());
+        proxy.fail_restore.store(false, Ordering::SeqCst);
+        assert_eq!(
+            controller.retry_session_recovery().unwrap().phase,
+            RuntimePhase::Disconnected
+        );
+        assert!(controller.lock_state().active.is_none());
+    }
+
+    #[test]
+    fn monitor_cleanup_failure_retains_child_and_does_not_restore_proxy_twice() {
+        let (mut controller, proxy, stops, alive) =
+            controller_with_system_proxy_stop_behavior(Arc::new(FakeProber(true)), true);
+        let listener = Arc::new(AtomicBool::new(true));
+        controller.services.listener = Arc::new(ToggleListener(listener.clone()));
+        let node = import_node(&controller);
+        controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Vpn))
+            .unwrap();
+        listener.store(false, Ordering::SeqCst);
+        controller.lock_state().active.as_mut().unwrap().last_probe =
+            Instant::now() - Duration::from_secs(11);
+        controller.monitor_tick();
+        assert_eq!(controller.status().phase, RuntimePhase::RecoveryRequired);
+        assert!(controller.lock_state().active.is_some());
+        assert!(alive.load(Ordering::SeqCst));
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert_eq!(proxy.restores.load(Ordering::SeqCst), 1);
+        assert!(controller.retry_session_recovery().is_err());
+        assert_eq!(proxy.restores.load(Ordering::SeqCst), 1);
+        assert!(controller.lock_state().active.is_some());
+    }
+
+    #[test]
     fn ambiguous_system_proxy_publish_failure_keeps_the_core_alive() {
         let (controller, proxy, stops, alive) =
             controller_with_system_proxy(Arc::new(FakeProber(true)));
@@ -5438,6 +7269,26 @@ mod tests {
         assert_eq!(controller.status().phase, RuntimePhase::RecoveryRequired);
         assert_eq!(stops.load(Ordering::SeqCst), 0);
         assert!(alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn rejected_foreign_proxy_publish_stops_local_core_without_attempting_restore() {
+        let (controller, proxy, stops, alive) =
+            controller_with_system_proxy(Arc::new(FakeProber(true)));
+        let node = import_node(&controller);
+        proxy.reject_publish_unchanged.store(true, Ordering::SeqCst);
+        let error = controller
+            .start_system_proxy(&node, system_routing(DefaultRoute::Vpn))
+            .unwrap_err();
+        assert_eq!(error.stage, PublicErrorStage::SystemProxyPublish);
+        assert_eq!(
+            controller.status().phase,
+            RuntimePhase::DisconnectedWithError
+        );
+        assert_eq!(proxy.restores.load(Ordering::SeqCst), 0);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert!(!alive.load(Ordering::SeqCst));
+        assert!(controller.lock_state().active.is_none());
     }
 
     #[test]

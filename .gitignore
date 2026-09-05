@@ -11,3 +11,4 @@ src-tauri/gen/
 .env.*
 !.env.example
 .cache/
+artifacts/

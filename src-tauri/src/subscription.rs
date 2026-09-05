@@ -1327,8 +1327,13 @@ fn string_array(value: Option<&Value>, message: &'static str) -> Result<Vec<Stri
 }
 
 fn host(url: &Url) -> Result<String, ImportError> {
-    url.host_str()
-        .map(str::to_owned)
+    // URL syntax brackets IPv6 literals; engine server fields and TLS names do not.
+    url.host()
+        .map(|host| match host {
+            url::Host::Domain(domain) => domain.to_owned(),
+            url::Host::Ipv4(address) => address.to_string(),
+            url::Host::Ipv6(address) => address.to_string(),
+        })
         .ok_or_else(|| ImportError::new("server address is required"))
 }
 
@@ -1713,6 +1718,40 @@ mod tests {
             .nodes
             .iter()
             .all(|node| node.source_format() == SourceFormat::Base64List));
+    }
+
+    #[test]
+    fn imports_naive_share_links_with_encoded_credentials() {
+        for (scheme, quic) in [("naive+https", false), ("naive+quic", true)] {
+            let link =
+                format!("{scheme}://fixture%40user:fixture%3Apa%25ss@example.test#My%20Naive");
+            let report = import_subscription(link.as_bytes()).unwrap();
+            assert_eq!(report.nodes[0].display_name(), "My Naive");
+            let NodeProtocol::Naive(naive) = report.nodes[0].protocol() else {
+                panic!("expected Naive");
+            };
+            assert_eq!(naive.username.as_ref().unwrap().expose(), "fixture@user");
+            assert_eq!(naive.password.as_ref().unwrap().expose(), "fixture:pa%ss");
+            assert_eq!(naive.server_port, 443);
+            assert_eq!(naive.quic, quic);
+            assert_eq!(naive.tls.server_name.as_deref(), Some("example.test"));
+        }
+    }
+
+    #[test]
+    fn imports_ipv6_share_link_authorities_without_url_brackets() {
+        for link in [
+            "naive+https://fixture:password@[2001:db8::1]:8443#IPv6".to_owned(),
+            "naive+quic://fixture:password@[2001:db8::1]:8443#IPv6".to_owned(),
+            "hysteria2://fixture@[2001:db8::1]:8443#IPv6".to_owned(),
+            format!("vless://{UUID}@[2001:db8::1]:8443?security=tls#IPv6"),
+        ] {
+            let report = import_subscription(link.as_bytes()).unwrap();
+            assert_eq!(report.nodes[0].server(), "2001:db8::1");
+            if let NodeProtocol::Naive(naive) = report.nodes[0].protocol() {
+                assert_eq!(naive.tls.server_name.as_deref(), Some("2001:db8::1"));
+            }
+        }
     }
 
     #[test]
