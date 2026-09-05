@@ -72,6 +72,13 @@ jobs:
           retention-days: 7
       - name: Prepare frontend
         run: npm --ignore-scripts run build
+      - name: Verify frontend checks leave source clean
+        run: |
+          $changes = @(git status --porcelain --untracked-files=all)
+          if ($LASTEXITCODE -ne 0 -or $changes.Count -ne 0) {
+            $changes | ForEach-Object { Write-Output $_ }
+            throw 'Frontend checks changed the source tree'
+          }
       - name: Fetch locked Rust dependencies
         run: cargo fetch --locked --manifest-path src-tauri/Cargo.toml
       - name: Offline native tests
@@ -89,7 +96,10 @@ jobs:
       - name: Verify source remains clean
         run: |
           $changes = @(git status --porcelain --untracked-files=all)
-          if ($LASTEXITCODE -ne 0 -or $changes.Count -ne 0) { throw 'Build changed tracked source or lock files' }
+          if ($LASTEXITCODE -ne 0 -or $changes.Count -ne 0) {
+            $changes | ForEach-Object { Write-Output $_ }
+            throw 'Build changed tracked source or lock files'
+          }
       - name: Upload verified controller archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

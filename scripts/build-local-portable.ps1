@@ -27,6 +27,8 @@ if ($LASTEXITCODE -ne 0 -or $sourceCommit -cnotmatch '^[0-9a-f]{40}$') {
 }
 $trackedChanges = @(& git.exe -C $repoRoot status --porcelain --untracked-files=all)
 if ($LASTEXITCODE -ne 0 -or $trackedChanges.Count -ne 0) {
+  # Names/status only: never print file contents that may contain local secrets.
+  $trackedChanges | ForEach-Object { Write-Output $_ }
   throw 'Portable build metadata requires a clean tracked source tree'
 }
 $buildMetadata = "RouteDeckBuildCommit=$sourceCommit"
