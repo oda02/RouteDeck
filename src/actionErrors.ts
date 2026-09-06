@@ -20,6 +20,12 @@ export function toPublicActionError(error: unknown): PublicActionError {
         return { message: "Не удалось запросить права Windows для TUN. Перезапустите RouteDeck и попробуйте снова." };
       case "tun-uac-cancelled":
         return { message: "Запрос прав Windows отменён. Нажмите «Подключить» ещё раз и подтвердите стандартное окно Windows." };
+      case "server-switch-failed":
+        return { message: "Не удалось сменить сервер. TUN не перезапускался. Выберите другой сервер или откройте диагностику.", redactedDetail: error.redactedDetail };
+      case "server-switch-not-prepared":
+        return { message: "Этот сервер отсутствует в текущей сессии или был обновлён. Чтобы загрузить его, отключите и снова подключите VPN. Это прервёт существующие соединения." };
+      case "server-switch-uncertain":
+        return { message: "Не удалось подтвердить выбранный выход. TUN сохранён. Откройте диагностику; для новой сессии потребуется отключение и повторное подключение." };
       case "runtime-failure":
         return {
           message: "Не удалось выполнить действие. Повторите попытку или откройте диагностику.",
