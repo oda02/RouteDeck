@@ -72,8 +72,12 @@ without a saved URL ask for it once on refresh. Each subscription header offers 
 and deletion; standalone groups can be deleted. Refresh replaces only that source and
 preserves node IDs across reordering. Failed downloads preserve the old source.
 
-Server and mode changes while connected automatically stop and reconnect in sequence.
-Disconnect cancels pending restart; a restoration error prevents another core starting.
+In TUN, selecting a prepared server keeps the same engine and adapter: a separate
+HTTPS check runs first, new connections then use that server, and existing connections
+remain on their old exits while available. Failed candidates do not restart TUN.
+See [TUN server switching and verification limits](docs/tun-server-switching.md).
+System Proxy server changes and capture-mode changes still stop and reconnect in sequence.
+Disconnect cancels pending work; a restoration error prevents another core starting.
 Refreshing the active source reconnects afterward; deleting it leaves RouteDeck
 disconnected. Home displays actual active server/mode separately from the selection.
 Its latency is a warm HTTP response measurement, separate from the HTTPS readiness proof.

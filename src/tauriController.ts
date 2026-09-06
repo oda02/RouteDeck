@@ -458,6 +458,8 @@ function routeDeckErrorFromBackend(error: PublicErrorDto): RouteDeckError {
       if (["subscription.source_missing", "subscription.source_changed", "subscription.source_invalid"].includes(error.message)) return new RouteDeckError("source-changed");
       return new RouteDeckError("subscription-import-rejected");
     case "active_session_conflict":
+      if (error.message === "switch_server.not_prepared") return new RouteDeckError("server-switch-not-prepared");
+      if (error.message === "switch_server.uncertain") return new RouteDeckError("server-switch-uncertain");
       if (error.stage === "import") return new RouteDeckError("import-requires-disconnect");
       return new RouteDeckError("runtime-failure", error.detail);
     case "preview_missing":
@@ -704,6 +706,25 @@ export class TauriController implements RouteDeckController {
           if (this.runtime?.nodeId === nodeId && this.runtime.mode === expectedMode
             && this.routingRevision === this.runtimeRoutingRevision
             && (isVerifiedSystemProxyReady(this.runtime) || isVerifiedTunReady(this.runtime) || isVerifiedLocalReady(this.runtime) || this.runtime.phase === "degraded")) return;
+          if (mode === "tun" && this.runtime?.mode === "tun" && this.runtime.sessionId
+            && this.routingRevision === this.runtimeRoutingRevision) {
+            const sessionId = this.runtime.sessionId;
+            try {
+              await this.invokeStatus("switch_tun_server", { sessionId, nodeId });
+              if (this.runtime?.sessionId !== sessionId || this.runtime.nodeId !== nodeId || !isVerifiedTunReady(this.runtime)) {
+                throw new RouteDeckError("runtime-failure");
+              }
+            } catch (error) {
+              // A failed candidate leaves the old session serving traffic. Never fall
+              // back to stop/start; a newer selection may still be tried normally.
+              if (this.wantsConnection && this.snapshot.selectedServerId !== nodeId) continue;
+              if (error instanceof RouteDeckError && error.code === "runtime-failure") {
+                throw new RouteDeckError("server-switch-failed", error.redactedDetail);
+              }
+              throw error;
+            }
+            continue;
+          }
           await this.stopRuntime();
           continue;
         }
@@ -715,7 +736,7 @@ export class TauriController implements RouteDeckController {
       }
     } catch (error) {
       const cancelled = !this.wantsConnection;
-      this.wantsConnection = false;
+      if (!(this.runtime?.mode === "tun" && this.hasRuntimeSession())) this.wantsConnection = false;
       if (cancelled && this.hasRuntimeSession()) await this.stopRuntime();
       throw error;
     }
@@ -1049,7 +1070,7 @@ export class TauriController implements RouteDeckController {
     const tunChanged = effectiveTunKey(saved) !== effectiveTunKey(this.snapshot.routing);
     const tunUsesPolicy = this.runtime?.mode === "tun" || (this.wantsConnection && this.snapshot.mode === "tun");
     const naiveChanged = saved.naiveUdpOverTcp !== this.snapshot.routing.naiveUdpOverTcp
-      && this.snapshot.servers.some((server) => server.protocol === "Naive" && (server.id === this.runtime?.nodeId || server.id === this.snapshot.selectedServerId));
+      && this.snapshot.servers.some((server) => server.protocol === "Naive" && (tunUsesPolicy || server.id === this.runtime?.nodeId || server.id === this.snapshot.selectedServerId));
     const changesRuntime = effectiveRoutingKey(saved) !== effectiveRoutingKey(this.snapshot.routing) || (tunChanged && tunUsesPolicy) || naiveChanged;
     try {
       if (typeof window !== "undefined") window.localStorage.setItem(ROUTING_STORAGE_KEY, JSON.stringify(saved));

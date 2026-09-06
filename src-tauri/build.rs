@@ -10,6 +10,7 @@ fn main() {
         "start_local_proxy",
         "start_system_proxy",
         "start_tun",
+        "switch_tun_server",
         "runtime_status",
         "confirmed_nodes",
         "reset_local_state",

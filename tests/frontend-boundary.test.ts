@@ -31,7 +31,7 @@ async function lifecycleFixture(connected = true, protocol = "vless") {
   const sourceId = "a".repeat(32);
   let nodes = ["a", "b", "c"].map((id) => ({ id, displayName: `Server ${id}`, protocol, insecureTls: false,
     sourceId: id === "c" ? "b".repeat(32) : sourceId, sourceName: id === "c" ? "Other" : "Subscription", sourceKind: "subscription", sourceRefreshable: true, sourceUpdatedAtMs: 100 }));
-  const hooks: { stop?: () => Promise<unknown>; start?: () => Promise<unknown>; refresh?: () => Promise<unknown> } = {};
+  const hooks: { stop?: () => Promise<unknown>; start?: () => Promise<unknown>; refresh?: () => Promise<unknown>; switch?: (nodeId: string) => Promise<unknown> } = {};
   const status = (phase: RuntimeStatusDto["phase"], nodeId = "a") => ({ ...runtimeStatus(++revision, phase), ...(phase === "disconnected" ? {} : { nodeId }) });
   const transport: TauriTransport = {
     listen: async () => () => undefined,
@@ -41,6 +41,7 @@ async function lifecycleFixture(connected = true, protocol = "vless") {
       if (command === "confirmed_nodes") return nodes;
       if (command.startsWith("stop_")) return hooks.stop ? hooks.stop() : status("disconnected");
       if (command.startsWith("start_")) return hooks.start ? hooks.start() : status(command === "start_tun" ? "tun_ready" : "system_proxy_ready", arguments_?.nodeId as string);
+      if (command === "switch_tun_server") return hooks.switch ? hooks.switch(arguments_?.nodeId as string) : status("tun_ready", arguments_?.nodeId as string);
       if (command === "refresh_source") {
         if (hooks.refresh) return hooks.refresh();
         nodes = nodes.map((node) => node.sourceId === sourceId ? { ...node, sourceUpdatedAtMs: 200 } : node);
@@ -1891,4 +1892,64 @@ test("a missing steady sample never falls back to cold HTTPS time or clears a pr
   assert.equal(controller.getSnapshot().servers[0].latencyMs, undefined);
   assert.equal(controller.getSnapshot().phase, "connected");
   controller.dispose();
+});
+
+
+test("TUN server selection uses one session without stop/start", async () => {
+  const f = await lifecycleFixture();
+  try {
+    await f.controller.setMode("tun");
+    f.calls.length = 0;
+    await f.controller.selectServer("b");
+    await f.controller.selectServer("c");
+    assert.deepEqual(f.calls.map(call => call.command), ["switch_tun_server", "switch_tun_server"]);
+    assert.deepEqual(f.calls[0].arguments_, {sessionId:"fixture-session", nodeId:"b"});
+    assert.equal(f.controller.getSnapshot().activeServerId, "c");
+    assert.equal(f.controller.getSnapshot().phase, "connected");
+  } finally { f.controller.dispose(); }
+});
+
+test("failed TUN candidate keeps the old session and allows another candidate", async () => {
+  const f = await lifecycleFixture();
+  try {
+    await f.controller.setMode("tun"); f.calls.length = 0;
+    f.hooks.switch = async () => { throw {code:"runtime_failure",stage:"prove_traffic",message:"Candidate unavailable"}; };
+    await assert.rejects(f.controller.selectServer("b"));
+    assert.equal(f.controller.getSnapshot().activeServerId, "a");
+    f.hooks.switch = undefined;
+    await f.controller.selectServer("c");
+    assert.equal(f.controller.getSnapshot().activeServerId, "c");
+    assert.equal(f.calls.filter(call => call.command.startsWith("stop_") || call.command.startsWith("start_")).length, 0);
+  } finally { f.controller.dispose(); }
+});
+
+test("disconnect during a TUN candidate check stops once without starting another core", async () => {
+  const f = await lifecycleFixture();
+  const entered = deferred(); const response = deferred<unknown>();
+  try {
+    await f.controller.setMode("tun"); f.calls.length = 0;
+    f.hooks.switch = async () => { entered.resolve(); return response.promise; };
+    const selecting = f.controller.selectServer("b");
+    await entered.promise;
+    const stopping = f.controller.disconnect();
+    response.resolve(f.status("tun_ready", "b"));
+    await Promise.all([selecting, stopping]);
+    assert.deepEqual(f.calls.map(call => call.command), ["switch_tun_server", "stop_tun"]);
+    assert.equal(f.controller.getSnapshot().phase, "disconnected");
+  } finally { f.controller.dispose(); }
+});
+
+test("rapid TUN selection applies the last requested server without replacing the adapter", async () => {
+  const f = await lifecycleFixture();
+  const entered = deferred(); const response = deferred<unknown>();
+  try {
+    await f.controller.setMode("tun"); f.calls.length = 0;
+    f.hooks.switch = async () => { entered.resolve(); return response.promise; };
+    const first = f.controller.selectServer("b"); await entered.promise;
+    const last = f.controller.selectServer("c"); f.hooks.switch = undefined;
+    response.resolve(f.status("tun_ready", "b"));
+    await Promise.all([first,last]);
+    assert.deepEqual(f.calls.map(call => call.command), ["switch_tun_server", "switch_tun_server"]);
+    assert.equal(f.controller.getSnapshot().activeServerId, "c");
+  } finally { f.controller.dispose(); }
 });

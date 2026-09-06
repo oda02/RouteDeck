@@ -14,6 +14,7 @@
     "allow-start-local-proxy",
     "allow-start-system-proxy",
     "allow-start-tun",
+    "allow-switch-tun-server",
     "allow-runtime-status",
     "allow-confirmed-nodes",
     "allow-reset-local-state",

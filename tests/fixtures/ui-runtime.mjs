@@ -69,6 +69,11 @@ const transport = {
       await sleep(fixture.startDelay);
       return emit(status(mode === "tun" ? "tun_ready" : "system_proxy_ready", mode, args.nodeId));
     }
+    if (command === "switch_tun_server") {
+      await sleep(fixture.startDelay);
+      if (fixture.failSwitch) throw { code: "runtime_failure", stage: "prove_traffic", message: "fixture candidate failed" };
+      return emit(status("tun_ready", "tun", args.nodeId));
+    }
     if (command.startsWith("stop_")) {
       await sleep(35);
       if (fixture.failStop) throw { code: "runtime_failure", stage: "system_proxy_restore", message: "fixture stop failed" };
