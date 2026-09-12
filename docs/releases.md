@@ -95,6 +95,15 @@ blanket legal compliance claim or a license grant for RouteDeck's own source.
 
 ## Hosting and verification
 
+The active `Protect main` repository ruleset requires a pull request, resolved
+review conversations and a successful `build / windows` check from GitHub Actions
+(app ID 15368), tested against the latest base branch. Direct pushes, force pushes
+and branch deletion are blocked; there are no bypass actors. A second person's
+approval is optional so a sole maintainer can merge their own tested PR. These
+rules target `refs/heads/main`; version tags keep the release workflow described
+above. Inspect the live rules in
+[repository settings](https://github.com/oda02/RouteDeck/settings/rules/22347978).
+
 The repository is public after a bounded scan of working source and reachable Git
 history for credentials. GitHub provides standard hosted runners free for public
 repositories, subject to concurrency, execution and service limits; larger runners
