@@ -267,3 +267,17 @@ fn command_join_error(_error: impl std::fmt::Display) -> PublicError {
         detail: None,
     }
 }
+
+#[tauri::command]
+pub async fn switch_tun_server(
+    controller: State<'_, Arc<ApplicationController>>,
+    node_id: String,
+    session_id: String,
+) -> Result<RuntimeStatus, PublicError> {
+    let controller = Arc::clone(controller.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        controller.switch_tun_server(&session_id, &node_id)
+    })
+    .await
+    .map_err(command_join_error)?
+}

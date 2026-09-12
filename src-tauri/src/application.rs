@@ -1,3 +1,6 @@
+#[path = "server_switch_application.rs"]
+mod switching;
+use crate::server_switch::{ClashSelectorControl, SelectorControl};
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
@@ -6,6 +9,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use switching::TunSwitchSession;
 
 use serde::{Deserialize, Serialize};
 
@@ -465,7 +469,7 @@ impl Drop for ProvisionalChild {
 struct RealityProcessPair {
     front: Box<dyn ManagedChild>,
     sidecar: Box<dyn ManagedChild>,
-    sidecar_port: u16,
+    sidecar_ports: Vec<u16>,
     listener: Arc<dyn ListenerVerifier>,
     _sidecar_config: SessionConfig,
 }
@@ -479,8 +483,10 @@ impl ManagedChild for RealityProcessPair {
         if !self.front.is_alive()? || !self.sidecar.is_alive()? {
             return Ok(false);
         }
-        self.listener
-            .verify_sidecar_owned_now(self.sidecar_port, self.sidecar.as_mut())?;
+        for port in &self.sidecar_ports {
+            self.listener
+                .verify_sidecar_owned_now(*port, self.sidecar.as_mut())?;
+        }
         Ok(true)
     }
 
@@ -510,6 +516,7 @@ struct RuntimeServices {
     subscription_fetcher: Arc<dyn SubscriptionFetcher>,
     system_proxy: Arc<dyn SystemProxyControl>,
     tun_privilege: Arc<dyn TunPrivilegeControl>,
+    selector: Arc<dyn SelectorControl>,
 }
 
 fn reconcile_all_sessions(root: &Path) -> Result<(), RuntimeError> {
@@ -607,6 +614,7 @@ struct StoredNode {
 }
 
 struct ActiveSession {
+    switching: Option<TunSwitchSession>,
     child: Box<dyn ManagedChild>,
     _config: SessionConfig,
     node_id: String,
@@ -831,6 +839,7 @@ impl ApplicationController {
                 subscription_fetcher,
                 system_proxy,
                 tun_privilege: Arc::new(PlatformTunPrivilege),
+                selector: Arc::new(ClashSelectorControl),
             },
             session_root,
             subscription_store: None,
@@ -1890,6 +1899,18 @@ impl ApplicationController {
                 "Review preserved recovery data before reconnecting",
             ));
         }
+        if state
+            .active
+            .as_ref()
+            .and_then(|active| active.switching.as_ref())
+            .is_some_and(|switching| switching.uncertain)
+        {
+            return Err(PublicError::fixed(
+                PublicErrorCode::ActiveSessionConflict,
+                PublicErrorStage::Start,
+                "switch_server.uncertain",
+            ));
+        }
         if state.active.is_some() {
             let exact = state.active.as_ref().is_some_and(|active| {
                 active.mode == RuntimeMode::Tun
@@ -2054,7 +2075,7 @@ impl ApplicationController {
             RuntimeMode::Tun,
             Some(stack),
             Some(traffic_rules),
-            naive_udp_over_tcp,
+            requested_naive_udp_over_tcp,
             redactor.clone(),
         );
         let Err(error) = result else {
@@ -2202,8 +2223,25 @@ impl ApplicationController {
             tun_upstream: tun_upstream.clone(),
             naive_udp_over_tcp,
         };
-        let mut bridge_reservation = None;
-        let generated = if reality {
+        let mut bridge_reservations = Vec::new();
+        let mut switch_reservations = Vec::new();
+        let mut switching = None;
+        let (generated_text, xray_text, redactor) = if mode == RuntimeMode::Tun {
+            let prepared = self.prepare_switchable_tun(
+                state,
+                node,
+                &policy,
+                capture_mode.clone(),
+                ports,
+                &password,
+                tun_upstream.clone().expect("TUN upstream"),
+                naive_udp_over_tcp,
+            )?;
+            bridge_reservations = prepared.bridges;
+            switch_reservations = prepared.reservations;
+            switching = Some(prepared.switching);
+            (prepared.config, prepared.xray, prepared.redactor)
+        } else if reality {
             let reservation = LoopbackPortReservation::reserve()?;
             let generated = generate_socks_bridge_config(
                 request(),
@@ -2212,25 +2250,30 @@ impl ApplicationController {
                 },
             )
             .map_err(|error| RuntimeError::new("generate_config", error.to_string()))?;
-            bridge_reservation = Some(reservation);
-            generated
-        } else {
-            generate_config(request())
-                .map_err(|error| RuntimeError::new("generate_config", error.to_string()))?
-        };
-        let session = SessionConfig::create(&self.session_root, generated.as_str())?;
-        let mut process_redactor = redactor
-            .clone()
-            .with_secret(&password)
-            .with_secret(&session.path().to_string_lossy());
-        let sidecar_session = if let Some(reservation) = bridge_reservation.as_ref() {
-            let generated = generate_xray_bridge_config(XrayBridgeRequest {
+            let xray = generate_xray_bridge_config(XrayBridgeRequest {
                 node,
                 listen_port: reservation.port(),
                 tun_upstream: tun_upstream.clone(),
             })
             .map_err(|error| RuntimeError::new("generate_config", error.to_string()))?;
-            let sidecar = SessionConfig::create(&self.session_root, generated.as_str())?;
+            bridge_reservations.push(reservation);
+            (
+                generated.as_str().to_owned(),
+                Some(xray.as_str().to_owned()),
+                redactor,
+            )
+        } else {
+            let generated = generate_config(request())
+                .map_err(|error| RuntimeError::new("generate_config", error.to_string()))?;
+            (generated.as_str().to_owned(), None, redactor)
+        };
+        let session = SessionConfig::create(&self.session_root, &generated_text)?;
+        let mut process_redactor = redactor
+            .clone()
+            .with_secret(&password)
+            .with_secret(&session.path().to_string_lossy());
+        let sidecar_session = if let Some(text) = xray_text {
+            let sidecar = SessionConfig::create(&self.session_root, &text)?;
             process_redactor = process_redactor.with_secret(&sidecar.path().to_string_lossy());
             Some(sidecar)
         } else {
@@ -2277,23 +2320,32 @@ impl ApplicationController {
             Some(node.id().to_owned()),
             None,
         );
-        let sidecar = if let (Some(reservation), Some(sidecar), Some(launcher)) =
-            (bridge_reservation, sidecar_session, sidecar_launcher.take())
-        {
-            let sidecar_port = reservation.port();
+        let sidecar =
+            if let (Some(sidecar), Some(launcher)) = (sidecar_session, sidecar_launcher.take()) {
+                let sidecar_ports: Vec<_> = bridge_reservations
+                    .iter()
+                    .map(LoopbackPortReservation::port)
+                    .collect();
+                for reservation in bridge_reservations {
+                    reservation.release();
+                }
+                let mut child = ProvisionalChild::new(launcher.start(
+                    &sidecar,
+                    process_redactor.clone(),
+                    self.diagnostics.clone(),
+                )?);
+                for port in &sidecar_ports {
+                    self.services
+                        .listener
+                        .wait_until_sidecar_ready(*port, child.as_mut())?;
+                }
+                Some((child, sidecar, sidecar_ports))
+            } else {
+                None
+            };
+        for reservation in switch_reservations {
             reservation.release();
-            let mut child = ProvisionalChild::new(launcher.start(
-                &sidecar,
-                process_redactor.clone(),
-                self.diagnostics.clone(),
-            )?);
-            self.services
-                .listener
-                .wait_until_sidecar_ready(sidecar_port, child.as_mut())?;
-            Some((child, sidecar, sidecar_port))
-        } else {
-            None
-        };
+        }
         reservations.release();
         let front = ProvisionalChild::new(launcher.start(
             &session,
@@ -2301,11 +2353,11 @@ impl ApplicationController {
             self.diagnostics.clone(),
         )?);
         let child: Box<dyn ManagedChild> =
-            if let Some((sidecar, sidecar_config, sidecar_port)) = sidecar {
+            if let Some((sidecar, sidecar_config, sidecar_ports)) = sidecar {
                 Box::new(RealityProcessPair {
                     front: front.take(),
                     sidecar: sidecar.take(),
-                    sidecar_port,
+                    sidecar_ports,
                     listener: Arc::clone(&self.services.listener),
                     _sidecar_config: sidecar_config,
                 })
@@ -2314,6 +2366,7 @@ impl ApplicationController {
             };
         let health_route = HealthRoute::new(ports.health, password);
         state.active = Some(ActiveSession {
+            switching,
             child,
             _config: session,
             node_id: node.id().to_owned(),
@@ -2324,7 +2377,8 @@ impl ApplicationController {
             routing: policy,
             tun_stack,
             tun_traffic_rules,
-            naive_udp_over_tcp,
+            naive_udp_over_tcp: naive_udp_over_tcp
+                && matches!(node.protocol(), NodeProtocol::Naive(_)),
             system_proxy_requires_restore: false,
             ports,
             health_route: health_route.clone(),
@@ -2887,6 +2941,13 @@ impl ApplicationController {
                     return;
                 }
             }
+        }
+        if active
+            .switching
+            .as_ref()
+            .is_some_and(|switching| switching.uncertain)
+        {
+            return;
         }
         if active.last_probe.elapsed() < Duration::from_secs(10) {
             return;
@@ -3882,10 +3943,15 @@ mod tests {
                 serde_json::from_str(&std::fs::read_to_string(config.path()).unwrap())
                     .expect("fixture config must be JSON");
             let bridge = if self.kind == EngineKind::SingBox {
-                assert_eq!(value["outbounds"][0]["type"], "socks");
-                assert!(value["outbounds"][0].get("username").is_none());
-                assert!(value["outbounds"][0].get("password").is_none());
-                value["outbounds"][0]["server_port"].as_u64().unwrap() as u16
+                let bridge = value["outbounds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|v| v["type"] == "socks")
+                    .unwrap();
+                assert!(bridge.get("username").is_none());
+                assert!(bridge.get("password").is_none());
+                bridge["server_port"].as_u64().unwrap() as u16
             } else {
                 assert_eq!(value["inbounds"][0]["settings"]["auth"], "noauth");
                 assert!(value["inbounds"][0]["settings"].get("accounts").is_none());
@@ -4483,6 +4549,305 @@ mod tests {
 
     fn import_node(controller: &ApplicationController) -> String {
         import_node_from(controller, NODE)
+    }
+
+    #[derive(Default)]
+    struct FakeSelector {
+        selected: Mutex<usize>,
+        candidate: Mutex<usize>,
+        calls: Mutex<Vec<String>>,
+        lost_reply: AtomicBool,
+        fail_reads: AtomicBool,
+    }
+
+    impl crate::server_switch::SelectorControl for FakeSelector {
+        fn select(
+            &self,
+            _: &crate::server_switch::SwitchControl,
+            selector: crate::server_switch::Selector,
+            index: usize,
+        ) -> Result<(), RuntimeError> {
+            use crate::server_switch::Selector;
+            let (name, target) = match selector {
+                Selector::Selected => ("selected", &self.selected),
+                Selector::Candidate => ("candidate", &self.candidate),
+            };
+            self.calls.lock().unwrap().push(format!("{name}:{index}"));
+            *target.lock().unwrap() = index;
+            if matches!(selector, Selector::Selected) && self.lost_reply.load(Ordering::SeqCst) {
+                return Err(crate::server_switch::rejected());
+            }
+            Ok(())
+        }
+        fn current(
+            &self,
+            _: &crate::server_switch::SwitchControl,
+            selector: crate::server_switch::Selector,
+        ) -> Result<String, RuntimeError> {
+            use crate::server_switch::Selector;
+            let target = match selector {
+                Selector::Selected => &self.selected,
+                Selector::Candidate => &self.candidate,
+            };
+            if matches!(selector, Selector::Selected) && self.fail_reads.load(Ordering::SeqCst) {
+                return Err(crate::server_switch::rejected());
+            }
+            Ok(crate::server_switch::node_tag(*target.lock().unwrap()))
+        }
+    }
+
+    #[test]
+    fn tun_switch_keeps_child_adapter_session_and_old_connections_owned_until_stop() {
+        let (mut controller, stops, alive) = controller_with_tun(true, true, false);
+        let first = import_node(&controller);
+        let second = import_node_from(
+            &controller,
+            &NODE
+                .replace("example.test", "second.test")
+                .replace("#", "#Second-"),
+        );
+        assert_ne!(first, second);
+        let selector = Arc::new(FakeSelector::default());
+        controller.services.selector = selector.clone();
+        let ready = controller
+            .start_tun(&first, tun_routing(DefaultRoute::Vpn))
+            .unwrap();
+        let (pid, luid) = {
+            let mut state = controller.lock_state();
+            let active = state.active.as_mut().unwrap();
+            (
+                active.child.pid(),
+                active.child.tun_capture_snapshot().unwrap().interface_luid,
+            )
+        };
+        for id in [&second, &first, &second] {
+            let switched = controller
+                .switch_tun_server(ready.session_id.as_deref().unwrap(), id)
+                .unwrap();
+            assert_eq!(switched.phase, RuntimePhase::TunReady);
+            assert_eq!(switched.node_id.as_deref(), Some(id.as_str()));
+            assert_eq!(switched.session_id, ready.session_id);
+            assert_eq!(switched.ports.unwrap().health, ready.ports.unwrap().health);
+            let mut state = controller.lock_state();
+            let active = state.active.as_mut().unwrap();
+            assert_eq!(active.child.pid(), pid);
+            assert_eq!(
+                active.child.tun_capture_snapshot().unwrap().interface_luid,
+                luid
+            );
+            assert_eq!(stops.load(Ordering::SeqCst), 0);
+            assert!(alive.load(Ordering::SeqCst));
+        }
+        assert_eq!(
+            *selector.calls.lock().unwrap(),
+            [
+                "candidate:1",
+                "selected:1",
+                "candidate:0",
+                "selected:0",
+                "candidate:1",
+                "selected:1"
+            ]
+        );
+        controller.stop().unwrap();
+        controller.stop().unwrap();
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn tun_switch_candidate_failure_and_stale_requests_preserve_the_old_session() {
+        let (mut controller, stops, alive) = controller_with_tun(true, true, false);
+        let first = import_node(&controller);
+        let second = import_node_from(&controller, &NODE.replace("#", "#Second-"));
+        let selector = Arc::new(FakeSelector::default());
+        controller.services.selector = selector.clone();
+        let ready = controller
+            .start_tun(&first, tun_routing(DefaultRoute::Vpn))
+            .unwrap();
+        let session = ready.session_id.as_deref().unwrap();
+        assert!(controller
+            .switch_tun_server("stale-session", &second)
+            .is_err());
+        assert!(controller
+            .switch_tun_server(session, "../arbitrary")
+            .is_err());
+        assert!(selector.calls.lock().unwrap().is_empty());
+        controller.services.prober = Arc::new(FakeProber(false));
+        assert!(controller.switch_tun_server(session, &second).is_err());
+        assert_eq!(*selector.calls.lock().unwrap(), ["candidate:1"]);
+        assert_eq!(controller.status().node_id, ready.node_id);
+        assert_eq!(controller.status().session_id, ready.session_id);
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert!(alive.load(Ordering::SeqCst));
+        controller.services.prober = Arc::new(FakeProber(true));
+        controller.switch_tun_server(session, &second).unwrap();
+        controller.stop().unwrap();
+    }
+
+    #[test]
+    #[ignore = "Explicit fixture export for pinned-engine check; does not start engines or TUN"]
+    fn export_server_switch_fixtures() {
+        let (controller, _, _) = controller_with_tun(true, true, false);
+        let first = import_node(&controller);
+        import_node_from(
+            &controller,
+            "naive+https://fixture-user:fixture-password@example.test:443#Naive",
+        );
+        let reality = "vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&type=tcp&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2#Reality";
+        import_node_from(&controller, reality);
+        import_node_from(&controller, &reality.replace("example.test", "second.test"));
+        let state = controller.lock_state();
+        let prepared = controller
+            .prepare_switchable_tun(
+                &state,
+                &state.nodes[&first].node,
+                &tun_routing(DefaultRoute::Vpn).into_policy(),
+                CaptureMode::Tun(TunSettings::default()),
+                crate::config::LocalPorts {
+                    http: 18080,
+                    socks: 18081,
+                    health: 18082,
+                },
+                "fixture-health-secret",
+                TunUpstream {
+                    interface_alias: "Ethernet".into(),
+                    ipv4_dns_server: None,
+                },
+                false,
+            )
+            .unwrap();
+        let directory = PathBuf::from(
+            std::env::var_os("ROUTEDECK_SWITCH_FIXTURE_DIR")
+                .expect("explicit output directory required"),
+        );
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("sing-box.json"), prepared.config).unwrap();
+        std::fs::write(directory.join("xray.json"), prepared.xray.unwrap()).unwrap();
+    }
+
+    #[test]
+    fn tun_switch_reconciles_lost_reply_and_preserves_tun_when_selection_is_uncertain() {
+        let (mut controller, stops, alive) = controller_with_tun(true, true, false);
+        let first = import_node(&controller);
+        let second = import_node_from(&controller, &NODE.replace("#", "#Second-"));
+        let selector = Arc::new(FakeSelector::default());
+        controller.services.selector = selector.clone();
+        let ready = controller
+            .start_tun(&first, tun_routing(DefaultRoute::Vpn))
+            .unwrap();
+        selector.lost_reply.store(true, Ordering::SeqCst);
+        let session = ready.session_id.as_deref().unwrap();
+        assert!(controller.switch_tun_server(session, &second).is_ok());
+        selector.fail_reads.store(true, Ordering::SeqCst);
+        assert!(controller.switch_tun_server(session, &first).is_err());
+        assert_eq!(controller.status().phase, RuntimePhase::Degraded);
+        controller.monitor_tick();
+        assert_eq!(controller.status().phase, RuntimePhase::Degraded);
+        assert!(controller.switch_tun_server(session, &second).is_err());
+        assert!(controller
+            .start_tun(&second, tun_routing(DefaultRoute::Vpn))
+            .is_err());
+        assert_eq!(controller.status().phase, RuntimePhase::Degraded);
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert!(alive.load(Ordering::SeqCst));
+        controller.stop().unwrap();
+    }
+
+    struct SwitchProofFailure(AtomicUsize);
+    impl TrafficProber for SwitchProofFailure {
+        fn prove(&self, _: &HealthRoute) -> Result<ProofResult, RuntimeError> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 1 {
+                return Err(crate::server_switch::rejected());
+            }
+            Ok(ProofResult { latency_ms: 42 })
+        }
+    }
+
+    #[test]
+    fn tun_switch_rolls_back_post_selection_failure_and_rejects_changed_profile_identity() {
+        let (mut controller, stops, _) = controller_with_tun(true, true, false);
+        let first = import_node(&controller);
+        let second = import_node_from(&controller, &NODE.replace("#", "#Second-"));
+        let selector = Arc::new(FakeSelector::default());
+        controller.services.selector = selector.clone();
+        let ready = controller
+            .start_tun(&first, tun_routing(DefaultRoute::Vpn))
+            .unwrap();
+        controller.services.prober = Arc::new(SwitchProofFailure(AtomicUsize::new(0)));
+        assert!(controller
+            .switch_tun_server(ready.session_id.as_deref().unwrap(), &second)
+            .is_err());
+        assert_eq!(
+            *selector.calls.lock().unwrap(),
+            ["candidate:1", "selected:1", "selected:0"]
+        );
+        assert_eq!(*selector.selected.lock().unwrap(), 0);
+        assert_eq!(controller.status().node_id, ready.node_id);
+        controller
+            .lock_state()
+            .nodes
+            .get_mut(&second)
+            .unwrap()
+            .config_identity = "refreshed-profile".into();
+        assert!(controller
+            .switch_tun_server(ready.session_id.as_deref().unwrap(), &second)
+            .is_err());
+        assert_eq!(selector.calls.lock().unwrap().len(), 3);
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        controller.stop().unwrap();
+    }
+
+    struct StaleSwitchProbe {
+        calls: AtomicUsize,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+    impl TrafficProber for StaleSwitchProbe {
+        fn prove(&self, _: &HealthRoute) -> Result<ProofResult, RuntimeError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.entered.wait();
+                self.release.wait();
+                return Err(crate::server_switch::rejected());
+            }
+            Ok(ProofResult { latency_ms: 42 })
+        }
+    }
+
+    #[test]
+    fn a_monitor_failure_from_before_the_switch_cannot_stop_or_relabel_the_new_selection() {
+        let (mut controller, stops, _) = controller_with_tun(true, true, false);
+        let first = import_node(&controller);
+        let second = import_node_from(&controller, &NODE.replace("#", "#Second-"));
+        controller.services.selector = Arc::new(FakeSelector::default());
+        let ready = controller
+            .start_tun(&first, tun_routing(DefaultRoute::Vpn))
+            .unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        controller.services.prober = Arc::new(StaleSwitchProbe {
+            calls: AtomicUsize::new(0),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        controller.lock_state().active.as_mut().unwrap().last_probe =
+            Instant::now() - Duration::from_secs(11);
+        let controller = Arc::new(controller);
+        let monitor = {
+            let controller = controller.clone();
+            thread::spawn(move || controller.monitor_tick())
+        };
+        entered.wait();
+        let switched = controller.switch_tun_server(ready.session_id.as_deref().unwrap(), &second);
+        release.wait();
+        monitor.join().unwrap();
+        assert!(switched.is_ok());
+        assert_eq!(controller.status().phase, RuntimePhase::TunReady);
+        assert_eq!(
+            controller.status().node_id.as_deref(),
+            Some(second.as_str())
+        );
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        controller.stop().unwrap();
     }
 
     fn import_node_from(controller: &ApplicationController, link: &str) -> String {
@@ -5476,7 +5841,7 @@ mod tests {
                 tun: false,
                 capture_calls: 0,
             }),
-            sidecar_port: 1,
+            sidecar_ports: vec![1],
             listener: Arc::new(FakeListener(true)),
             _sidecar_config: sidecar_config,
         };
@@ -5529,7 +5894,7 @@ mod tests {
                 message: "sidecar stop failed",
                 attempts: Arc::clone(&sidecar_attempts),
             }),
-            sidecar_port: 1,
+            sidecar_ports: vec![1],
             listener: Arc::new(FakeListener(true)),
             _sidecar_config: sidecar_config,
         };

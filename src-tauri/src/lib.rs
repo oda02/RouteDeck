@@ -9,6 +9,7 @@ pub mod health;
 pub mod redaction;
 pub mod running_applications;
 mod runtime_constants;
+mod server_switch;
 pub mod subscription;
 pub mod subscription_fetch;
 mod subscription_store;
@@ -54,6 +55,7 @@ pub fn run(expected_tun_helper_sha256: Option<&'static str>) {
             commands::start_local_proxy,
             commands::start_system_proxy,
             commands::start_tun,
+            commands::switch_tun_server,
             commands::runtime_status,
             commands::confirmed_nodes,
             commands::reset_local_state,

@@ -395,8 +395,9 @@ function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onSelec
       </div>
       <div className="subscription-meta">
         <span>{filtered.length} из {snapshot.servers.length} серверов</span>
-        <span>{snapshot.switching ? "Переподключение…" : sourceBusy ? "Обновление библиотеки…" : picking ? "После выбора вернёмся на главную" : "Выбор применяется автоматически"}</span>
+        <span>{snapshot.switching ? "Переключение…" : sourceBusy ? "Обновление библиотеки…" : picking ? "После выбора вернёмся на главную" : "Выбор применяется автоматически"}</span>
       </div>
+      {snapshot.activeMode === "tun" ? <details className="routing-scope"><summary>Как меняется сервер в TUN</summary><p>Новые соединения пойдут через выбранный сервер после проверки. Уже открытые продолжат работать через прежний сервер, пока он доступен. TUN не перезапускается. Обновлённые или добавленные серверы загружаются при следующем подключении.</p></details> : null}
       <div className="server-list" role="radiogroup" aria-label="Выбор сервера">
         {filtered.length ? groups.map(([groupId, group], index) => {
           const expanded = !collapsedGroups.has(groupId);

@@ -1279,6 +1279,23 @@ mod windows {
                 "protected TUN config is not valid JSON",
             )
         })?;
+        if root.get("experimental").is_some() {
+            let (base, exits) = crate::server_switch::split_config(root, upstream_alias)?;
+            let mut families = None;
+            for exit in exits {
+                let single = crate::server_switch::single_config(&base, exit, upstream_alias);
+                crate::config::validate_no_direct_health(&single)
+                    .map_err(|_| crate::server_switch::rejected())?;
+                let contents =
+                    serde_json::to_string(&single).map_err(|_| crate::server_switch::rejected())?;
+                families = Some(validate_tun_config_for_upstream(
+                    &contents,
+                    upstream_alias,
+                    ipv4_dns_server,
+                )?);
+            }
+            return families.ok_or_else(crate::server_switch::rejected);
+        }
         validate_generated_config_fields(&root)?;
         let object = root.as_object().ok_or_else(|| {
             RuntimeError::new("tun_helper_config", "protected TUN config root is invalid")
@@ -4156,6 +4173,131 @@ mod windows {
                         ExpectedFamilies { ipv4: true, ipv6 }
                     );
                 }
+            }
+        }
+
+        #[test]
+        fn switching_helper_schema_preserves_guards_and_rejects_control_plane_attacks() {
+            use crate::server_switch::{combine_configs, SwitchControl};
+            let native = generated_tun_fixture(
+                "hysteria2://fixture-password@example.test:443",
+                false,
+                true,
+                false,
+            );
+            let bridge = generated_tun_fixture("vless://11111111-2222-3333-4444-555555555555@example.test:443?security=reality&type=tcp&sni=cover.test&fp=chrome&pbk=abcdefghijklmnopqrstuvwxyzABCDEFGH123456789&sid=a1b2", true, true, false);
+            let valid = combine_configs(
+                vec![native, bridge],
+                &SwitchControl {
+                    port: 19091,
+                    secret: "a".repeat(48),
+                },
+                19092,
+                "fixture-health-secret",
+                "Ethernet",
+            )
+            .unwrap();
+            assert!(validate_tun_config(&valid.to_string(), "Ethernet").is_ok());
+            for (pointer, value) in [
+                (
+                    "/experimental/clash_api/external_controller",
+                    serde_json::json!("0.0.0.0:19091"),
+                ),
+                ("/experimental/clash_api/secret", serde_json::json!("")),
+                (
+                    "/experimental/clash_api/access_control_allow_origin",
+                    serde_json::json!(["*"]),
+                ),
+                (
+                    "/experimental/clash_api/access_control_allow_private_network",
+                    serde_json::json!(true),
+                ),
+                (
+                    "/outbounds/0/interrupt_exist_connections",
+                    serde_json::json!(true),
+                ),
+                ("/outbounds/0/outbounds/0", serde_json::json!("direct")),
+                ("/outbounds/1/default", serde_json::json!("direct")),
+                ("/outbounds/3/tag", serde_json::json!("node-1")),
+                ("/outbounds/3/bind_interface", serde_json::json!("foreign")),
+                ("/outbounds/4/server", serde_json::json!("192.0.2.1")),
+                ("/outbounds/4/server_port", serde_json::json!(19091)),
+                ("/inbounds/4/listen", serde_json::json!("0.0.0.0")),
+                ("/inbounds/4/listen_port", serde_json::json!(19091)),
+                ("/inbounds/4/users/0/password", serde_json::json!("wrong")),
+                ("/route/rules/0/outbound", serde_json::json!("direct")),
+                ("/route/rules/1/outbound", serde_json::json!("selected")),
+                ("/route/rules/2/action", serde_json::json!("route")),
+                ("/route/rules/3/action", serde_json::json!("route")),
+            ] {
+                let mut attack = valid.clone();
+                *attack.pointer_mut(pointer).unwrap() = value;
+                assert!(
+                    validate_tun_config(&attack.to_string(), "Ethernet").is_err(),
+                    "accepted {pointer}"
+                );
+            }
+            for pointer in [
+                "/route",
+                "/route/rules",
+                "/inbounds",
+                "/inbounds/0",
+                "/outbounds",
+                "/outbounds/0",
+                "/dns",
+                "/dns/servers",
+                "/dns/servers/0",
+            ] {
+                for value in [
+                    serde_json::json!(null),
+                    serde_json::json!(true),
+                    serde_json::json!([]),
+                    serde_json::json!({}),
+                    serde_json::json!("wrong-type"),
+                ] {
+                    let mut attack = valid.clone();
+                    *attack.pointer_mut(pointer).unwrap() = value;
+                    assert!(
+                        validate_tun_config(&attack.to_string(), "Ethernet").is_err(),
+                        "accepted malformed {pointer}"
+                    );
+                }
+            }
+            for (pointer, key, value) in [
+                (
+                    "/experimental/clash_api",
+                    "external_ui",
+                    serde_json::json!("C:\\fixture"),
+                ),
+                (
+                    "/experimental/clash_api",
+                    "external_ui_download_url",
+                    serde_json::json!("https://example.test/fixture.zip"),
+                ),
+                (
+                    "/experimental",
+                    "cache_file",
+                    serde_json::json!({"enabled":true}),
+                ),
+                ("/outbounds/3", "plugin", serde_json::json!("fixture.exe")),
+                (
+                    "/outbounds/4",
+                    "bind_interface",
+                    serde_json::json!("Ethernet"),
+                ),
+                ("/log", "output", serde_json::json!("C:\\fixture")),
+            ] {
+                let mut attack = valid.clone();
+                attack
+                    .pointer_mut(pointer)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(key.into(), value);
+                assert!(
+                    validate_tun_config(&attack.to_string(), "Ethernet").is_err(),
+                    "accepted {pointer}/{key}"
+                );
             }
         }
 

@@ -92,7 +92,8 @@ try {
   await page.locator(".server-row:visible").click();
   await connected(); await checkFrame();
   const sequence = await page.evaluate(() => window.__routeDeckFixture.calls.map((entry) => entry.command).filter((entry) => /^(start|stop)_/.test(entry)));
-  assert.deepEqual(sequence, ["start_system_proxy", "stop_system_proxy", "start_tun", "stop_tun", "start_tun"]);
+  assert.deepEqual(sequence, ["start_system_proxy", "stop_system_proxy", "start_tun"]);
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter(entry => entry.command === "switch_tun_server").length), 1);
   scenarios += 3;
 
   await nav("Серверы");
@@ -105,7 +106,7 @@ try {
   });
   await page.getByRole("button", { name: "Обновить подписку Основная подписка", exact: true }).click();
   await settle(); await checkFrame();
-  assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => /^stop_/.test(entry.command)).length), 2, "refreshing another source stopped active runtime");
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => /^stop_/.test(entry.command)).length), 1, "refreshing another source stopped active runtime");
   await page.getByRole("button", { name: "Обновить подписку Старая подписка", exact: true }).click();
   await page.getByLabel("Ссылка на подписку", { exact: true }).fill("https://provider.invalid/fixture-token");
   await page.getByRole("button", { name: "Обновить", exact: true }).click();
