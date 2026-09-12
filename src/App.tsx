@@ -91,6 +91,7 @@ const phaseLabels: Record<ConnectionPhase, string> = {
   degraded: "Требует внимания",
   disconnecting: "Отключение",
   "blocked-by-conflict": "Прокси не применён",
+  "recovery-required": "Нужно восстановление",
   failed: "Ошибка подключения",
 };
 
@@ -129,7 +130,7 @@ function ProofStateIcon({ proof }: { proof: ConnectionProof }) {
 }
 
 function StatusBadge({ phase }: { phase: ConnectionPhase }) {
-  const kind = phase === "connected" ? "success" : phase === "degraded" || phase === "blocked-by-conflict" ? "warning" : phase === "failed" ? "danger" : "neutral";
+  const kind = phase === "connected" ? "success" : phase === "degraded" || phase === "blocked-by-conflict" || phase === "recovery-required" ? "warning" : phase === "failed" ? "danger" : "neutral";
   return (
     <span className="status-badge" data-kind={kind} aria-live="polite">
       {phase === "connected" ? <CheckIcon size={15} /> : pendingPhases.includes(phase) ? <LoaderIcon size={15} /> : <ShieldIcon size={15} />}
@@ -295,15 +296,17 @@ function HomePage({ snapshot, libraryBusy, headingRef, onNavigate, onModeChange,
   const liveLatency = connected && activeServer?.latencyState === "ready" ? activeServer.latencyMs : undefined;
   const status = pending ? "Переключаемся" : phaseLabels[snapshot.phase];
   const boundaryNotice = !snapshot.backendAvailable && !snapshot.isDemo;
+  const recoveryRequired = snapshot.phase === "recovery-required";
   return (
     <div className="page home-page">
       <h1 className="sr-only" ref={headingRef} tabIndex={-1}>Главная</h1>
-      <ActionFailureNotice failure={actionFailure} page="home" onClear={onClearFailure} />
+      <ActionFailureNotice failure={recoveryRequired ? null : actionFailure} page="home" onClear={onClearFailure} />
+      {recoveryRequired && snapshot.notice ? <OpaqueNotice notice={actionFailure?.page === "home" ? { ...snapshot.notice, title: actionFailure.notice.title, body: actionFailure.notice.body } : snapshot.notice} secondaryAction={{ label: "Диагностика", onClick: () => onNavigate("diagnostics") }} /> : null}
       <section className="connection-hero" data-state={connected ? "connected" : pending ? "pending" : snapshot.phase === "failed" ? "failed" : "idle"} aria-label="Подключение">
         <div className="hero-topline"><span className="eyebrow">ВАШЕ ПОДКЛЮЧЕНИЕ</span><span className="connection-live-dot" aria-hidden="true" /></div>
         <div className="hero-status-row">
           <span className="hero-symbol">{pending ? <LoaderIcon size={32} /> : <ShieldIcon size={32} />}</span>
-          <div className="hero-status-copy"><h2 aria-live="polite">{status}</h2><p>{pending ? phaseLabels[snapshot.phase] : connected ? `${mode === "tun" ? "TUN" : "Системный прокси"} · маршрут проверен` : active ? "Соединение требует внимания" : "Готов к подключению"}</p></div>
+          <div className="hero-status-copy"><h2 aria-live="polite">{status}</h2><p>{pending ? phaseLabels[snapshot.phase] : recoveryRequired ? "Новое подключение заблокировано до восстановления" : connected ? `${mode === "tun" ? "TUN" : "Системный прокси"} · маршрут проверен` : active ? "Соединение требует внимания" : snapshot.phase === "failed" ? "Соединение не установлено" : "Готов к подключению"}</p></div>
         </div>
         <div className="connection-current">
           <span>{activeServer ? "Сейчас используется" : "Сервер для подключения"}</span>
@@ -311,10 +314,10 @@ function HomePage({ snapshot, libraryBusy, headingRef, onNavigate, onModeChange,
           <span>{activeServer?.source ?? server?.source ?? "Подписка или отдельная ссылка"}</span>
         </div>
         <button className={`primary-button connection-button${active || pending ? " disconnect-button" : ""}`} type="button"
-          disabled={boundaryNotice || (!server && !active && !pending) || snapshot.phase === "disconnecting"}
-          onClick={active || pending ? onDisconnect : onConnect}>
+          disabled={boundaryNotice || (!server && !active && !pending && !recoveryRequired) || snapshot.phase === "disconnecting" || (recoveryRequired && pending)}
+          onClick={recoveryRequired ? onRetry : active || pending ? onDisconnect : onConnect}>
           {active || pending ? <XCircleIcon size={23} /> : <ShieldIcon size={23} />}
-          <span>{snapshot.phase === "disconnecting" ? "Отключаем…" : pending ? "Отменить подключение" : active ? "Отключить" : "Подключить"}</span>
+          <span>{recoveryRequired ? "Повторить восстановление" : snapshot.phase === "disconnecting" ? "Отключаем…" : pending ? "Отменить подключение" : active ? "Отключить" : "Подключить"}</span>
         </button>
         <div className="connection-metrics">
           <button type="button" className="latency-metric" onClick={onLatencyInfo} aria-label="Как измеряется отклик через VPN"><ActivityIcon size={16} /><strong>{liveLatency !== undefined ? `${liveLatency} мс` : "—"}</strong><span>Отклик · Google</span><InfoIcon size={14} /></button>
@@ -331,7 +334,7 @@ function HomePage({ snapshot, libraryBusy, headingRef, onNavigate, onModeChange,
         <SegmentedControl label="Режим подключения" value={snapshot.mode} options={[{ value: "proxy", label: "Системный прокси" }, { value: "tun", label: "TUN" }]} onChange={onModeChange} disabled={boundaryNotice} />
         <p className="mode-explanation">{snapshot.mode === "tun" ? "Трафик устройства через TUN. Windows запросит права при подключении." : "Для приложений с поддержкой прокси Windows. UDP и системный DNS не перехватываются."}</p>
       </section>
-      {snapshot.notice && actionFailure?.page !== "home" ? <OpaqueNotice notice={snapshot.notice} onClose={boundaryNotice ? undefined : controller.dismissNotice} primaryAction={boundaryNotice ? undefined : { label: "Повторить", onClick: onRetry }} secondaryAction={{ label: "Диагностика", onClick: () => onNavigate("diagnostics") }} /> : null}
+      {snapshot.notice && !recoveryRequired && actionFailure?.page !== "home" ? <OpaqueNotice notice={snapshot.notice} onClose={boundaryNotice ? undefined : controller.dismissNotice} primaryAction={boundaryNotice ? undefined : { label: "Повторить", onClick: onRetry }} secondaryAction={{ label: "Диагностика", onClick: () => onNavigate("diagnostics") }} /> : null}
       <button className="summary-card routing-shortcut" type="button" onClick={() => onNavigate("routing")}><RoutingIcon size={19} /><span className="selection-copy"><strong>Правила маршрутизации</strong><span>{snapshot.routing.defaultRoute === "vpn" ? "По умолчанию через VPN" : "По умолчанию напрямую"} · исключений: {snapshot.routing.apps.filter((app) => app.route !== "inherit" && app.route !== snapshot.routing.defaultRoute).length}</span></span><ChevronRightIcon size={18} /></button>
     </div>
   );

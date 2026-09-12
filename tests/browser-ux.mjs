@@ -545,6 +545,23 @@ try {
   assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command === "check_app_update").length), 0);
   scenarios += 6;
 
+  await nav("Главная");
+  await page.evaluate(() => { window.__routeDeckFixture.requireRecovery(); window.__routeDeckFixture.failRecovery = true; });
+  await page.getByRole("heading", { name: "Нужно восстановление", exact: true }).waitFor();
+  assert.equal(await page.getByText("Готов к подключению", { exact: true }).count(), 0);
+  assert.equal(await page.getByRole("button", { name: "Подключить", exact: true }).count(), 0);
+  await page.getByRole("button", { name: "Повторить восстановление", exact: true }).click();
+  await settle();
+  await page.getByText("Не удалось проверить завершение предыдущей сессии.", { exact: false }).waitFor();
+  await page.getByRole("heading", { name: "Нужно восстановление", exact: true }).waitFor();
+  await page.screenshot({ path: ".cache/ux-qa/startup-recovery.png" });
+  await page.evaluate(() => { window.__routeDeckFixture.failRecovery = false; window.__routeDeckFixture.calls.length = 0; });
+  await page.getByRole("button", { name: "Повторить восстановление", exact: true }).click();
+  await settle();
+  await page.getByRole("button", { name: "Подключить", exact: true }).waitFor();
+  assert.deepEqual(await page.evaluate(() => window.__routeDeckFixture.calls.map((call) => call.command)), ["retry_session_recovery"]);
+  scenarios += 2;
+
   assert.deepEqual(errors, []);
   console.log(`PASS: ${scenarios} browser scenarios; real frontend controller with synthetic IPC, no native networking`);
 } catch (error) {

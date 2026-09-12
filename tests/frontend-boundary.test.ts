@@ -1532,8 +1532,46 @@ test("retained runtime after stop failure prevents every queued restart", async 
   await assert.rejects(f.controller.selectServer("b"), { code: "runtime-failure" });
   await assert.rejects(f.controller.connect(), { code: "runtime-failure" });
   assert.equal(f.calls.some((call) => call.command.startsWith("start_")), false);
-  assert.equal(f.controller.getSnapshot().phase, "failed");
+  assert.equal(f.controller.getSnapshot().phase, "recovery-required");
   f.controller.dispose();
+});
+
+test("startup recovery remains visible and retry never starts a connection", async () => {
+  let revision = 1;
+  let failRecovery = true;
+  const calls: string[] = [];
+  const recovery = (): RuntimeStatusDto => ({
+    ...runtimeStatus(revision++, "disconnected"),
+    phase: "recovery_required",
+    error: { code: "runtime_failure", stage: "session_recovery", message: "fixture stale state" },
+  });
+  const controller = new TauriController(async () => ({
+    listen: async () => () => undefined,
+    invoke: async (command) => {
+      calls.push(command);
+      if (command === "runtime_status") return recovery();
+      if (command === "confirmed_nodes") return [];
+      if (command === "retry_session_recovery") {
+        if (failRecovery) throw recovery().error;
+        return runtimeStatus(revision++, "disconnected");
+      }
+      throw new Error("Unexpected recovery command");
+    },
+  }));
+  await controller.ready();
+  assert.equal(controller.getSnapshot().phase, "recovery-required");
+  const notice = controller.getSnapshot().notice;
+  controller.dismissNotice();
+  assert.deepEqual(controller.getSnapshot().notice, notice);
+  calls.length = 0;
+  await assert.rejects(controller.retry(), { code: "session-recovery-required" });
+  assert.equal(controller.getSnapshot().phase, "recovery-required");
+  failRecovery = false;
+  await controller.retry();
+  assert.equal(controller.getSnapshot().phase, "disconnected");
+  assert.equal(controller.getSnapshot().notice, undefined);
+  assert.deepEqual(calls, ["retry_session_recovery", "retry_session_recovery"]);
+  controller.dispose();
 });
 
 test("cancelled UAC never starts a fallback or retries by itself", async () => {
