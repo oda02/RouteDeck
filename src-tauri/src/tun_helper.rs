@@ -868,9 +868,11 @@ mod windows {
             ));
         }
         let parent = open_verified_parent(invocation)?;
-        let config = duplicate_config(parent.raw(), request)?;
+        // Retain the GUI's lease until the nested helper session owns its lease.
+        // Otherwise GUI exit can race startup recovery between reading and launch.
+        let mut config = duplicate_config(parent.raw(), request)?;
         let config_directory = protected_config_directory(&config)?;
-        let contents = read_verified_config(config, request)?;
+        let contents = read_verified_config(&mut config, request)?;
         let expected_families = validate_tun_config_for_upstream(
             &contents,
             &request.upstream.interface_alias,
@@ -1134,7 +1136,7 @@ mod windows {
     }
 
     fn read_verified_config(
-        mut config: File,
+        config: &mut File,
         request: &StartRequest,
     ) -> Result<String, RuntimeError> {
         config
@@ -4695,6 +4697,38 @@ mod windows {
                     "accepted invalid field at {pointer}"
                 );
             }
+        }
+
+        #[test]
+        fn reading_helper_config_retains_its_lease_across_parent_exit() {
+            let root = std::env::temp_dir().join(format!(
+                "routedeck-helper-read-lease-{}",
+                random_hex(8).unwrap()
+            ));
+            let session = SessionConfig::create(&root, "{}").unwrap();
+            let mut guard = session.revalidate_for_launch().unwrap();
+            let path = session.abandon_for_recovery_test();
+            let request = StartRequest {
+                request_id: 1,
+                config_handle_id: 1,
+                config_len: 2,
+                config_sha256: format!("{:x}", Sha256::digest(b"{}")),
+                preflight_sha256: String::new(),
+                upstream: TunUpstreamIdentity {
+                    interface_luid: 7,
+                    interface_index: 9,
+                    interface_alias: "Fixture".into(),
+                    ipv4_dns_server: None,
+                },
+            };
+            assert_eq!(read_verified_config(&mut guard, &request).unwrap(), "{}");
+            assert!(crate::engine_runtime::session_recovery::CleanupPlan::inspect(&path).is_err());
+            drop(guard);
+            crate::engine_runtime::session_recovery::CleanupPlan::inspect(&path)
+                .unwrap()
+                .remove()
+                .unwrap();
+            fs::remove_dir(root).unwrap();
         }
 
         #[test]
