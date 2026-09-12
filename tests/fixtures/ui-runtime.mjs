@@ -45,6 +45,10 @@ const transport = {
     // Never include supplied URLs/share contents in even this synthetic log.
     fixture.calls.push({ command, nodeId: args?.nodeId, sourceId: args?.sourceId, ...(command.startsWith("start_") ? { routing: structuredClone(args?.routing) } : {}) });
     if (command === "runtime_status") return current ?? (current = status());
+    if (command === "retry_session_recovery") {
+      if (fixture.failRecovery) throw { code: "runtime_failure", stage: "session_recovery", message: "fixture recovery failed" };
+      return emit(status());
+    }
     if (command === "get_app_version") return "0.1.0";
     if (command === "check_app_update") {
       if (fixture.failUpdateCheck) throw "fixture update check failed";
@@ -115,4 +119,5 @@ export const controller = new TauriController(async () => transport);
 window.__routeDeckFixture = fixture;
 fixture.snapshot = () => controller.getSnapshot();
 fixture.runDiagnostics = () => controller.runDiagnostics();
+fixture.requireRecovery = () => emit({ ...status(), phase: "recovery_required", error: { code: "runtime_failure", stage: "session_recovery", message: "fixture recovery needed" } });
 fixture.setMetricAvailable = (available) => { fixture.steadyUnavailable = !available; emit(status(current.phase, current.mode, current.nodeId)); };

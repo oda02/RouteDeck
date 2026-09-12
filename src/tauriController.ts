@@ -235,8 +235,9 @@ export function runtimePhaseToConnectionPhase(phase: RuntimePhaseDto): Connectio
     case "blocked_by_conflict":
       return "blocked-by-conflict";
     case "disconnected_with_error":
-    case "recovery_required":
       return "failed";
+    case "recovery_required":
+      return "recovery-required";
   }
 }
 
@@ -440,6 +441,7 @@ function projectRuntimeLatency(servers: readonly Server[], status: RuntimeStatus
 }
 
 function routeDeckErrorFromBackend(error: PublicErrorDto): RouteDeckError {
+  if (error.stage === "session_recovery") return new RouteDeckError("session-recovery-required");
   if (error.code === "runtime_failure" && error.stage === "start"
     && error.detail === "TUN permission request was cancelled") {
     return new RouteDeckError("tun-uac-cancelled");
@@ -827,7 +829,7 @@ export class TauriController implements RouteDeckController {
   };
 
   dismissNotice = (): void => {
-    if (!this.boundaryFailed) this.publish({ notice: undefined });
+    if (!this.boundaryFailed && this.runtime?.phase !== "recovery_required") this.publish({ notice: undefined });
   };
 
   refreshServers = async (): Promise<void> => {

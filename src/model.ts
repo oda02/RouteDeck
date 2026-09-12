@@ -13,6 +13,7 @@ export type ConnectionPhase =
   | "degraded"
   | "disconnecting"
   | "blocked-by-conflict"
+  | "recovery-required"
   | "failed";
 
 export type ProofState = "idle" | "running" | "pass" | "warn" | "fail" | "skipped";
@@ -183,6 +184,7 @@ export type RouteDeckErrorCode =
   | "tun-admin-required"
   | "tun-uac-cancelled"
   | "runtime-failure"
+  | "session-recovery-required"
   | "server-switch-failed"
   | "server-switch-not-prepared"
   | "server-switch-uncertain"

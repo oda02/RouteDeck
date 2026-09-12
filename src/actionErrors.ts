@@ -31,6 +31,9 @@ export function toPublicActionError(error: unknown): PublicActionError {
           message: "Не удалось выполнить действие. Повторите попытку или откройте диагностику.",
           redactedDetail: error.redactedDetail,
         };
+      // Recovery has no arbitrary backend detail: the actionable cause is fixed copy.
+      case "session-recovery-required":
+        return { message: "Не удалось проверить завершение предыдущей сессии. Новое подключение заблокировано; откройте диагностику для восстановления." };
       case "node-not-selected":
         return { message: "Сначала импортируйте и выберите сервер." };
       case "subscription-import-rejected":
