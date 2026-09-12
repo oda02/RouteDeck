@@ -12,7 +12,8 @@ use windows_sys::Win32::{
 };
 
 pub(crate) const MARKER: &str = "session-owner.json";
-const MAX_CONFIG: u64 = 1024 * 1024;
+// Xray's combined sidecar config can exceed the helper's 1 MiB sing-box limit.
+const MAX_CONFIG: u64 = 16 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -148,6 +149,15 @@ mod tests {
     }
 
     #[test]
+    fn combined_sidecar_config_larger_than_tun_control_limit_is_recoverable() {
+        let root = root();
+        let contents = format!("{{\"fixture\":\"{}\"}}", "x".repeat(1024 * 1024));
+        let directory = abandon(SessionConfig::create(&root, &contents).unwrap());
+        CleanupPlan::inspect(&directory).unwrap().remove().unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
     fn mismatched_config_unknown_files_and_missing_marker_are_preserved() {
         let root = root();
         let directory = abandon(SessionConfig::create(&root, "{}").unwrap());
@@ -252,6 +262,29 @@ fn bytes(file: &mut File, max: u64) -> Result<Vec<u8>, RuntimeError> {
     Ok(data)
 }
 
+fn file_digest(file: &mut File, max: u64) -> Result<String, RuntimeError> {
+    if file.metadata().map_err(|_| error())?.len() > max {
+        return Err(error());
+    }
+    file.seek(SeekFrom::Start(0)).map_err(|_| error())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut reader = file.take(max + 1);
+    let mut total = 0;
+    loop {
+        let count = reader.read(&mut buffer).map_err(|_| error())?;
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        if total > max {
+            return Err(error());
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 pub(crate) struct CleanupPlan {
     files: Vec<(PathBuf, File)>,
     markers: Vec<(PathBuf, File)>,
@@ -319,9 +352,7 @@ impl CleanupPlan {
                 MARKER => {}
                 "config.json" => {
                     let mut file = lock(&path, false)?;
-                    if format!("{:x}", Sha256::digest(bytes(&mut file, MAX_CONFIG)?))
-                        != marker.config_sha256
-                    {
+                    if file_digest(&mut file, MAX_CONFIG)? != marker.config_sha256 {
                         return Err(error());
                     }
                     self.files.push((path, file));
@@ -366,16 +397,7 @@ impl CleanupPlan {
             if file.metadata().map_err(|_| error())?.len() != expected.size {
                 return Err(error());
             }
-            let mut hasher = Sha256::new();
-            let mut buffer = [0u8; 64 * 1024];
-            loop {
-                let count = file.read(&mut buffer).map_err(|_| error())?;
-                if count == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..count]);
-            }
-            if format!("{:x}", hasher.finalize()) != expected.sha256 {
+            if file_digest(&mut file, expected.size)? != expected.sha256 {
                 return Err(error());
             }
             self.files.push((path, file));
