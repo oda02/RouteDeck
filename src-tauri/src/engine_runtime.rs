@@ -18,6 +18,10 @@ use sha2::{Digest, Sha256};
 use crate::windows_process::{create_suspended_engine, EngineCommand, PlatformProcess};
 use crate::{config::LocalPorts, redaction::Redactor};
 
+#[cfg(windows)]
+#[path = "session_recovery.rs"]
+pub(crate) mod session_recovery;
+
 const EMBEDDED_SING_BOX_LOCK: &str = include_str!("../../engine/sing-box.lock.json");
 const EMBEDDED_XRAY_LOCK: &str = include_str!("../../engine/xray-core.lock.json");
 const SING_BOX_DIRECTORY: &str = "engine";
@@ -1322,6 +1326,15 @@ struct ConfigIdentity {
 }
 
 impl SessionConfig {
+    #[cfg(test)]
+    pub(crate) fn abandon_for_recovery_test(mut self) -> PathBuf {
+        let path = self.directory.clone();
+        self.guard.take();
+        self.directory_guard.take();
+        std::mem::forget(self);
+        path
+    }
+
     pub(crate) fn create(root: &Path, contents: &str) -> Result<Self, RuntimeError> {
         Self::create_with_identity(root, contents, config_identity)
     }
@@ -1341,6 +1354,8 @@ impl SessionConfig {
             let directory_guard = open_session_directory_guard(&directory)?;
             let (config_path, guard) = create_session_config(&directory, contents)?;
             let identity = identity_reader(&guard)?;
+            #[cfg(windows)]
+            session_recovery::write_marker(&directory, contents)?;
             Ok(Self {
                 directory: directory.clone(),
                 config_path,
@@ -1493,7 +1508,9 @@ fn cleanup_session_directory(directory: &Path) -> Result<(), RuntimeError> {
             .file_type()
             .map_err(|error| RuntimeError::new("session_recovery", error.to_string()))?
             .is_file()
-            || (name != OsStr::new("config.tmp") && name != OsStr::new("config.json"))
+            || (name != OsStr::new("config.tmp")
+                && name != OsStr::new("config.json")
+                && name != OsStr::new("session-owner.json"))
         {
             return Err(RuntimeError::new(
                 "session_recovery",
@@ -1512,6 +1529,12 @@ impl Drop for SessionConfig {
         self.guard.take();
         self.directory_guard.take();
         let _ = fs::remove_file(&self.config_path);
+        // Keep ownership evidence if a child/check still holds files in this session.
+        if fs::read_dir(&self.directory).is_ok_and(|mut entries| {
+            entries.all(|entry| entry.is_ok_and(|entry| entry.file_name() == "session-owner.json"))
+        }) {
+            let _ = fs::remove_file(self.directory.join("session-owner.json"));
+        }
         let _ = fs::remove_dir(&self.directory);
     }
 }
@@ -1550,10 +1573,13 @@ fn create_private_config_file(path: &Path) -> Result<File, RuntimeError> {
         Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ},
     };
 
-    let descriptor_text: Vec<u16> = OsStr::new("D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)")
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
+    let sid = current_user_sid_string()?;
+    let descriptor_text: Vec<u16> = OsStr::new(&format!(
+        "O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FA;;;BA)"
+    ))
+    .encode_wide()
+    .chain(Some(0))
+    .collect();
     let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
     if unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -1725,11 +1751,13 @@ fn create_private_directory(path: &Path) -> Result<(), RuntimeError> {
         Storage::FileSystem::CreateDirectoryW,
     };
 
-    let descriptor_text: Vec<u16> =
-        OsStr::new("D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
+    let sid = current_user_sid_string()?;
+    let descriptor_text: Vec<u16> = OsStr::new(&format!(
+        "O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+    ))
+    .encode_wide()
+    .chain(Some(0))
+    .collect();
     let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
     let converted = unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -2552,6 +2580,71 @@ mod tests {
         let second = random_hex(16).unwrap();
         assert_eq!(first.len(), 32);
         assert_ne!(first, second);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires explicitly supplied reviewed runtimes; binds loopback only"]
+    fn reviewed_runtime_teardown_and_crash_recovery_remove_sealed_copies() {
+        let package = PathBuf::from(
+            std::env::var_os("ROUTEDECK_RUNTIME_FIXTURE_ROOT")
+                .expect("provide reviewed runtime fixture root"),
+        );
+        for kind in [EngineKind::SingBox, EngineKind::Xray] {
+            let root = std::env::temp_dir().join(format!(
+                "routedeck-runtime-recovery-{}",
+                random_hex(8).unwrap()
+            ));
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let contents = match kind {
+                EngineKind::SingBox => serde_json::json!({"inbounds":[{"type":"mixed","listen":"127.0.0.1","listen_port":port}],"outbounds":[{"type":"direct"}]}),
+                EngineKind::Xray => serde_json::json!({"inbounds":[{"listen":"127.0.0.1","port":port,"protocol":"socks","settings":{"udp":false}}],"outbounds":[{"protocol":"freedom"}]}),
+            }.to_string();
+            let descriptor = EngineDescriptor::for_kind(kind);
+            let launcher = VerifiedEngineLauncher {
+                layout: FixedEngineLayout::from_package_root(&package, descriptor).unwrap(),
+                descriptor,
+                prepared: Mutex::new(None),
+            };
+            let session = SessionConfig::create(&root, &contents).unwrap();
+            let diagnostics = Arc::new(Mutex::new(DiagnosticBuffer::default()));
+            launcher
+                .check(&session, Redactor::default(), diagnostics.clone())
+                .unwrap();
+            let mut child = launcher
+                .start(&session, Redactor::default(), diagnostics.clone())
+                .unwrap();
+            child.stop().unwrap();
+            drop(child);
+            drop(session);
+            assert_eq!(
+                fs::read_dir(&root).unwrap().count(),
+                0,
+                "normal teardown left a session"
+            );
+
+            let session = SessionConfig::create(&root, &contents).unwrap();
+            launcher
+                .check(&session, Redactor::default(), diagnostics)
+                .unwrap();
+            let prepared = launcher.prepared.lock().unwrap().take().unwrap();
+            drop(prepared.verified_files);
+            drop(prepared._config_guard);
+            std::mem::forget(prepared.sealed_engine);
+            let directory = session.abandon_for_recovery_test();
+            session_recovery::CleanupPlan::inspect(&directory)
+                .unwrap()
+                .remove()
+                .unwrap();
+            assert_eq!(
+                fs::read_dir(&root).unwrap().count(),
+                0,
+                "crash recovery left sealed files"
+            );
+            fs::remove_dir(root).unwrap();
+        }
     }
 
     #[test]

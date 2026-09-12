@@ -2954,10 +2954,43 @@ mod windows {
     }
 
     pub(crate) fn reconcile_stale_tun_sessions(root: &Path) -> Result<(), RuntimeError> {
+        reconcile_stale_sessions_with_probes(
+            root,
+            find_tun_adapter_luids,
+            || {
+                Ok(route_states()?
+                    .into_iter()
+                    .map(|route| route.luid)
+                    .collect())
+            },
+            stale_process_identity,
+        )
+    }
+
+    fn reconcile_stale_sessions_with_probes(
+        root: &Path,
+        adapters: impl FnOnce() -> Result<Vec<u64>, RuntimeError>,
+        routes: impl FnOnce() -> Result<Vec<u64>, RuntimeError>,
+        process_identity: impl Fn(Option<u32>, Option<u64>) -> StaleProcessIdentity,
+    ) -> Result<(), RuntimeError> {
+        use crate::engine_runtime::session_recovery::{CleanupPlan, MARKER};
         fs::create_dir_all(root).map_err(|error| recovery_error(error.to_string()))?;
         reject_reparse_directory(root)?;
 
-        let same_name_luids = find_tun_adapter_luids()
+        let entries = fs::read_dir(root)
+            .map_err(|error| recovery_error(error.to_string()))?
+            .take(65)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| recovery_error(error.to_string()))?;
+        // The normal clean launch has no recovery work and needs no network scan.
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if entries.len() > 64 {
+            return Err(recovery_error("too many stale sessions"));
+        }
+
+        let same_name_luids = adapters()
             .map_err(|_| recovery_error("could not inspect RouteDeck adapter ownership"))?;
         if !same_name_luids.is_empty() {
             return Err(recovery_error(
@@ -2966,34 +2999,67 @@ mod windows {
         }
 
         let mut candidates = Vec::new();
-        for entry in fs::read_dir(root).map_err(|error| recovery_error(error.to_string()))? {
-            let entry = entry.map_err(|error| recovery_error(error.to_string()))?;
-            candidates.push(inspect_stale_tun_candidate(entry.path())?);
+        let mut plans = Vec::new();
+        let mut journals = Vec::new();
+        for entry in entries {
+            reject_reparse_directory(&entry.path())?;
+            let empty = fs::read_dir(entry.path())
+                .map_err(|_| recovery_error("session directory unavailable"))?
+                .next()
+                .is_none();
+            if entry
+                .path()
+                .join(MARKER)
+                .try_exists()
+                .map_err(|_| recovery_error("ownership marker unavailable"))?
+                || empty
+            {
+                let plan = CleanupPlan::inspect(&entry.path())?;
+                for path in &plan.journals {
+                    let journal = read_stored_tun_journal(path)?;
+                    validate_stored_tun_journal(&journal)?;
+                    let config = path
+                        .parent()
+                        .ok_or_else(|| recovery_error("journal parent missing"))?
+                        .join("config.json");
+                    if config
+                        .try_exists()
+                        .map_err(|_| recovery_error("config unavailable"))?
+                    {
+                        verify_stale_config_digest(&config, &journal.config_sha256)?;
+                    }
+                    journals.push(journal);
+                }
+                plans.push(plan);
+            } else {
+                candidates.push(inspect_stale_tun_candidate(entry.path())?);
+            }
         }
 
         let route_luids = if candidates
             .iter()
             .any(|candidate| candidate.journal.owned_interface_luid.is_some())
+            || journals
+                .iter()
+                .any(|journal| journal.owned_interface_luid.is_some())
         {
-            route_states()
+            routes()
                 .map_err(|_| recovery_error("could not inspect stale RouteDeck route ownership"))?
-                .into_iter()
-                .map(|route| route.luid)
-                .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
 
-        for candidate in &candidates {
-            let process = stale_process_identity(
-                candidate.journal.engine_pid,
-                candidate.journal.engine_created,
-            );
+        for journal in candidates
+            .iter()
+            .map(|candidate| &candidate.journal)
+            .chain(journals.iter())
+        {
+            let process = process_identity(journal.engine_pid, journal.engine_created);
             if !stale_recovery_is_safe(
                 true,
                 &same_name_luids,
                 &route_luids,
-                candidate.journal.owned_interface_luid,
+                journal.owned_interface_luid,
                 process,
             ) {
                 return Err(recovery_error(
@@ -3004,6 +3070,9 @@ mod windows {
 
         for candidate in candidates {
             remove_stale_tun_candidate(candidate)?;
+        }
+        for plan in plans {
+            plan.remove()?;
         }
         Ok(())
     }
@@ -3228,7 +3297,9 @@ mod windows {
         has_journal
             && same_name_luids.is_empty()
             && !owned_luid.is_some_and(|luid| route_luids.contains(&luid))
-            && process == StaleProcessIdentity::Absent
+            // A reused PID belongs to a different process. Never stop that process;
+            // its existence cannot keep the old session's files blocked forever.
+            && matches!(process, StaleProcessIdentity::Absent | StaleProcessIdentity::Mismatched)
     }
 
     fn remove_stale_tun_candidate(candidate: StaleTunCandidate) -> Result<(), RuntimeError> {
@@ -4929,6 +5000,73 @@ mod windows {
         }
 
         #[test]
+        fn empty_recovery_does_not_query_network_or_processes() {
+            let root = std::env::temp_dir().join(format!(
+                "routedeck-empty-recovery-{}",
+                random_hex(8).unwrap()
+            ));
+            reconcile_stale_sessions_with_probes(
+                &root,
+                || panic!("clean launch scanned adapters"),
+                || panic!("clean launch scanned routes"),
+                |_, _| panic!("clean launch inspected processes"),
+            )
+            .unwrap();
+            fs::remove_dir(root).unwrap();
+        }
+
+        #[test]
+        fn recovery_reclaims_tun_and_sidecar_only_after_all_ownership_proofs() {
+            let root = std::env::temp_dir().join(format!(
+                "routedeck-combined-recovery-{}",
+                random_hex(8).unwrap()
+            ));
+            let contents = "{}";
+            let outer = SessionConfig::create(&root, contents).unwrap();
+            let outer_path = outer.path().parent().unwrap().to_owned();
+            let nested = SessionConfig::create(&outer_path, contents).unwrap();
+            let sidecar = SessionConfig::create(&root, contents).unwrap();
+            let sidecar_path = sidecar.path().parent().unwrap().to_owned();
+            let mut journal = TunJournal::create(
+                &outer_path,
+                &"01".repeat(16),
+                &format!("{:x}", Sha256::digest(contents)),
+            )
+            .unwrap();
+            journal.engine_pid = Some(123);
+            journal.engine_created = Some(456);
+            journal.owned_luid = Some(7);
+            journal.write(journal.value("adapter_observed")).unwrap();
+            drop(journal);
+            nested.abandon_for_recovery_test();
+            outer.abandon_for_recovery_test();
+            sidecar.abandon_for_recovery_test();
+
+            // A surviving owned route must preserve even the independent sidecar.
+            assert!(reconcile_stale_sessions_with_probes(
+                &root,
+                || Ok(vec![]),
+                || Ok(vec![7]),
+                |_, _| StaleProcessIdentity::Absent
+            )
+            .is_err());
+            assert!(outer_path.join("config.json").exists());
+            assert!(sidecar_path.join("config.json").exists());
+            // A reused PID is not the old process and must never be terminated.
+            reconcile_stale_sessions_with_probes(
+                &root,
+                || Ok(vec![]),
+                || Ok(vec![99]),
+                |_, _| StaleProcessIdentity::Mismatched,
+            )
+            .unwrap();
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+            reconcile_stale_sessions_with_probes(&root, || panic!(), || panic!(), |_, _| panic!())
+                .unwrap();
+            fs::remove_dir(root).unwrap();
+        }
+
+        #[test]
         fn stale_recovery_fails_closed_for_foreign_or_ambiguous_identity() {
             assert!(stale_recovery_is_safe(
                 true,
@@ -4960,7 +5098,6 @@ mod windows {
             ));
             for identity in [
                 StaleProcessIdentity::Matching,
-                StaleProcessIdentity::Mismatched,
                 StaleProcessIdentity::Unknown,
             ] {
                 assert!(!stale_recovery_is_safe(true, &[], &[], Some(7), identity));
