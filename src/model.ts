@@ -56,11 +56,13 @@ export interface Server {
 
 export type DefaultRoute = "direct" | "vpn";
 export type AppRouteChoice = "inherit" | "direct" | "vpn";
+export type AppMatchBy = "path" | "name";
 
 export interface AppRule {
   id: string;
   name: string;
   path: string;
+  matchBy?: AppMatchBy;
   route: AppRouteChoice;
 }
 

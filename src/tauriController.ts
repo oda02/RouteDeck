@@ -15,6 +15,7 @@ import type {
   SubscriptionPreview,
   TunPathChoice,
 } from "./model.ts";
+import { appRuleMatchKey, effectiveAppRuleKey, executableName, validExecutableName } from "./appRuleMatching.ts";
 import {
   ContractViolation,
   RuntimeRevisionGate,
@@ -112,12 +113,14 @@ export function validatedRouting(value: unknown): RoutingConfig {
   const validText = (text: unknown, maxBytes: number): text is string => typeof text === "string" && Boolean(text.trim())
     && !/[\u0000-\u001f\u007f-\u009f]/.test(text) && new TextEncoder().encode(text).length <= maxBytes;
   const apps = candidate.apps.map((app) => {
-    if (!app || typeof app !== "object" || Array.isArray(app) || Object.keys(app).some((key) => !["id", "name", "path", "route"].includes(key))
+    if (!app || typeof app !== "object" || Array.isArray(app) || Object.keys(app).some((key) => !["id", "name", "path", "route", "matchBy"].includes(key))
       || !validText(app.id, 4096) || !validText(app.name, 260) || !validText(app.path, 4096) || !/[\\/]/.test(app.path)
+      || (app.matchBy !== undefined && app.matchBy !== "path" && app.matchBy !== "name")
+      || (app.matchBy === "name" && !validExecutableName(executableName(app.path.trim())))
       || !["inherit", "direct", "vpn"].includes(app.route)) throw new RouteDeckError("invalid-routing");
-    return { id: app.id, name: app.name.trim(), path: app.path.trim().replaceAll("/", "\\"), route: app.route };
+    return { id: app.id, name: app.name.trim(), path: app.path.trim().replaceAll("/", "\\"), ...(app.matchBy === "name" ? { matchBy: "name" as const } : {}), route: app.route };
   });
-  if (new Set(apps.map((app) => app.id)).size !== apps.length || new Set(apps.map((app) => app.path.toLocaleLowerCase("en-US"))).size !== apps.length) throw new RouteDeckError("invalid-routing");
+  if (new Set(apps.map((app) => app.id)).size !== apps.length || new Set(apps.map(appRuleMatchKey)).size !== apps.length) throw new RouteDeckError("invalid-routing");
   // Missing means migration from an older version; an explicitly empty list
   // must stay empty so removing the compatibility rule survives a restart.
   const rawRules = candidate.trafficRules === undefined ? defaultTrafficRules() : candidate.trafficRules;
@@ -144,7 +147,7 @@ export function effectiveTunKey(routing: RoutingConfig): string {
 }
 
 export function effectiveRoutingKey(routing: RoutingConfig): string {
-  return JSON.stringify([routing.defaultRoute, routing.apps.filter((app) => app.route !== "inherit").map((app) => [app.path, app.route]).sort((a, b) => a[0].localeCompare(b[0]))]);
+  return JSON.stringify([routing.defaultRoute, routing.apps.filter((app) => app.route !== "inherit").map((app) => [effectiveAppRuleKey(app), app.route]).sort((a, b) => a[0].localeCompare(b[0]))]);
 }
 
 function loadRouting(): RoutingConfig {
@@ -790,7 +793,8 @@ export class TauriController implements RouteDeckController {
           .filter((app) => app.route !== "inherit")
           .map((app) => ({
             processPath: app.path,
-            processName: app.path.split(/[\\/]/).at(-1) || undefined,
+            processName: executableName(app.path) || undefined,
+            ...(app.matchBy === "name" ? { matchBy: "name" } : {}),
             route: app.route,
           })),
       },

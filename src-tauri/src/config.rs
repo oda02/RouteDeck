@@ -356,15 +356,29 @@ fn generate_config_with_selected(
             });
         }
     }
-    for app in &request.policy.apps {
-        rules.push(json!({
-            // sing-box 1.13.x compares Windows process paths case-sensitively. Preserve the
-            // QueryFullProcessImageNameW casing supplied by the application picker; only the
-            // identity/duplicate checks in the domain model may use a lower-cased key.
-            "process_path": [app.process_path.trim().replace('/', "\\")],
+    // Exact path exceptions take precedence over wider file-name rules, regardless
+    // of UI row order. Within each kind validation rejects duplicate identities.
+    let mut app_rules: Vec<_> = request.policy.apps.iter().collect();
+    app_rules.sort_by_key(|app| app.match_by == crate::domain::AppMatchBy::Name);
+    for app in app_rules {
+        let mut rule = json!({
             "action": "route",
             "outbound": action_outbound(app.action)
-        }));
+        });
+        match app.match_by {
+            crate::domain::AppMatchBy::Path => {
+                // Preserve QueryFullProcessImageNameW casing: sing-box's exact
+                // Windows path matcher is case-sensitive in the pinned release.
+                rule["process_path"] = json!([app.process_path.trim().replace('/', "\\")]);
+            }
+            crate::domain::AppMatchBy::Name => {
+                let pattern = crate::app_rule_matching::executable_name_pattern(
+                    crate::app_rule_matching::executable_name(app.process_path.trim()),
+                ).map_err(|_| ConfigError::new("invalid executable file name"))?;
+                rule["process_path_regex"] = json!([pattern]);
+            }
+        }
+        rules.push(rule);
     }
     if request.policy.lan == LanPolicy::Direct {
         rules.push(json!({ "ip_is_private": true, "action": "route", "outbound": "direct" }));
@@ -1170,6 +1184,7 @@ mod tests {
         app_draft.apps.push(crate::domain::AppRoute {
             process_path: r"C:\Apps\Browser.exe".into(),
             process_name: Some("Browser.exe".into()),
+            match_by: crate::domain::AppMatchBy::Path,
             action: AppRouteAction::Direct,
         });
         assert!(generate_config(request(&node, &app_draft)).is_err());
@@ -1186,6 +1201,7 @@ mod tests {
         direct.apps.push(crate::domain::AppRoute {
             process_path: r"C:/Program Files/Browser/Browser.EXE".into(),
             process_name: Some("Browser.exe".into()),
+            match_by: crate::domain::AppMatchBy::Path,
             action: AppRouteAction::Vpn,
         });
         let mut system_request = request(&node, &direct);
@@ -1261,6 +1277,7 @@ mod tests {
         selected.apps.push(crate::domain::AppRoute {
             process_path: r"C:\Apps\Browser.exe".into(),
             process_name: Some("Browser.exe".into()),
+            match_by: crate::domain::AppMatchBy::Path,
             action: AppRouteAction::Direct,
         });
         let mut system_request = request(&node, &selected);
@@ -1288,6 +1305,68 @@ mod tests {
             value.pointer("/route/final").and_then(Value::as_str),
             Some("selected")
         );
+    }
+
+    #[test]
+    fn stable_file_names_compile_case_insensitively_after_exact_paths() {
+        let node = node("hysteria2://fixture-password@example.test:443?sni=example.test#fixture");
+        let mut policy = policy(DefaultRoute::Direct);
+        policy.apps = vec![
+            crate::domain::AppRoute {
+                process_path: r"C:\Apps\version-a\Client (beta)+[1].exe".into(),
+                process_name: None, match_by: crate::domain::AppMatchBy::Name,
+                action: AppRouteAction::Vpn,
+            },
+            crate::domain::AppRoute {
+                process_path: r"C:\Other\Client (beta)+[1].exe".into(),
+                process_name: None, match_by: crate::domain::AppMatchBy::Path,
+                action: AppRouteAction::Direct,
+            },
+        ];
+        let mut first_request = request(&node, &policy);
+        first_request.mode = CaptureMode::SystemProxy;
+        let first: Value = serde_json::from_str(generate_config(first_request).unwrap().as_str()).unwrap();
+        assert_eq!(first.pointer("/route/rules/1/process_path/0"), Some(&json!(r"C:\Other\Client (beta)+[1].exe")));
+        assert_eq!(first.pointer("/route/rules/1/outbound"), Some(&json!("direct")));
+        assert_eq!(first.pointer("/route/rules/2/process_path_regex/0"), Some(&json!(r"(?i)(?:^|[\\/])Client \(beta\)\+\[1\]\.exe$")));
+        assert_eq!(first.pointer("/route/rules/2/outbound"), Some(&json!("selected")));
+        assert_eq!(first.pointer("/route/final"), Some(&json!("direct")));
+        assert!(first.pointer("/route/rules/2/process_name").is_none());
+        assert!(first.pointer("/route/rules/2/process_path").is_none());
+        policy.apps[0].process_path = r"D:\Apps\new-version\Client (beta)+[1].exe".into();
+        let mut updated_request = request(&node, &policy);
+        updated_request.mode = CaptureMode::SystemProxy;
+        let updated: Value = serde_json::from_str(generate_config(updated_request).unwrap().as_str()).unwrap();
+        assert_eq!(first, updated, "name match must survive moving a versioned executable");
+    }
+
+    #[test]
+    fn stable_name_rules_keep_default_and_tun_guards_for_each_route_choice() {
+        let node = node("hysteria2://fixture-password@example.test:443?sni=example.test#fixture");
+        for default in [DefaultRoute::Direct, DefaultRoute::Vpn] {
+            for action in [AppRouteAction::Direct, AppRouteAction::Vpn] {
+                for tun in [false, true] {
+                    let mut policy = policy(default);
+                    policy.apps = vec![crate::domain::AppRoute {
+                        process_path: r"C:\Apps\v1\Программа.exe".into(), process_name: None,
+                        match_by: crate::domain::AppMatchBy::Name, action,
+                    }];
+                    let mut request = request(&node, &policy);
+                    if tun {
+                        request.mode = CaptureMode::Tun(TunSettings::default());
+                        request.tun_upstream = Some(tun_upstream("Ethernet"));
+                    } else { request.mode = CaptureMode::SystemProxy; }
+                    let value: Value = serde_json::from_str(generate_config(request).unwrap().as_str()).unwrap();
+                    let rules = value.pointer("/route/rules").unwrap().as_array().unwrap();
+                    let app_index = rules.iter().position(|rule| rule.get("process_path_regex").is_some()).unwrap();
+                    assert_eq!(rules[app_index]["outbound"], json!(action_outbound(action)));
+                    assert_eq!(rules[app_index]["process_path_regex"], json!([r"(?i)(?:^|[\\/])Программа\.exe$"]));
+                    assert_eq!(value.pointer("/route/final"), Some(&json!(default_outbound(default))));
+                    validate_no_direct_health(&value).unwrap();
+                    if tun { validate_tun_dns_hijack(&value).unwrap(); assert!(app_index > 2); }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1887,6 +1966,7 @@ mod tests {
         policy.apps.push(crate::domain::AppRoute {
             process_path: r"C:\Apps\Browser.exe".into(),
             process_name: Some("Browser.exe".into()),
+            match_by: crate::domain::AppMatchBy::Path,
             action: AppRouteAction::Vpn,
         });
         let mut config_request = request(&node, &policy);

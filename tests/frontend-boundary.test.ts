@@ -1838,6 +1838,36 @@ test("display-only routing edits do not restart an active runtime", async () => 
   f.controller.dispose();
 });
 
+test("stable application selection persists and transports typed name mode without polling", async () => {
+  await withPreferenceStorage(async (storage) => {
+    const f = await lifecycleFixture();
+    const routing = { ...f.controller.getSnapshot().routing, apps: [{ id: "client", name: "Client", path: "C:\\Apps\\v1\\Client.exe", matchBy: "name" as const, route: "vpn" as const }] };
+    await f.controller.applyRouting(routing);
+    assert.deepEqual(f.calls.map((c) => c.command), ["stop_system_proxy", "start_system_proxy"]);
+    assert.deepEqual((f.calls[1].arguments_?.routing as { apps: unknown }).apps, [{ processPath: routing.apps[0].path, processName: "Client.exe", matchBy: "name", route: "vpn" }]);
+    assert.equal(JSON.parse(storage.get("routedeck.routing.v1")!).apps[0].matchBy, "name");
+    const restored = await lifecycleFixture(false);
+    assert.equal(restored.controller.getSnapshot().routing.apps[0].matchBy, "name");
+    f.calls.length = 0;
+    await f.controller.applyRouting({ ...routing, apps: [{ ...routing.apps[0], path: "D:\\Apps\\v2\\CLIENT.EXE" }] });
+    assert.deepEqual(f.calls, []);
+    await f.controller.applyRouting({ ...routing, apps: [{ ...routing.apps[0], matchBy: "path" }] });
+    assert.deepEqual(f.calls.map((c) => c.command), ["stop_system_proxy", "start_system_proxy"]);
+    f.controller.dispose(); restored.controller.dispose();
+  });
+});
+
+test("different Unicode filename literals trigger applying the replacement runtime rule", async () => {
+  const f = await lifecycleFixture();
+  const routing = { ...f.controller.getSnapshot().routing, apps: [{ id: "client", name: "Client", path: "C:\\Apps\\ß.exe", matchBy: "name" as const, route: "vpn" as const }] };
+  await f.controller.applyRouting(routing);
+  f.calls.length = 0;
+  await f.controller.applyRouting({ ...routing, apps: [{ ...routing.apps[0], path: "C:\\Apps\\SS.exe" }] });
+  assert.deepEqual(f.calls.map((c) => c.command), ["stop_system_proxy", "start_system_proxy"]);
+  assert.equal(((f.calls[1].arguments_?.routing as { apps: { processName: string }[] }).apps[0]).processName, "SS.exe");
+  f.controller.dispose();
+});
+
 test("invalid routing paths, duplicate identities and unsupported fields are rejected before saving", async () => {
   const f = await lifecycleFixture();
   const app = { id: "app", name: "App", path: "C:\\Apps\\app.exe", route: "vpn" as const };
