@@ -1341,6 +1341,35 @@ mod tests {
     }
 
     #[test]
+    fn stable_name_rules_keep_default_and_tun_guards_for_each_route_choice() {
+        let node = node("hysteria2://fixture-password@example.test:443?sni=example.test#fixture");
+        for default in [DefaultRoute::Direct, DefaultRoute::Vpn] {
+            for action in [AppRouteAction::Direct, AppRouteAction::Vpn] {
+                for tun in [false, true] {
+                    let mut policy = policy(default);
+                    policy.apps = vec![crate::domain::AppRoute {
+                        process_path: r"C:\Apps\v1\Программа.exe".into(), process_name: None,
+                        match_by: crate::domain::AppMatchBy::Name, action,
+                    }];
+                    let mut request = request(&node, &policy);
+                    if tun {
+                        request.mode = CaptureMode::Tun(TunSettings::default());
+                        request.tun_upstream = Some(tun_upstream("Ethernet"));
+                    } else { request.mode = CaptureMode::SystemProxy; }
+                    let value: Value = serde_json::from_str(generate_config(request).unwrap().as_str()).unwrap();
+                    let rules = value.pointer("/route/rules").unwrap().as_array().unwrap();
+                    let app_index = rules.iter().position(|rule| rule.get("process_path_regex").is_some()).unwrap();
+                    assert_eq!(rules[app_index]["outbound"], json!(action_outbound(action)));
+                    assert_eq!(rules[app_index]["process_path_regex"], json!([r"(?i)(?:^|[\\/])Программа\.exe$"]));
+                    assert_eq!(value.pointer("/route/final"), Some(&json!(default_outbound(default))));
+                    validate_no_direct_health(&value).unwrap();
+                    if tun { validate_tun_dns_hijack(&value).unwrap(); assert!(app_index > 2); }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn structural_validator_rejects_direct_or_late_health_routes() {
         let mut value = json!({
             "outbounds": [{"type":"vless","tag":"selected"}],

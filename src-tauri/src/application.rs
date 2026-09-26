@@ -7701,6 +7701,27 @@ mod tests {
     }
 
     #[test]
+    fn app_matching_ipc_is_typed_migrates_and_survives_policy_conversion() {
+        let app = serde_json::json!({"processPath":r"C:\Apps\v1\Client.exe","processName":"Client.exe","route":"vpn"});
+        let legacy: SystemProxyAppRoute = serde_json::from_value(app.clone()).unwrap();
+        assert_eq!(legacy.match_by, crate::domain::AppMatchBy::Path);
+        let mut stable = app.clone(); stable["matchBy"] = serde_json::json!("name");
+        for tun in [false, true] {
+            let value = serde_json::json!({"defaultRoute":"direct","apps":[stable.clone()]});
+            let policy = if tun { serde_json::from_value::<TunRouting>(value).unwrap().into_policy() }
+                else { serde_json::from_value::<SystemProxyRouting>(value).unwrap().into_policy() };
+            assert_eq!(policy.apps[0].match_by, crate::domain::AppMatchBy::Name);
+            assert!(policy.validate().is_ok());
+        }
+        for mode in ["regex", "Name", "", "process_name"] {
+            let mut attack = app.clone(); attack["matchBy"] = serde_json::json!(mode);
+            assert!(serde_json::from_value::<SystemProxyAppRoute>(attack).is_err());
+        }
+        let mut attack = stable; attack["processPathRegex"] = serde_json::json!([".*"]);
+        assert!(serde_json::from_value::<SystemProxyAppRoute>(attack).is_err());
+    }
+
+    #[test]
     fn routing_defaults_are_closed_and_backward_compatible() {
         let legacy: TunRouting = serde_json::from_value(serde_json::json!({
             "defaultRoute": "vpn",
@@ -7761,6 +7782,24 @@ mod tests {
             }))
             .is_err());
         }
+    }
+
+    #[test]
+    fn invalid_stable_app_names_fail_before_privilege_or_runtime_work() {
+        let (controller, stops, alive) = controller_with_tun(false, true, false);
+        let node = import_node(&controller);
+        for filename in ["*.exe", "Client.exe:stream", "CON.exe", ".exe", "client\n.exe"] {
+            let mut routing = tun_routing(DefaultRoute::Direct);
+            routing.apps[0].match_by = crate::domain::AppMatchBy::Name;
+            routing.apps[0].process_path = format!(r"C:\Apps\{filename}");
+            let error = controller.start_tun(&node, routing).unwrap_err();
+            assert_eq!(error.stage, PublicErrorStage::Start);
+            assert_eq!(error.message, "Application routing rules are invalid");
+        }
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert!(!alive.load(Ordering::SeqCst));
+        assert!(!controller.status().connection_requested);
+        assert_eq!(controller.status().phase, RuntimePhase::Disconnected);
     }
 
     #[test]

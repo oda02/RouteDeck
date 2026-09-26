@@ -1857,6 +1857,17 @@ test("stable application selection persists and transports typed name mode witho
   });
 });
 
+test("different Unicode filename literals trigger applying the replacement runtime rule", async () => {
+  const f = await lifecycleFixture();
+  const routing = { ...f.controller.getSnapshot().routing, apps: [{ id: "client", name: "Client", path: "C:\\Apps\\ß.exe", matchBy: "name" as const, route: "vpn" as const }] };
+  await f.controller.applyRouting(routing);
+  f.calls.length = 0;
+  await f.controller.applyRouting({ ...routing, apps: [{ ...routing.apps[0], path: "C:\\Apps\\SS.exe" }] });
+  assert.deepEqual(f.calls.map((c) => c.command), ["stop_system_proxy", "start_system_proxy"]);
+  assert.equal(((f.calls[1].arguments_?.routing as { apps: { processName: string }[] }).apps[0]).processName, "SS.exe");
+  f.controller.dispose();
+});
+
 test("invalid routing paths, duplicate identities and unsupported fields are rejected before saving", async () => {
   const f = await lifecycleFixture();
   const app = { id: "app", name: "App", path: "C:\\Apps\\app.exe", route: "vpn" as const };

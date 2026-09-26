@@ -1081,10 +1081,9 @@ mod tests {
         // A specific exact path can override the wider name rule.
         policy.apps = vec![old, stable];
         assert!(policy.validate().is_ok());
-        for invalid in ["app.exe:stream", "folder/name.exe", "*.exe", "CON.exe"] {
+        for invalid in ["app.exe:stream", "*.exe", "CON.exe"] {
             policy.apps[1].process_path = format!(r"C:\Apps\{invalid}");
-            // Slashes represent a path: basename extraction is intentional.
-            if !invalid.contains('/') { assert!(policy.validate().is_err()); }
+            assert!(policy.validate().is_err());
         }
         assert!(serde_json::from_str::<AppRoute>(r#"{"process_path":"C:\\Apps\\Client.exe","process_name":null,"match_by":"regex","action":"vpn"}"#).is_err());
     }

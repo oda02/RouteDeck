@@ -35,3 +35,11 @@ test("stable rules survive a version-folder change without runtime change; mode 
   assert.notEqual(effectiveRoutingKey(routing([app])), effectiveRoutingKey(routing([{ ...app, path: "D:\\NewVersion\\Client.exe" }])));
   assert.equal(effectiveRoutingKey(routing([{ ...app, route: "inherit" }])), effectiveRoutingKey(routing([{ ...stable, route: "inherit" }])));
 });
+
+test("effective stable rules never collapse different Go Unicode regex literals", () => {
+  const key = (name: string) => effectiveRoutingKey(routing([{ ...app, matchBy: "name", path: `C:\\Apps\\${name}.exe` }]));
+  assert.notEqual(key("ß"), key("SS"));
+  assert.notEqual(key("ı"), key("I"));
+  assert.notEqual(key("Программа"), key("Other"));
+  assert.equal(key("CODEX"), key("codex"));
+});

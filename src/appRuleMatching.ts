@@ -18,8 +18,12 @@ export function appRuleMatchKey(app: Pick<AppRule, "path" | "matchBy">): string 
     : `path:${app.path.replaceAll("/", "\\").toLocaleLowerCase("en-US")}`;
 }
 
-// Case-insensitive stable names don't depend on the selected version's folder.
+// Only ASCII case canonicalization is guaranteed to preserve Go regexp matching.
+// Unicode full folding is conservative for duplicate detection, but can collapse
+// distinct runtime literals (for example ß and SS), so never use it here.
 // Exact-path compilation preserves native path case, so the effective key does too.
 export function effectiveAppRuleKey(app: AppRule): string {
-  return app.matchBy === "name" ? appRuleMatchKey(app) : `path:${app.path}`;
+  return app.matchBy === "name"
+    ? `name:${executableName(app.path).replace(/[A-Z]/g, (c) => c.toLowerCase())}`
+    : `path:${app.path}`;
 }
