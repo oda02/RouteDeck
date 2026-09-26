@@ -1085,7 +1085,9 @@ export class TauriController implements RouteDeckController {
     }
     if (changesRuntime) this.routingRevision += 1;
     this.publish({ routing: saved, routingPending: this.hasRuntimeSession() && this.routingRevision !== this.runtimeRoutingRevision });
-    if (changesRuntime && (this.wantsConnection || this.hasRuntimeSession() || this.queuedOperations > 0)) await this.enqueue(() => this.reconcileConnection());
+    // Retry a saved batch after failed teardown even when its stored value is
+    // unchanged: the retained session can still be using the previous rules.
+    if ((changesRuntime || this.snapshot.routingPending) && (this.wantsConnection || this.hasRuntimeSession() || this.queuedOperations > 0)) await this.enqueue(() => this.reconcileConnection());
   };
 
   saveSettings = async (settings: SettingsConfig): Promise<void> => {

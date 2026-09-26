@@ -55,6 +55,13 @@ System Proxy can coexist with another locally listening proxy because listeners 
 
 System Proxy routing is intentionally described as best-effort application proxy routing, not full-device tunnelling. Applications that ignore the Windows proxy, UDP/QUIC traffic, and operating-system DNS requests are outside its capture scope; use TUN when those flows must be covered.
 
+The Rules page stages edits until **Apply rules** saves the whole batch. Adding
+applications, changing routes or traffic rules, and editing advanced preferences
+do not reconnect the tunnel during selection. Apply reconciles the active session
+once when its effective rules changed. **Discard changes** restores saved rules.
+Navigation keeps the draft and a header shortcut opens pending edits; closing or
+reloading the application discards a draft that has not been applied.
+
 ## Development
 
 ### Server library

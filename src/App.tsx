@@ -13,6 +13,7 @@ import { createPortal } from "react-dom";
 import { controller } from "./controller";
 import { syncWindowTheme } from "./windowAppearance";
 import { useAutoSave } from "./useAutoSave";
+import { useStagedSave } from "./useStagedSave";
 import { nextSubscriptionRefresh } from "./subscriptionRefresh";
 import { appUpdateMonitor } from "./appUpdates";
 import { toPublicActionError, type PublicActionError } from "./actionErrors";
@@ -471,7 +472,7 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
   headingRef: React.RefObject<HTMLHeadingElement | null>;
   draft: RoutingConfig;
   onDraftChange: (routing: RoutingConfig) => void;
-  saveState: SaveFeedback;
+  saveState: SaveFeedback & { running: boolean; apply: () => Promise<void>; discard: () => void };
 }) {
   const [search, setSearch] = useState("");
   const [showPaths, setShowPaths] = useState(false);
@@ -480,6 +481,7 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
   const [pickerSearch, setPickerSearch] = useState("");
   const [pickerError, setPickerError] = useState("");
   const [runningApplications, setRunningApplications] = useState<RunningApplication[]>([]);
+  const [pickerSelections, setPickerSelections] = useState<Map<string, RunningApplication>>(new Map());
   const [trafficEditor, setTrafficEditor] = useState<TrafficRule | null>(null);
   const [trafficEditorOriginalId, setTrafficEditorOriginalId] = useState<string | null>(null);
   const [trafficEditorError, setTrafficEditorError] = useState("");
@@ -501,11 +503,9 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
     apps: draft.apps.map((app) => app.id === id ? { ...app, route } : app),
   });
 
-  const openApplicationPicker = () => {
+  const loadRunningApplications = () => {
     if (pickerLoading) return;
-    setPickerOpen(true);
     setPickerLoading(true);
-    setPickerSearch("");
     setPickerError("");
     void controller.listRunningApplications()
       .then(setRunningApplications)
@@ -513,19 +513,43 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
       .finally(() => setPickerLoading(false));
   };
 
-  const addApplication = (application: RunningApplication) => {
+  const openApplicationPicker = () => {
+    if (pickerLoading) return;
+    setPickerOpen(true);
+    setPickerSearch("");
+    setPickerSelections(new Map());
+    loadRunningApplications();
+  };
+
+  const closeApplicationPicker = () => {
+    setPickerOpen(false);
+    setPickerSelections(new Map());
+  };
+
+  const toggleApplication = (application: RunningApplication) => {
     const canonicalPath = application.executablePath.replaceAll("/", "\\").toLocaleLowerCase("en-US");
     if (selectedPaths.has(canonicalPath)) return;
-    const name = application.displayName.replace(/\.exe$/i, "") || application.displayName;
+    setPickerSelections((current) => {
+      const next = new Map(current);
+      if (next.has(canonicalPath)) next.delete(canonicalPath);
+      else next.set(canonicalPath, application);
+      return next;
+    });
+  };
+
+  const saveApplicationPicker = () => {
+    if (pickerSelections.size === 0) { closeApplicationPicker(); return; }
+    const additions = Array.from(pickerSelections, ([canonicalPath, application]) => ({
+      id: canonicalPath,
+      name: application.displayName.replace(/\.exe$/i, "") || application.displayName,
+      path: application.executablePath,
+      route: draft.defaultRoute === "direct" ? "vpn" : "direct",
+    } as const));
     onDraftChange({
       ...draft,
-      apps: [...draft.apps, {
-        id: canonicalPath,
-        name,
-        path: application.executablePath,
-        route: draft.defaultRoute === "direct" ? "vpn" : "direct",
-      }],
+      apps: [...draft.apps, ...additions],
     });
+    closeApplicationPicker();
   };
 
   const matchingApps = draft.apps.filter((app) => `${app.name} ${app.path}`.toLocaleLowerCase("ru-RU").includes(search.trim().toLocaleLowerCase("ru-RU")));
@@ -557,8 +581,18 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
     <div className="page routing-page">
       <div className="page-title-row">
         <h1 ref={headingRef} tabIndex={-1}>Правила</h1>
-        <SaveState state={saveState} unapplied={snapshot.routingPending} />
+        <div className="save-feedback" data-error={Boolean(saveState.error)}>
+          <span role="status" aria-live="polite">{saveState.running ? "Применяем…" : saveState.error ? "Не удалось сохранить или применить" : saveState.pending ? "Есть неприменённые изменения" : snapshot.routingPending ? "Сохранено · ожидает подключения" : "Сохранено"}</span>
+          {saveState.error ? <p role="alert">{saveState.error}</p> : null}
+        </div>
       </div>
+      <section className="card routing-apply-bar" aria-label="Применение правил">
+        <p>{saveState.pending ? "Изменения пока в черновике. Сохраните весь набор правил одним действием." : "Выберите приложения и настройте правила, затем примените весь набор."}<small>Активное соединение переподключится один раз. До применения действуют сохранённые правила. Черновик сохраняется при переходе между страницами; при закрытии приложения он сбрасывается.</small></p>
+        <div className="routing-apply-actions">
+          <button className="secondary-button" type="button" disabled={!saveState.pending || saveState.running} onClick={saveState.discard}>Отменить изменения</button>
+          <button className="primary-button" type="button" disabled={!saveState.pending || saveState.running} aria-busy={saveState.running} onClick={() => { void saveState.apply(); }}>{saveState.running ? "Применяем…" : saveState.error ? "Повторить применение" : "Применить правила"}</button>
+        </div>
+      </section>
       <section className="card route-default">
         <label htmlFor="default-route"><strong>Остальной трафик</strong><small>Приложения ниже — исключения</small></label>
         <select id="default-route" value={draft.defaultRoute} onChange={(event) => onDraftChange({ ...draft, defaultRoute: event.target.value as RoutingConfig["defaultRoute"] })}>
@@ -566,7 +600,7 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
         </select>
       </section>
 
-      <details className="routing-scope"><summary>{snapshot.mode === "tun" ? "TUN · трафик Windows" : "Системный прокси · ограниченный охват"}</summary><p>{snapshot.mode === "tun" ? "Правила охватывают трафик Windows." : "Только TCP приложений, использующих прокси Windows. Для остальных приложений и UDP нужен TUN."} Изменения сохраняются автоматически; активное соединение переподключится.</p></details>
+      <details className="routing-scope"><summary>{snapshot.mode === "tun" ? "TUN · трафик Windows" : "Системный прокси · ограниченный охват"}</summary><p>{snapshot.mode === "tun" ? "Правила охватывают трафик Windows." : "Только TCP приложений, использующих прокси Windows. Для остальных приложений и UDP нужен TUN."} Для сохранения изменений нажмите «Применить правила».</p></details>
       <section className="card rules-table">
         <div className="rules-toolbar">
           <h2>Приложения <span className="quiet-count">{draft.apps.length}</span></h2>
@@ -621,12 +655,12 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
 
       {pickerOpen ? (
         <Dialog
-          title="Добавить приложение"
-          description="Выберите приложение из запущенных сейчас."
+          title="Добавить приложения"
+          description="Отметьте нужные приложения. Они добавятся в черновик; затем нажмите «Применить правила»."
           focusKey="application-picker-search"
-          onClose={() => setPickerOpen(false)}
+          onClose={closeApplicationPicker}
           busy={pickerLoading}
-          actions={<><button className="text-button" type="button" disabled={pickerLoading} onClick={openApplicationPicker}><RefreshIcon size={16} />Обновить список</button><button className="secondary-button" type="button" onClick={() => setPickerOpen(false)}>Готово · {draft.apps.length}</button></>}
+          actions={<><button className="text-button" type="button" disabled={pickerLoading} onClick={loadRunningApplications}><RefreshIcon size={16} />Обновить список</button><button className="secondary-button" type="button" onClick={closeApplicationPicker}>Отмена</button><button className="primary-button dialog-primary" type="button" disabled={pickerSelections.size === 0} onClick={saveApplicationPicker}>Добавить в правила · {pickerSelections.size}</button></>}
         >
           {pickerLoading ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><LoaderIcon size={17} />Ищем запущенные приложения…</p> : (
             <>
@@ -639,11 +673,12 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
                 {filteredApplications.length > 0 ? filteredApplications.map((application) => {
                   const canonicalPath = application.executablePath.replaceAll("/", "\\").toLocaleLowerCase("en-US");
                   const added = selectedPaths.has(canonicalPath);
+                  const selected = pickerSelections.has(canonicalPath);
                   return (
-                    <button className="application-picker-row" type="button" disabled={added} onClick={() => addApplication(application)} key={canonicalPath}>
+                    <button className="application-picker-row" type="button" disabled={added} aria-pressed={selected} onClick={() => toggleApplication(application)} key={canonicalPath}>
                       <span className="app-monogram" aria-hidden="true">{application.displayName.slice(0, 1).toUpperCase()}</span>
                       <span className="app-copy"><strong>{application.displayName}</strong><span title={application.executablePath}>{application.executablePath}</span></span>
-                      <span className="picker-row-state">{added ? "Добавлено" : draft.defaultRoute === "direct" ? "Через VPN" : "Напрямую"}</span>
+                      <span className="picker-row-state">{added ? "Добавлено" : selected ? "Выбрано" : draft.defaultRoute === "direct" ? "Через VPN" : "Напрямую"}</span>
                     </button>
                   );
                 }) : <div className="empty-state compact-empty"><SearchIcon size={22} /><strong>Приложения не найдены</strong><span>{pickerSearch ? "Измените запрос." : "Запустите приложение и откройте список снова."}</span></div>}
@@ -904,7 +939,7 @@ export default function App() {
   const refreshUrlRef = useRef<HTMLInputElement>(null);
   const serversHeadingRef = useRef<HTMLHeadingElement>(null);
   const [search, setSearch] = useState("");
-  const routingSave = useAutoSave(snapshot.routing, controller.applyRouting);
+  const routingSave = useStagedSave(snapshot.routing, controller.applyRouting);
   const settingsSave = useAutoSave(snapshot.settings, controller.saveSettings);
   const routingDraft = routingSave.draft;
   const settingsDraft = settingsSave.draft;
@@ -1226,7 +1261,10 @@ export default function App() {
     <div className="app-shell" data-demo={snapshot.isDemo || undefined}>
       <header className="app-header">
         <div className="brand"><span className="brand-mark"><RoutingIcon size={20} /></span><span><strong>RouteDeck{appUpdate.currentVersion ? <span className="brand-version">v{appUpdate.currentVersion}</span> : null}</strong><small>VPN-клиент</small></span></div>
-        <StatusBadge phase={snapshot.phase} />
+        <div className="header-status">
+          {routingSave.pending || routingSave.error ? <button className="routing-pending-button" type="button" onClick={() => navigate("routing")} aria-label="Открыть неприменённые правила" title="Открыть неприменённые правила"><RoutingIcon size={16} /><span>Правила · {routingSave.running ? "применяем" : "черновик"}</span></button> : null}
+          <StatusBadge phase={snapshot.phase} />
+        </div>
       </header>
       {snapshot.isDemo ? (
         <div className="demo-banner" role="status">
