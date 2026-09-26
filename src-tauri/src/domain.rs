@@ -688,7 +688,17 @@ pub enum AppRouteAction {
 pub struct AppRoute {
     pub process_path: String,
     pub process_name: Option<String>,
+    #[serde(default)]
+    pub match_by: AppMatchBy,
     pub action: AppRouteAction,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppMatchBy {
+    #[default]
+    Path,
+    Name,
 }
 
 impl fmt::Debug for AppRoute {
@@ -697,6 +707,7 @@ impl fmt::Debug for AppRoute {
             .debug_struct("AppRoute")
             .field("process_path", &"[REDACTED]")
             .field("process_name", &self.process_name)
+            .field("match_by", &self.match_by)
             .field("action", &self.action)
             .finish()
     }
@@ -748,7 +759,14 @@ impl RoutePolicy {
                     return Err(DomainError::new("invalid process name"));
                 }
             }
-            let key = canonical_process_path(&app.process_path);
+            let key = match app.match_by {
+                AppMatchBy::Path => format!("path:{}", canonical_process_path(&app.process_path)),
+                AppMatchBy::Name => {
+                    let name = crate::app_rule_matching::executable_name(app.process_path.trim());
+                    crate::app_rule_matching::validate_executable_name(name)?;
+                    format!("name:{}", name.to_uppercase().to_lowercase())
+                }
+            };
             if let Some(previous) = actions.insert(key, app.action) {
                 if previous != app.action {
                     return Err(DomainError::new(
@@ -1029,11 +1047,13 @@ mod tests {
                 AppRoute {
                     process_path: r"C:\Apps\Browser.exe".into(),
                     process_name: None,
+                    match_by: crate::domain::AppMatchBy::Path,
                     action: AppRouteAction::Direct,
                 },
                 AppRoute {
                     process_path: r"c:/apps/browser.exe".into(),
                     process_name: None,
+                    match_by: crate::domain::AppMatchBy::Path,
                     action: AppRouteAction::Vpn,
                 },
             ],
@@ -1043,6 +1063,30 @@ mod tests {
         };
         assert!(policy.validate().is_err());
         assert!(!format!("{policy:?}").contains("Browser.exe"));
+    }
+
+    #[test]
+    fn app_match_kind_migrates_and_name_duplicates_ignore_version_folders() {
+        let old: AppRoute = serde_json::from_str(r#"{"process_path":"C:\\Apps\\Client.exe","process_name":null,"action":"vpn"}"#).unwrap();
+        assert_eq!(old.match_by, AppMatchBy::Path);
+        let mut stable = old.clone();
+        stable.match_by = AppMatchBy::Name;
+        let mut updated = stable.clone();
+        updated.process_path = "C:/Apps/new-version/CLIENT.EXE".into();
+        let mut policy = RoutePolicy {
+            default: DefaultRoute::Direct, apps: vec![stable.clone(), updated],
+            lan: LanPolicy::Direct, ipv6: Ipv6Policy::Enabled, dns: DnsPolicy::Vpn,
+        };
+        assert!(policy.validate().is_err());
+        // A specific exact path can override the wider name rule.
+        policy.apps = vec![old, stable];
+        assert!(policy.validate().is_ok());
+        for invalid in ["app.exe:stream", "folder/name.exe", "*.exe", "CON.exe"] {
+            policy.apps[1].process_path = format!(r"C:\Apps\{invalid}");
+            // Slashes represent a path: basename extraction is intentional.
+            if !invalid.contains('/') { assert!(policy.validate().is_err()); }
+        }
+        assert!(serde_json::from_str::<AppRoute>(r#"{"process_path":"C:\\Apps\\Client.exe","process_name":null,"match_by":"regex","action":"vpn"}"#).is_err());
     }
 
     #[test]

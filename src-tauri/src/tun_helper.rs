@@ -1821,8 +1821,9 @@ mod windows {
         }
         let mut app_count = 0;
         while let Some(rule) = rules.get(index) {
+            let name_matcher = rule.get("process_path_regex").is_some();
             let Some(paths) = rule
-                .get("process_path")
+                .get(if name_matcher { "process_path_regex" } else { "process_path" })
                 .and_then(serde_json::Value::as_array)
             else {
                 break;
@@ -1835,9 +1836,11 @@ mod windows {
                 )
                 && paths.len() == 1
                 && paths[0].as_str().is_some_and(|path| {
-                    !path.is_empty()
+                    if name_matcher {
+                        crate::app_rule_matching::validate_executable_name_pattern(path)
+                    } else { !path.is_empty()
                         && path.encode_utf16().count() <= 32_767
-                        && !path.chars().any(char::is_control)
+                        && !path.chars().any(char::is_control) }
                 });
             if !exact_app {
                 return Err(rejected());
@@ -2143,7 +2146,7 @@ mod windows {
                     rule,
                     &["action", "outbound"],
                     &["ip_is_private"],
-                    &["inbound", "process_path", "network"],
+                    &["inbound", "process_path", "process_path_regex", "network"],
                     &["port"],
                     &[],
                 )?,
@@ -4445,6 +4448,7 @@ mod windows {
                 apps: vec![AppRoute {
                     process_path: r"C:\Fixture\Browser.exe".into(),
                     process_name: None,
+                    match_by: crate::domain::AppMatchBy::Path,
                     action: AppRouteAction::Direct,
                 }],
                 lan: LanPolicy::Direct,
@@ -4749,6 +4753,37 @@ mod windows {
                 Some(expected)
             )
             .is_ok());
+        }
+
+        #[test]
+        fn helper_accepts_only_generated_literal_executable_name_patterns() {
+            let mut valid = generated_tun_fixture(
+                "hysteria2://fixture-password@example.test:443?sni=example.test",
+                false, true, false,
+            );
+            let rules = valid.pointer_mut("/route/rules").unwrap().as_array_mut().unwrap();
+            let app = rules.iter_mut().find(|rule| rule.get("process_path").is_some()).unwrap();
+            app.as_object_mut().unwrap().remove("process_path");
+            app["process_path_regex"] = serde_json::json!([
+                crate::app_rule_matching::executable_name_pattern("Client (beta)+[1].exe").unwrap()
+            ]);
+            assert!(validate_tun_config(&valid.to_string(), "Ethernet").is_ok());
+            for expression in [r".*", r"(?i)(?:^|[\\/]).*\.exe$", r"(?i)(?:^|[\\/])Client.exe$", r"(?i)(?:^|[\\/])Client\.exe$|.*", r"(?i)(?:^|[\\/])a\w\.exe$", r"(?i)(?:^|[\\/])a\.exe"] {
+                let mut attack = valid.clone();
+                let app = attack.pointer_mut("/route/rules").unwrap().as_array_mut().unwrap().iter_mut().find(|rule| rule.get("process_path_regex").is_some()).unwrap();
+                app["process_path_regex"] = serde_json::json!([expression]);
+                assert!(validate_tun_config(&attack.to_string(), "Ethernet").is_err(), "accepted {expression}");
+            }
+            for extra in ["process_path", "process_name", "inbound"] {
+                let mut attack = valid.clone();
+                let app = attack.pointer_mut("/route/rules").unwrap().as_array_mut().unwrap().iter_mut().find(|rule| rule.get("process_path_regex").is_some()).unwrap();
+                app[extra] = serde_json::json!(["fixture"]);
+                assert!(validate_tun_config(&attack.to_string(), "Ethernet").is_err());
+            }
+            let mut oversized = valid;
+            let app = oversized.pointer_mut("/route/rules").unwrap().as_array_mut().unwrap().iter_mut().find(|rule| rule.get("process_path_regex").is_some()).unwrap();
+            app["process_path_regex"] = serde_json::json!([r"(?i)(?:^|[\\/])a\.exe$", r"(?i)(?:^|[\\/])b\.exe$"]);
+            assert!(validate_tun_config(&oversized.to_string(), "Ethernet").is_err());
         }
 
         #[test]

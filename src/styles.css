@@ -2002,6 +2002,10 @@ body:has(.dialog-scrim) > .toast { display: none; }
 .compact-rule { display: grid; grid-template-columns: minmax(0, 1fr) 142px 44px; align-items: center; gap: 8px; min-height: 52px; padding: 3px 8px 3px 16px; border-top: 1px solid var(--border-subtle); }
 .compact-rule:hover { background: var(--bg-hover); }
 .rule-app-copy { min-width: 0; }
+.app-match-button { display: block; width: 100%; min-width: 0; min-height: 44px; padding: 2px 0; border: 0; background: transparent; color: var(--text-primary); text-align: left; cursor: pointer; }
+.app-match-button:hover strong { color: var(--accent); }
+.app-match-button > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; line-height: 15px; color: var(--text-secondary); }
+.app-match-value { overflow-wrap: anywhere; padding: 10px; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); font-size: 13px; }
 .rule-app-copy strong { display: block; font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rule-app-copy small { display: block; color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; line-height: 1.4; padding-block: 4px; }
 .compact-rule select { width: 100%; min-height: 38px; font-size: 12px; padding-inline: 8px; border-color: transparent; background-color: transparent; }

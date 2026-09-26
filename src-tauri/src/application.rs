@@ -311,6 +311,8 @@ pub struct TunRouting {
 pub struct SystemProxyAppRoute {
     pub process_path: String,
     pub process_name: Option<String>,
+    #[serde(default)]
+    pub match_by: crate::domain::AppMatchBy,
     pub route: AppRouteAction,
 }
 
@@ -320,6 +322,7 @@ impl fmt::Debug for SystemProxyAppRoute {
             .debug_struct("SystemProxyAppRoute")
             .field("process_path", &"[REDACTED]")
             .field("process_name", &self.process_name)
+            .field("match_by", &self.match_by)
             .field("route", &self.route)
             .finish()
     }
@@ -335,6 +338,7 @@ impl SystemProxyRouting {
                 .map(|app| AppRoute {
                     process_path: app.process_path,
                     process_name: app.process_name,
+                    match_by: app.match_by,
                     action: app.route,
                 })
                 .collect(),
@@ -356,6 +360,7 @@ impl TunRouting {
                 .map(|app| AppRoute {
                     process_path: app.process_path,
                     process_name: app.process_name,
+                    match_by: app.match_by,
                     action: app.route,
                 })
                 .collect(),
@@ -7666,6 +7671,7 @@ mod tests {
             apps: vec![SystemProxyAppRoute {
                 process_path: r"C:\Program Files\Browser\browser.exe".into(),
                 process_name: Some("browser.exe".into()),
+                match_by: crate::domain::AppMatchBy::Path,
                 route: if default_route == DefaultRoute::Direct {
                     AppRouteAction::Vpn
                 } else {
@@ -7684,6 +7690,7 @@ mod tests {
             apps: vec![SystemProxyAppRoute {
                 process_path: r"C:\Program Files\Browser\browser.exe".into(),
                 process_name: Some("browser.exe".into()),
+                match_by: crate::domain::AppMatchBy::Path,
                 route: if default_route == DefaultRoute::Direct {
                     AppRouteAction::Vpn
                 } else {
