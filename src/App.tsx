@@ -484,7 +484,6 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
   const [pickerSearch, setPickerSearch] = useState("");
   const [pickerError, setPickerError] = useState("");
   const [runningApplications, setRunningApplications] = useState<RunningApplication[]>([]);
-  const [pickerSelections, setPickerSelections] = useState<Map<string, RunningApplication>>(new Map());
   const [trafficEditor, setTrafficEditor] = useState<TrafficRule | null>(null);
   const [trafficEditorOriginalId, setTrafficEditorOriginalId] = useState<string | null>(null);
   const [trafficEditorError, setTrafficEditorError] = useState("");
@@ -494,9 +493,11 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
   const summary = draft.defaultRoute === "direct"
     ? `По умолчанию напрямую · ${draft.apps.filter((app) => app.route === "vpn").length} исключений через VPN`
     : `По умолчанию через VPN · ${draft.apps.filter((app) => app.route === "direct").length} исключений напрямую`;
-  const selectedPaths = useMemo(() => new Set(
-    draft.apps.map((app) => app.path.replaceAll("/", "\\").toLocaleLowerCase("en-US")),
-  ), [draft.apps]);
+  const matchingApplicationRules = (application: RunningApplication) => {
+    const pathKey = appRuleMatchKey({ path: application.executablePath, matchBy: "path" });
+    const nameKey = appRuleMatchKey({ path: application.executablePath, matchBy: "name" });
+    return draft.apps.filter((app) => appRuleMatchKey(app) === (app.matchBy === "name" ? nameKey : pathKey));
+  };
   const filteredApplications = useMemo(() => {
     const query = deferredPickerSearch.trim().toLocaleLowerCase("ru-RU");
     return runningApplications.filter((application) => !query
@@ -534,39 +535,27 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
     if (pickerLoading) return;
     setPickerOpen(true);
     setPickerSearch("");
-    setPickerSelections(new Map());
     loadRunningApplications();
   };
 
   const closeApplicationPicker = () => {
     setPickerOpen(false);
-    setPickerSelections(new Map());
   };
 
   const toggleApplication = (application: RunningApplication) => {
-    const canonicalPath = application.executablePath.replaceAll("/", "\\").toLocaleLowerCase("en-US");
-    if (selectedPaths.has(canonicalPath)) return;
-    setPickerSelections((current) => {
-      const next = new Map(current);
-      if (next.has(canonicalPath)) next.delete(canonicalPath);
-      else next.set(canonicalPath, application);
-      return next;
-    });
-  };
-
-  const saveApplicationPicker = () => {
-    if (pickerSelections.size === 0) { closeApplicationPicker(); return; }
-    const additions = Array.from(pickerSelections, ([canonicalPath, application]) => ({
-      id: canonicalPath,
-      name: application.displayName.replace(/\.exe$/i, "") || application.displayName,
-      path: application.executablePath,
-      route: draft.defaultRoute === "direct" ? "vpn" : "direct",
-    } as const));
+    const matching = matchingApplicationRules(application);
     onDraftChange({
       ...draft,
-      apps: [...draft.apps, ...additions],
+      apps: matching.length
+        ? draft.apps.filter((app) => !matching.includes(app))
+        : [...draft.apps, {
+          id: application.executablePath.replaceAll("/", "\\").toLocaleLowerCase("en-US"),
+          name: application.displayName.replace(/\.exe$/i, "") || application.displayName,
+          path: application.executablePath,
+          matchBy: "path",
+          route: draft.defaultRoute === "direct" ? "vpn" : "direct",
+        }],
     });
-    closeApplicationPicker();
   };
 
   const matchingApps = draft.apps.filter((app) => `${app.name} ${app.path}`.toLocaleLowerCase("ru-RU").includes(search.trim().toLocaleLowerCase("ru-RU")));
@@ -604,9 +593,9 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
         </div>
       </div>
       <section className="card routing-apply-bar" aria-label="Применение правил">
-        <p>{saveState.pending ? "Изменения пока в черновике. Сохраните весь набор правил одним действием." : "Выберите приложения и настройте правила, затем примените весь набор."}<small>Активное соединение переподключится один раз. До применения действуют сохранённые правила. Черновик сохраняется при переходе между страницами; при закрытии приложения он сбрасывается.</small></p>
+        <p>{saveState.pending ? "Черновик правил" : "Все изменения применяются вместе"}<small>Активное соединение переподключится один раз.</small></p>
         <div className="routing-apply-actions">
-          <button className="secondary-button" type="button" disabled={!saveState.pending || saveState.running} onClick={saveState.discard}>Отменить изменения</button>
+          <button className="secondary-button" type="button" aria-label="Отменить изменения" disabled={!saveState.pending || saveState.running} onClick={saveState.discard}>Отменить</button>
           <button className="primary-button" type="button" disabled={!saveState.pending || saveState.running} aria-busy={saveState.running} onClick={() => { void saveState.apply(); }}>{saveState.running ? "Применяем…" : saveState.error ? "Повторить применение" : "Применить правила"}</button>
         </div>
       </section>
@@ -616,7 +605,7 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
           options={[{ value: "vpn", label: "Через VPN" }, { value: "direct", label: "Напрямую" }]} />
       </section>
 
-      <details className="routing-scope"><summary>{snapshot.mode === "tun" ? "TUN · трафик Windows" : "Системный прокси · ограниченный охват"}</summary><p>{snapshot.mode === "tun" ? "Правила охватывают трафик Windows." : "Только TCP приложений, использующих прокси Windows. Для остальных приложений и UDP нужен TUN."} Для сохранения изменений нажмите «Применить правила».</p></details>
+      <details className="routing-scope"><summary>{snapshot.mode === "tun" ? "TUN · трафик Windows" : "Системный прокси · ограниченный охват"}</summary><p>{snapshot.mode === "tun" ? "Правила охватывают трафик Windows." : "Только TCP приложений, использующих прокси Windows. Для остальных приложений и UDP нужен TUN."} Для сохранения изменений нажмите «Применить правила». До применения действуют сохранённые правила. Черновик сохраняется при переходе между страницами; при закрытии приложения он сбрасывается.</p></details>
       <section className="card rules-table">
         <div className="rules-toolbar">
           <h2>Приложения <span className="quiet-count">{draft.apps.length}</span></h2>
@@ -671,35 +660,34 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
       {pickerOpen ? (
         <Dialog
           title="Добавить приложения"
-          description="Отметьте нужные приложения. Они добавятся в черновик; затем нажмите «Применить правила»."
+          description="Отметки сразу меняют черновик. Примените его один раз на странице правил."
+          className="application-picker-dialog"
+          dismissOnBackdrop
           focusKey="application-picker-search"
           onClose={closeApplicationPicker}
-          busy={pickerLoading}
-          actions={<><button className="text-button" type="button" disabled={pickerLoading} onClick={loadRunningApplications}><RefreshIcon size={16} />Обновить список</button><button className="secondary-button" type="button" onClick={closeApplicationPicker}>Отмена</button><button className="primary-button dialog-primary" type="button" disabled={pickerSelections.size === 0} onClick={saveApplicationPicker}>Добавить в правила · {pickerSelections.size}</button></>}
+          actions={<><span className="picker-draft-count" role="status" aria-live="polite">В черновике: {draft.apps.length}</span><button className="secondary-button" type="button" onClick={closeApplicationPicker}>Готово</button></>}
         >
-          {pickerLoading ? <p className="persistent-hint" role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><LoaderIcon size={17} />Ищем запущенные приложения…</p> : (
-            <>
               <label className="search-field application-search" htmlFor="application-picker-search">
                 <SearchIcon size={18} /><span className="sr-only">Поиск приложений</span>
                 <input id="application-picker-search" value={pickerSearch} onChange={(event) => setPickerSearch(event.target.value)} placeholder="Найти приложение" autoComplete="off" data-autofocus />
               </label>
+              <div className="picker-list-toolbar"><span className="picker-list-count">{pickerSearch ? `Найдено: ${filteredApplications.length} из ${runningApplications.length}` : `Приложений: ${runningApplications.length}`}</span><button className="text-button picker-refresh" type="button" disabled={pickerLoading} aria-busy={pickerLoading} onClick={loadRunningApplications}>{pickerLoading ? <LoaderIcon size={16} /> : <RefreshIcon size={16} />}Обновить список</button></div>
               {pickerError ? <p className="field-error" role="alert">{pickerError}</p> : null}
-              {!pickerError ? <div className="application-picker-list">
+              <div className="application-picker-list" aria-label="Запущенные приложения" aria-busy={pickerLoading}>
                 {filteredApplications.length > 0 ? filteredApplications.map((application) => {
                   const canonicalPath = application.executablePath.replaceAll("/", "\\").toLocaleLowerCase("en-US");
-                  const added = selectedPaths.has(canonicalPath);
-                  const selected = pickerSelections.has(canonicalPath);
+                  const matching = matchingApplicationRules(application);
+                  const selected = matching.length > 0;
+                  const byName = matching.some((app) => app.matchBy === "name");
                   return (
-                    <button className="application-picker-row" type="button" disabled={added} aria-pressed={selected} onClick={() => toggleApplication(application)} key={canonicalPath}>
+                    <button className="application-picker-row" type="button" aria-pressed={selected} onClick={() => toggleApplication(application)} key={canonicalPath}>
                       <span className="app-monogram" aria-hidden="true">{application.displayName.slice(0, 1).toUpperCase()}</span>
                       <span className="app-copy"><strong>{application.displayName}</strong><span title={application.executablePath}>{application.executablePath}</span></span>
-                      <span className="picker-row-state">{added ? "Добавлено" : selected ? "Выбрано" : draft.defaultRoute === "direct" ? "Через VPN" : "Напрямую"}</span>
+                      <span className="picker-row-state">{selected ? <><CheckIcon size={15} />{byName ? "По имени" : "Выбрано"}</> : draft.defaultRoute === "direct" ? "Через VPN" : "Напрямую"}</span>
                     </button>
                   );
-                }) : <div className="empty-state compact-empty"><SearchIcon size={22} /><strong>Приложения не найдены</strong><span>{pickerSearch ? "Измените запрос." : "Запустите приложение и откройте список снова."}</span></div>}
-              </div> : null}
-            </>
-          )}
+                }) : <div className="empty-state compact-empty" role="status"><SearchIcon size={22} /><strong>{pickerLoading ? "Ищем приложения…" : "Приложения не найдены"}</strong><span>{pickerSearch ? "Измените запрос." : "Показаны запущенные приложения."}</span></div>}
+              </div>
         </Dialog>
       ) : null}
       {trafficEditor ? (
@@ -851,7 +839,7 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
   );
 }
 
-function Dialog({ title, description, focusKey, onClose, busy = false, closeDisabled = false, children, actions }: { title: string; description?: string; focusKey?: string; onClose: () => void; busy?: boolean; closeDisabled?: boolean; children: ReactNode; actions: ReactNode }) {
+function Dialog({ title, description, focusKey, onClose, busy = false, closeDisabled = false, className = "", dismissOnBackdrop = false, children, actions }: { title: string; description?: string; focusKey?: string; onClose: () => void; busy?: boolean; closeDisabled?: boolean; className?: string; dismissOnBackdrop?: boolean; children: ReactNode; actions: ReactNode }) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const previouslyFocusedRef = useRef<HTMLElement | null>(null);
 
@@ -923,8 +911,8 @@ function Dialog({ title, description, focusKey, onClose, busy = false, closeDisa
   }, [busy, closeDisabled, onClose]);
 
   return createPortal(
-    <div className="dialog-scrim" role="presentation">
-      <div className="dialog" ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby={description ? "dialog-description" : undefined}>
+    <div className="dialog-scrim" role="presentation" onClick={(event) => { if (dismissOnBackdrop && !closeDisabled && event.target === event.currentTarget) onClose(); }}>
+      <div className={`dialog ${className}`} ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby={description ? "dialog-description" : undefined}>
         <div className="dialog-header"><div><h2 id="dialog-title">{title}</h2>{description ? <p id="dialog-description">{description}</p> : null}</div><button className="icon-button dialog-close" type="button" aria-label="Закрыть окно" title={closeDisabled ? "Дождитесь завершения импорта" : undefined} disabled={closeDisabled} onClick={onClose}><XIcon size={19} /></button></div>
         <div className="dialog-content">{children}</div>
         <div className="dialog-actions">{actions}</div>

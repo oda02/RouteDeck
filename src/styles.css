@@ -2035,11 +2035,36 @@ body:has(.dialog-scrim) > .toast { display: none; }
 }
 /* Compact utility pages: stable rows, one explanation per section. */
 .routing-page, .settings-page { gap: 16px; }
-.routing-apply-bar { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
-.routing-apply-bar p { margin: 0; font-size: 13px; line-height: 1.5; }
-.routing-apply-bar small { display: block; color: var(--text-secondary); margin-top: 5px; }
-.routing-apply-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-.routing-apply-actions button { flex: 1 1 150px; }
+.routing-apply-bar { padding: 10px 12px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 12px; }
+.routing-apply-bar p { flex: 1 1 180px; margin: 0; font-size: 12px; line-height: 1.5; }
+.routing-apply-bar small { display: block; color: var(--text-secondary); font-size: 11px; }
+.routing-apply-actions { display: flex; flex: 1 1 auto; min-width: 0; justify-content: flex-end; gap: 8px; }
+.routing-apply-actions button { flex: 1 1 0; min-width: 0; min-height: 40px; padding: 8px 10px; font-size: 12px; }
+@media (max-width: 520px) {
+  .routing-apply-bar p { flex-basis: 100%; }
+  .routing-apply-actions { width: 100%; }
+  .routing-apply-actions button { flex: 1; min-width: 0; min-height: 44px; }
+}
+.dialog-scrim:has(.application-picker-dialog) { grid-template-rows: minmax(0, 1fr); }
+.application-picker-dialog { height: min(560px, 100%); max-height: 100%; grid-template-rows: auto minmax(0, 1fr) auto; }
+.application-picker-dialog .dialog-header, .application-picker-dialog .dialog-actions { min-width: 0; }
+.application-picker-dialog .dialog-content { overflow: hidden; padding-top: 4px; padding-bottom: 0; gap: 8px; }
+.application-picker-dialog .application-picker-list { flex: 1 1 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.application-picker-dialog .application-picker-row { flex-shrink: 0; cursor: pointer; }
+.application-picker-dialog .application-search:focus-within { outline: 2px solid var(--focus); outline-offset: -2px; box-shadow: none; }
+.application-picker-dialog .application-search input:focus-visible { outline: none; }
+.application-picker-dialog .application-picker-row:focus-visible { outline-offset: -3px; }
+.picker-list-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 40px; }
+.picker-list-count, .picker-draft-count { color: var(--text-secondary); font-size: 12px; }
+.picker-list-count { min-width: 0; }
+.picker-refresh { flex: 0 0 auto; min-width: 150px; min-height: 40px; padding: 6px 8px; }
+.picker-row-state { display: inline-flex; align-items: center; justify-content: flex-end; gap: 4px; }
+.picker-draft-count { margin-right: auto; }
+.application-picker-dialog .dialog-actions { padding-top: 10px; padding-bottom: 12px; }
+@media (max-height: 520px) {
+  .application-picker-dialog .dialog-header { padding-top: 12px; padding-bottom: 8px; }
+  .application-picker-dialog .dialog-header p { font-size: 12px; line-height: 17px; }
+}
 .header-status { display: flex; align-items: center; gap: 8px; }
 .routing-pending-button { display: flex; align-items: center; gap: 5px; border: 1px solid var(--accent); border-radius: 8px; padding: 5px 8px; background: var(--bg-hover); color: var(--text-primary); font-size: 11px; cursor: pointer; }
 @media (max-width: 480px) { .routing-pending-button span { display: none; } }

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { chooseSelect, verifySelectControls } from "./fixtures/select-controls.mjs";
+import { verifyApplicationPicker } from "./fixtures/application-picker.mjs";
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.ROUTEDECK_PLAYWRIGHT_PATH || "playwright");
 const base = process.env.ROUTEDECK_UI_URL || "http://127.0.0.1:1421";
@@ -228,7 +229,7 @@ try {
   await page.setViewportSize({ width: 360, height: 560 }); await checkFrame();
   await page.setViewportSize({ width: 1000, height: 900 });
   const pickerStarts = await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command.startsWith("start_")).length);
-  await page.getByRole("button", { name: "Добавить в правила · 3", exact: true }).click();
+  await page.getByRole("button", { name: "Готово", exact: true }).click();
   await page.waitForTimeout(750);
   assert.equal(await page.evaluate(() => window.fixtureRoutingWrites), 0, "adding apps to draft persisted before Apply");
   assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command.startsWith("start_")).length), pickerStarts, "adding apps to draft restarted tunnel");
@@ -241,15 +242,18 @@ try {
 
   await page.getByRole("button", { name: "Добавить", exact: true }).click();
   await page.locator(".application-picker-row").nth(4).click();
-  await page.getByRole("button", { name: "Отмена", exact: true }).click();
-  assert.equal(await page.evaluate(() => window.fixtureRoutingWrites), 1, "cancel persisted a staged app");
-  assert.equal(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps.length), 3, "cancel mutated controller routing");
+  await page.getByRole("button", { name: "Готово", exact: true }).click();
+  assert.equal(await page.locator(".compact-rule").count(), 4, "closing lost the shared picker draft");
+  assert.equal(await page.evaluate(() => window.fixtureRoutingWrites), 1, "closing persisted a staged app");
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps.length), 3, "closing mutated controller routing");
   await page.getByRole("button", { name: "Добавить", exact: true }).click();
   await page.locator(".application-picker-row").nth(4).click();
   await page.getByRole("button", { name: "Закрыть окно", exact: true }).click();
+  assert.equal(await page.locator(".compact-rule").count(), 3, "toggling a selected app did not remove it from the draft");
   await page.getByRole("button", { name: "Добавить", exact: true }).click();
   await page.locator(".application-picker-row").nth(4).click();
   await page.keyboard.press("Escape");
+  assert.equal(await page.locator(".compact-rule").count(), 4, "Escape discarded shared draft choices");
   await page.waitForTimeout(750);
   assert.equal(await page.evaluate(() => window.fixtureRoutingWrites), 1, "X or Escape persisted a staged app");
   assert.equal(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps.length), 3, "X or Escape mutated controller routing");
@@ -287,7 +291,7 @@ try {
   // Fill the long-list fixture and keep the existing compact-list coverage.
   await page.getByRole("button", { name: "Добавить", exact: true }).click();
   for (let index = 3; index < 20; index++) await page.locator(".application-picker-row").nth(index).click();
-  await page.getByRole("button", { name: "Добавить в правила · 17", exact: true }).click();
+  await page.getByRole("button", { name: "Готово", exact: true }).click();
   await nav("Главная");
   await page.waitForTimeout(750);
   assert.equal(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps.length), 3, "navigation submitted unfinished draft");
@@ -721,6 +725,7 @@ try {
   scenarios += 2;
 
   scenarios += await verifySelectControls(browser, base, fixtureModule);
+  scenarios += await verifyApplicationPicker(browser, base, fixtureModule);
   assert.deepEqual(errors, []);
   console.log(`PASS: ${scenarios} browser scenarios; real frontend controller with synthetic IPC, no native networking`);
 } catch (error) {

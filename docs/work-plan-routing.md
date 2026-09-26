@@ -21,9 +21,10 @@ restart the connection during editing.
 - Navigation retains the draft and shows an accessible pending-rules button in
   the header. Closing/reloading the application discards an unsubmitted draft;
   the UI states this explicitly. Applied rules use existing local persistence.
-- The application picker stages toggleable selections independently. Refresh
-  keeps selections. **Add to rules** adds all selected apps to the page draft;
-  Cancel, X and Escape discard picker choices. No picker action reconnects.
+- The application picker toggles applications directly in the shared page draft.
+  Refresh keeps choices, search and existing results. Done, X, Escape and backdrop
+  close retain that draft. There is one final **Apply rules** action on the page;
+  **Discard changes** reverts all draft edits. No picker action reconnects.
 - Persistence errors preserve the draft for explicit retry. Saved changes remain
   saved if reconnect fails; the UI reports the failure. Retained old TUN rules
   remain pending and retrying the same batch must reconcile them again. Existing
@@ -35,7 +36,7 @@ restart the connection during editing.
   managed checkout, preserving original working files and remote history.
 - [x] Implement full-page draft, explicit Apply/Discard and pending indication.
 - [x] Add fixture coverage crossing the old debounce: zero writes/restarts during
-  edits, one save/restart on Apply, picker cancellation, page draft cancellation,
+  edits, one save/restart on Apply, picker close preservation, page draft cancellation,
   navigation, storage failure retry, delayed Apply with newer edits, and layouts.
 - [x] Add deterministic controller regression for retrying an identical saved
   batch while the retained TUN still uses the previous rules.

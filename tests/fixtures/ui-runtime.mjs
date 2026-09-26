@@ -7,6 +7,7 @@ const manual = "b".repeat(32);
 const legacy = "c".repeat(32);
 const previousUpdate = Date.now() - 25 * 60 * 60 * 1000;
 const fixture = {
+  applicationCount: 20, applicationVersion: "2026.09.26", applicationsDelay: 0, failApplications: false,
   calls: [], failRefresh: false, failStop: false, failProxyCleanup: false, failUpdateCheck: false, failOpenReleases: false, proxyCleanupDelay: 0, startDelay: 40, refreshDelay: 0,
   failUpdateDownload: true, failUpdateInstall: false, portableUpdate: { phase: "downloading", downloaded: 50, total: 100, version: "0.2.0", error: null },
   updateResponse: { currentVersion: "0.1.0", latestVersion: "0.1.0", status: "upToDate", releaseUrl: null },
@@ -109,10 +110,14 @@ const transport = {
       return { imported: 1, nodeIds: [node.id] };
     }
     if (command === "discard_import_preview") return null;
-    if (command === "list_running_applications") return Array.from({ length: 20 }, (_, index) => ({
-      processName: `app${index + 1}.exe`, displayName: `Приложение ${String(index + 1).padStart(2, "0")}`,
-      executablePath: `C:\\Fixture Apps\\Application ${index + 1}\\app${index + 1}.exe`,
-    }));
+    if (command === "list_running_applications") {
+      if (fixture.applicationsDelay) await sleep(fixture.applicationsDelay);
+      if (fixture.failApplications) throw { code: "command_failed", stage: "command", message: "Could not enumerate running applications" };
+      return Array.from({ length: fixture.applicationCount }, (_, index) => ({
+        processName: `app${index + 1}.exe`, displayName: `Приложение ${String(index + 1).padStart(2, "0")}`,
+        executablePath: `C:\\Fixture Apps\\Application ${index + 1}\\${fixture.applicationCount > 20 ? `Versions\\${fixture.applicationVersion}\\Resources\\Application Support\\` : ""}app${index + 1}.exe`,
+      }));
+    }
     throw new Error(`Unsupported fixture command: ${command}`);
   },
 };
