@@ -16,6 +16,17 @@ use windows_sys::Win32::{
     UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK},
 };
 
+pub(super) fn local_absolute_path(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    path.is_absolute()
+        && matches!(
+            path.components().next(),
+            Some(Component::Prefix(p))
+                if matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+        )
+        && !path.components().any(|p| matches!(p, Component::ParentDir))
+}
+
 struct Process(HANDLE);
 impl Drop for Process {
     fn drop(&mut self) {

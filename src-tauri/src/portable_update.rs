@@ -54,6 +54,10 @@ impl DirectoryLease {
         if !path.is_absolute() {
             return Err(ERROR);
         }
+        #[cfg(windows)]
+        if !windows::local_absolute_path(path) {
+            return Err(ERROR);
+        }
         let mut handles = Vec::new();
         for ancestor in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
             if !metadata_safe(ancestor)?.is_dir() {
@@ -1202,6 +1206,26 @@ mod tests {
         ));
         assert!(asset_url("1.0.0", "../foreign").is_err());
         assert!(unhex::<16>("../outside").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_local_absolute_drive_paths_reach_filesystem_boundary() {
+        for path in [r"C:\RouteDeck", r"\\?\C:\RouteDeck"] {
+            assert!(windows::local_absolute_path(Path::new(path)));
+        }
+        for path in [
+            r"C:RouteDeck",
+            r"RouteDeck",
+            r"\RouteDeck",
+            r"C:\safe\..\other",
+            r"\\server\share\RouteDeck",
+            r"\\?\UNC\server\share\RouteDeck",
+            r"\\.\PIPE\RouteDeck",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\RouteDeck",
+        ] {
+            assert!(!windows::local_absolute_path(Path::new(path)), "{path}");
+        }
     }
     #[cfg(windows)]
     #[test]
