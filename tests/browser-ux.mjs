@@ -36,6 +36,11 @@ try {
     }, { label: name, requireHeadingFocus: !alreadyCurrent });
   };
   const settle = () => page.waitForFunction(() => !window.__routeDeckFixture.snapshot().switching);
+  const saveEdits = async () => {
+    const apply = page.getByRole("button", { name: "Применить правила", exact: true });
+    if (await apply.count() && await apply.isEnabled()) await apply.click();
+    await page.getByText("Сохранено", { exact: true }).waitFor();
+  };
   const connected = () => page.waitForFunction(() => window.__routeDeckFixture.snapshot().phase === "connected" && !window.__routeDeckFixture.snapshot().switching);
   const checkFrame = async () => {
     const frame = await page.evaluate(() => ({
@@ -195,16 +200,99 @@ try {
   await page.evaluate(() => { window.__routeDeckFixture.failStop = false; });
   await page.getByRole("button", { name: "Отключить", exact: true }).click(); await settle();
   await checkFrame(); scenarios += 2;
-  // Twenty application rules: compact list, batch add and autosave across navigation.
+  // Picker changes stay local until one explicit batch save, including while connected.
+  await nav("Главная"); await page.getByRole("button", { name: "Подключить", exact: true }).click(); await connected();
+  await page.evaluate(() => {
+    window.fixtureRoutingWrites = 0;
+    window.fixturePickerSetItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (key, value) {
+      if (key === "routedeck.routing.v1") window.fixtureRoutingWrites += 1;
+      return window.fixturePickerSetItem.call(this, key, value);
+    };
+  });
   await nav("Правила");
   await page.getByRole("button", { name: "Добавить", exact: true }).click();
   await page.locator(".application-picker-row").nth(19).waitFor();
-  for (let index = 0; index < 20; index++) await page.locator(".application-picker-row").nth(index).click();
-  await page.getByRole("button", { name: "Готово · 20", exact: true }).click();
+  for (let index = 0; index < 3; index++) await page.locator(".application-picker-row").nth(index).click();
+  // Cross the 500 ms autosave debounce: an immediate assertion would miss the old bug.
+  await page.waitForTimeout(750);
+  assert.equal(await page.evaluate(() => window.fixtureRoutingWrites), 0, "picker selection persisted before explicit save");
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps.length), 0, "picker selection mutated controller routing");
+  await page.getByRole("button", { name: "Обновить список", exact: true }).click();
+  await page.locator(".application-picker-row").nth(19).waitFor();
+  assert.equal(await page.locator('.application-picker-row[aria-pressed="true"]').count(), 3, "refresh discarded staged selections");
+  await page.locator(".application-picker-row").nth(2).click();
+  assert.equal(await page.locator('.application-picker-row[aria-pressed="true"]').count(), 2, "selection could not be undone");
+  await page.locator(".application-picker-row").nth(2).click();
+  await page.setViewportSize({ width: 360, height: 560 }); await checkFrame();
+  await page.setViewportSize({ width: 1000, height: 900 });
+  const pickerStarts = await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command.startsWith("start_")).length);
+  await page.getByRole("button", { name: "Добавить в правила · 3", exact: true }).click();
+  await page.waitForTimeout(750);
+  assert.equal(await page.evaluate(() => window.fixtureRoutingWrites), 0, "adding apps to draft persisted before Apply");
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command.startsWith("start_")).length), pickerStarts, "adding apps to draft restarted tunnel");
+  await page.screenshot({ path: ".cache/ux-qa/routing-draft-1000.png" });
+  await saveEdits();
+  await page.waitForFunction(() => window.__routeDeckFixture.snapshot().routing.apps.length === 3);
+  await connected();
+  assert.equal(await page.evaluate(() => window.fixtureRoutingWrites), 1, "three selected apps were not persisted in one routing write");
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command.startsWith("start_")).length), pickerStarts + 1, "batch save restarted TUN more than once");
+
+  await page.getByRole("button", { name: "Добавить", exact: true }).click();
+  await page.locator(".application-picker-row").nth(4).click();
+  await page.getByRole("button", { name: "Отмена", exact: true }).click();
+  assert.equal(await page.evaluate(() => window.fixtureRoutingWrites), 1, "cancel persisted a staged app");
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps.length), 3, "cancel mutated controller routing");
+  await page.getByRole("button", { name: "Добавить", exact: true }).click();
+  await page.locator(".application-picker-row").nth(4).click();
+  await page.getByRole("button", { name: "Закрыть окно", exact: true }).click();
+  await page.getByRole("button", { name: "Добавить", exact: true }).click();
+  await page.locator(".application-picker-row").nth(4).click();
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(750);
+  assert.equal(await page.evaluate(() => window.fixtureRoutingWrites), 1, "X or Escape persisted a staged app");
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps.length), 3, "X or Escape mutated controller routing");
+
+  // All rule controls stage a batch, and Discard restores the last saved set.
+  const savedBatch = await page.evaluate(() => structuredClone(window.__routeDeckFixture.snapshot().routing));
+  const beforeDraftCommands = await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => /^(start|stop)_/.test(entry.command)).length);
+  await page.getByLabel("Маршрут для Приложение 01").selectOption("direct");
+  await page.locator("#default-route").selectOption("vpn");
+  await page.getByRole("button", { name: "Удалить правило Приложение 03", exact: true }).click();
+  await page.locator(".traffic-rules summary").click();
+  await page.getByLabel("Включить правило 1", { exact: true }).uncheck();
+  await page.locator(".tun-stack-settings summary").click();
+  await page.getByLabel("Стек TUN", { exact: true }).selectOption("system");
+  await page.locator(".naive-settings summary").click();
+  await page.getByLabel("UDP over TCP для Naive", { exact: true }).check();
+  await page.waitForTimeout(750);
+  assert.deepEqual(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing), savedBatch, "editing changed saved rules");
+  assert.equal(await page.evaluate(() => window.fixtureRoutingWrites), 1, "editing controls persisted before Apply");
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => /^(start|stop)_/.test(entry.command)).length), beforeDraftCommands, "editing controls restarted tunnel");
+  await page.setViewportSize({ width: 360, height: 560 });
+  await page.locator("main").evaluate((element) => { element.scrollTop = 0; });
+  await page.screenshot({ path: ".cache/ux-qa/routing-draft-360.png" });
+  await checkFrame();
+  await page.getByRole("button", { name: "Отменить изменения", exact: true }).click();
+  assert.equal(await page.getByRole("button", { name: "Открыть неприменённые правила", exact: true }).count(), 0);
+  assert.equal(await page.locator(".compact-rule").count(), 3);
+  assert.equal(await page.getByLabel("Маршрут для Приложение 01").inputValue(), "vpn");
+  assert.equal(await page.getByLabel("Включить правило 1", { exact: true }).isChecked(), true);
+  assert.equal(await page.getByLabel("Стек TUN", { exact: true }).inputValue(), "gvisor");
+  assert.equal(await page.getByLabel("UDP over TCP для Naive", { exact: true }).isChecked(), false);
+  await page.setViewportSize({ width: 1000, height: 900 });
+  scenarios += 3;
+
+  // Fill the long-list fixture and keep the existing compact-list coverage.
+  await page.getByRole("button", { name: "Добавить", exact: true }).click();
+  for (let index = 3; index < 20; index++) await page.locator(".application-picker-row").nth(index).click();
+  await page.getByRole("button", { name: "Добавить в правила · 17", exact: true }).click();
   await nav("Главная");
+  await page.waitForTimeout(750);
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps.length), 3, "navigation submitted unfinished draft");
+  await page.getByRole("button", { name: "Открыть неприменённые правила", exact: true }).click();
+  await saveEdits();
   await page.waitForFunction(() => window.__routeDeckFixture.snapshot().routing.apps.length === 20);
-  await nav("Правила");
-  await page.getByText("Сохранено", { exact: true }).waitFor();
   assert.equal(await page.locator(".compact-rule").count(), 20);
   assert.ok((await page.locator(".compact-rule").first().boundingBox()).height <= 56);
   assert.equal(await page.getByRole("button", { name: "Сохранить правила", exact: true }).count(), 0);
@@ -215,7 +303,8 @@ try {
   assert.match(await page.locator(".rule-app-copy small").innerText(), /app17.exe/);
   await page.getByRole("searchbox", { name: "Найти правило" }).fill("");
   await page.getByLabel("Пути", { exact: true }).uncheck();
-  await page.getByText("Сохранено", { exact: true }).waitFor(); scenarios += 3;
+  await saveEdits(); scenarios += 3;
+  await page.evaluate(() => { Storage.prototype.setItem = window.fixturePickerSetItem; });
   for (const size of [{ width: 360, height: 560 }, { width: 1000, height: 900 }]) {
     await page.setViewportSize(size); await checkFrame();
     await page.locator("main").evaluate((element) => { element.scrollTop = 0; });
@@ -231,15 +320,16 @@ try {
   // A failed local write is visible, retained across pages and explicitly retryable.
   await page.evaluate(() => { window.fixtureOriginalSetItem = Storage.prototype.setItem; Storage.prototype.setItem = function () { throw new DOMException("Fixture", "QuotaExceededError"); }; });
   await page.getByLabel("Маршрут для Приложение 01").selectOption("direct");
+  await page.getByRole("button", { name: "Применить правила", exact: true }).click();
   await page.locator(".save-feedback [role=alert]").waitFor();
   await nav("Настройки"); await nav("Правила");
   await page.locator(".save-feedback [role=alert]").waitFor();
   await page.evaluate(() => { Storage.prototype.setItem = window.fixtureOriginalSetItem; });
-  await page.locator(".save-feedback").getByRole("button", { name: "Повторить" }).click();
-  await page.getByText("Сохранено", { exact: true }).waitFor(); scenarios++;
+  await page.getByRole("button", { name: "Повторить применение", exact: true }).click();
+  await saveEdits(); scenarios++;
   await nav("Настройки");
   await page.getByLabel("Тема", { exact: true }).selectOption("light");
-  await page.getByText("Сохранено", { exact: true }).waitFor();
+  await saveEdits();
   assert.equal(await page.locator("html").getAttribute("data-theme"), "light");
   await page.reload(); await page.waitForFunction(() => window.__routeDeckFixture?.snapshot().backendAvailable);
   assert.equal(await page.locator("html").getAttribute("data-theme"), "light");
@@ -259,20 +349,24 @@ try {
   await nav("Главная"); await page.getByRole("button", { name: "Подключить", exact: true }).click(); await connected();
   const beforeRules = await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command.startsWith("start_")).length);
   await nav("Правила"); await page.getByLabel("Маршрут для Приложение 01").selectOption("vpn");
-  await page.getByText("Сохранено", { exact: true }).waitFor(); await connected();
+  await saveEdits(); await connected();
   assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command.startsWith("start_")).length), beforeRules + 1);
   await checkFrame(); scenarios++;
   await page.evaluate(() => { window.__routeDeckFixture.startDelay = 1500; });
   await page.getByLabel("Маршрут для Приложение 02").selectOption("direct");
+  await page.getByRole("button", { name: "Применить правила", exact: true }).click();
   await page.waitForFunction(() => window.__routeDeckFixture.snapshot().phase === "starting-core");
   await page.getByLabel("Маршрут для Приложение 02").selectOption("vpn");
   await page.getByLabel("Маршрут для Приложение 03").selectOption("direct");
-  await page.getByText("Сохранено", { exact: true }).waitFor(); await connected();
+  await connected();
+  await page.waitForFunction(() => document.querySelector('.routing-apply-actions .primary-button')?.disabled === false);
+  assert.deepEqual(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps.slice(1, 3).map((app) => app.route)), ["direct", "vpn"], "newer edits were submitted automatically");
+  await saveEdits(); await connected();
   assert.deepEqual(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps.slice(1, 3).map((app) => app.route)), ["vpn", "direct"], "late save completion overwrote a newer draft");
   await page.evaluate(() => { window.__routeDeckFixture.startDelay = 40; }); scenarios++;
   // Background refresh waits until disconnected and reuses URLs without dialogs.
   await nav("Настройки"); await page.getByLabel("Автообновление подписок").selectOption("6");
-  await page.getByText("Сохранено", { exact: true }).waitFor();
+  await saveEdits();
   await page.clock.fastForward(61_000);
   assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command === "refresh_source").length), 0);
   await nav("Главная"); await page.getByRole("button", { name: "Отключить", exact: true }).click(); await settle();
@@ -302,7 +396,7 @@ try {
   await page.screenshot({ path: ".cache/ux-qa/status-wide.png" }); scenarios++;
   for (const theme of ["dark", "light"]) {
     await nav("Настройки"); await page.getByLabel("Тема", { exact: true }).selectOption(theme);
-    await page.getByText("Сохранено", { exact: true }).waitFor();
+    await saveEdits();
     await nav("Серверы");
     for (const width of [360, 1920, 440, 1200, 360, 1600, 720, 440]) {
       await page.setViewportSize({ width, height: 760 }); await checkFrame();
@@ -378,7 +472,7 @@ try {
   await nav("Правила");
   await page.locator(".tun-stack-settings summary").click();
   await page.getByLabel("Стек TUN", { exact: true }).selectOption("gvisor");
-  await page.getByText("Сохранено", { exact: true }).waitFor();
+  await saveEdits();
   await page.setViewportSize({ width: 360, height: 760 }); await checkFrame();
   assert.equal(await page.locator("main").evaluate((element) => element.scrollWidth > element.clientWidth), false);
   await page.locator(".tun-stack-settings").scrollIntoViewIfNeeded();
@@ -391,7 +485,7 @@ try {
   await nav("Правила");
   await page.locator(".tun-stack-settings summary").click();
   await page.getByLabel("Стек TUN", { exact: true }).selectOption("system");
-  await page.getByText("Сохранено", { exact: true }).waitFor(); await connected();
+  await saveEdits(); await connected();
   assert.deepEqual(await page.evaluate((count) => window.__routeDeckFixture.calls.filter((entry) => /^(start|stop)_/.test(entry.command)).slice(count).map((entry) => entry.command), beforeStack), ["stop_tun", "start_tun"]);
   assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command === "start_tun").at(-1).routing.stack), "system");
   await nav("Главная");
@@ -400,7 +494,7 @@ try {
   await nav("Правила");
   await page.locator(".tun-stack-settings summary").click();
   await page.getByLabel("Стек TUN", { exact: true }).selectOption("gvisor");
-  await page.getByText("Сохранено", { exact: true }).waitFor(); await connected();
+  await saveEdits(); await connected();
   assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => /^(start|stop)_/.test(entry.command)).length), beforeProxyStack);
   assert.equal(await page.evaluate(() => Object.hasOwn(window.__routeDeckFixture.calls.filter((entry) => entry.command === "start_system_proxy").at(-1).routing, "stack")), false);
   await checkFrame(); scenarios += 3;
@@ -427,14 +521,14 @@ try {
   }
   await page.getByRole("button", { name: "Применить", exact: true }).click();
   await page.getByRole("dialog").waitFor({ state: "hidden" });
-  await page.getByText("Сохранено", { exact: true }).waitFor();
+  await saveEdits();
   assert.equal(await page.locator(".traffic-rule-row").count(), 2);
   assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => /^(start|stop)_/.test(entry.command)).length), beforeProxyStack);
   await page.getByRole("button", { name: "Поднять правило 2", exact: true }).click();
-  await page.getByText("Сохранено", { exact: true }).waitFor();
+  await saveEdits();
   assert.equal(await page.locator(".traffic-rules summary").getByText("UDP 443 блокируется", { exact: true }).count(), 0, "earlier direct rule overrides later block");
   await page.getByLabel("Включить правило 1", { exact: true }).uncheck();
-  await page.getByText("Сохранено", { exact: true }).waitFor();
+  await saveEdits();
   await page.locator(".traffic-rules summary").getByText("UDP 443 блокируется", { exact: true }).waitFor(); scenarios += 3;
 
   await page.locator(".traffic-rule-row").first().getByRole("button", { name: "Изменить", exact: true }).click();
@@ -443,10 +537,10 @@ try {
   await page.getByLabel("Действие", { exact: true }).selectOption("vpn");
   await page.getByRole("button", { name: "Применить", exact: true }).click();
   await page.getByRole("dialog").waitFor({ state: "hidden" });
-  await page.getByText("Сохранено", { exact: true }).waitFor();
+  await saveEdits();
   assert.equal(await page.locator(".traffic-rule-row").first().getByText("TCP 8443", { exact: true }).count(), 1);
   await page.getByLabel("Включить правило 1", { exact: true }).check();
-  await page.getByText("Сохранено", { exact: true }).waitFor();
+  await saveEdits();
   for (const width of [360, 1200]) {
     await page.setViewportSize({ width, height: 800 });
     await page.locator(".traffic-rules").scrollIntoViewIfNeeded(); await checkFrame();
@@ -464,7 +558,7 @@ try {
   await nav("Правила");
   await page.locator(".traffic-rules summary").click();
   await page.getByRole("button", { name: "Удалить правило 1", exact: true }).click();
-  await page.getByText("Сохранено", { exact: true }).waitFor(); await connected();
+  await saveEdits(); await connected();
   assert.deepEqual(await page.evaluate((count) => window.__routeDeckFixture.calls.filter((entry) => /^(start|stop)_/.test(entry.command)).slice(count).map((entry) => entry.command), beforeTraffic), ["stop_tun", "start_tun"]);
   const savedTraffic = await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.trafficRules);
   await page.reload();
@@ -473,7 +567,7 @@ try {
   await nav("Правила");
   await page.locator(".traffic-rules summary").click();
   await page.getByRole("button", { name: "Удалить правило 1", exact: true }).click();
-  await page.getByText("Сохранено", { exact: true }).waitFor();
+  await saveEdits();
   await page.reload();
   await page.waitForFunction(() => window.__routeDeckFixture?.snapshot().backendAvailable);
   assert.deepEqual(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.trafficRules), []); scenarios += 2;
@@ -482,7 +576,7 @@ try {
   await page.locator(".naive-settings summary").click();
   assert.equal(await page.getByLabel("UDP over TCP для Naive", { exact: true }).isChecked(), false);
   await page.getByLabel("UDP over TCP для Naive", { exact: true }).check();
-  await page.getByText("Сохранено", { exact: true }).waitFor();
+  await saveEdits();
   for (const width of [360, 1600]) {
     await page.setViewportSize({ width, height: 800 });
     await page.locator(".naive-settings").scrollIntoViewIfNeeded(); await checkFrame();
@@ -507,7 +601,7 @@ try {
   await nav("Правила");
   await page.locator(".naive-settings summary").click();
   await page.getByLabel("UDP over TCP для Naive", { exact: true }).uncheck();
-  await page.getByText("Сохранено", { exact: true }).waitFor(); await connected();
+  await saveEdits(); await connected();
   assert.equal(await page.evaluate(() => Boolean(window.__routeDeckFixture.calls.filter((entry) => entry.command === "start_tun").at(-1).routing.naiveUdpOverTcp)), false);
   scenarios += 3;
 
