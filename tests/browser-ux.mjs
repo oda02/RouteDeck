@@ -687,7 +687,7 @@ try {
   await page.getByRole("button", { name: "Повторить загрузку", exact: true }).click();
   await page.getByRole("button", { name: "Обновить и перезапустить", exact: true }).waitFor();
   await page.screenshot({ path: ".cache/ux-qa/portable-update-ready.png" });
-  await page.getByLabel("Тема", { exact: true }).selectOption("dark"); await saveEdits();
+  await chooseSelect(page, page.getByLabel("Тема", { exact: true }), "dark"); await saveEdits();
   await page.setViewportSize({ width: 360, height: 800 }); await page.locator(".update-settings").scrollIntoViewIfNeeded(); await checkFrame();
   await page.screenshot({ path: ".cache/ux-qa/portable-update-ready-dark-360.png" });
   await page.evaluate(() => { window.__routeDeckFixture.failUpdateInstall = false; });

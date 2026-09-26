@@ -103,6 +103,13 @@ new lock entry, including optional/target-only entries:
 
 ## Validation and limits
 
+Combined validation with the reviewed UI and stable-app rules: 385 Rust tests
+passed (two existing integration tests ignored), 144 Node tests, 89 synthetic
+browser scenarios, production frontend build and offline Rust all-target checks.
+Controller packaging, publisher and portable-input hostile fixtures passed.
+Actual runtime assembly awaits the CI-reviewed build/runtime artifacts; no live
+installed-bundle replacement is included in these local results.
+
 - Native fake/temp fixtures cover signatures, limits, unsafe ZIP names, full bundle
   integrity, hardlinks/reparse rejection, ownership, populated Windows handle
   rename, interrupted transaction steps, exact-child abort, retry after failure,
