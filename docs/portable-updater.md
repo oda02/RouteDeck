@@ -122,8 +122,10 @@ installed-bundle replacement is included in these local results.
 - No live tunnel, running GUI replacement, native restart, Windows proxy/routes/
   DNS/adapters/services or real privileged host test was performed. Real portable
   N->N+1 launch qualification remains an isolated Windows VM release smoke test.
-- Read-only/network/public-writable folders and altered portable bundles fall back
-  to manual repair in a new folder. Previous and staging folders are retained as
+- Read-only/public-writable folders and altered portable bundles fall back
+  to manual repair in a new folder. UNC/device paths are rejected before filesystem
+  access; drive-letter paths can also be mapped remote drives, whose update/rename
+  behavior has not been qualified. Previous and staging folders are retained as
   evidence; automatic garbage collection and automatic rollback are outside MVP.
   This disk usage is not bounded: each successful update retains one full previous
   bundle, and failed staging can retain partial downloads. After verifying that
