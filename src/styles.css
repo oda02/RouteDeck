@@ -1227,6 +1227,11 @@ h2 {
   background: var(--bg-hover);
 }
 
+.application-picker-row[aria-pressed="true"] {
+  background: var(--bg-hover);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
 .application-picker-row:disabled {
   color: var(--text-secondary);
   background: var(--bg-canvas);
