@@ -291,10 +291,10 @@ function HomePage({ snapshot, libraryBusy, headingRef, onNavigate, onModeChange,
   const activeServer = snapshot.servers.find((item) => item.id === snapshot.activeServerId);
   const pending = (Boolean(snapshot.switching) && !libraryBusy) || pendingPhases.includes(snapshot.phase);
   const connected = snapshot.phase === "connected" && !pending;
-  const active = Boolean(snapshot.activeServerId) || ["connected", "degraded", "blocked-by-conflict"].includes(snapshot.phase);
+  const active = Boolean(snapshot.connectionRequested) || Boolean(snapshot.activeServerId) || ["connected", "degraded", "blocked-by-conflict"].includes(snapshot.phase);
   const mode = snapshot.activeMode ?? snapshot.mode;
   const liveLatency = connected && activeServer?.latencyState === "ready" ? activeServer.latencyMs : undefined;
-  const status = pending ? "Переключаемся" : phaseLabels[snapshot.phase];
+  const status = pending ? "Переключаемся" : snapshot.connectionRequested && snapshot.phase !== "connected" && snapshot.phase !== "recovery-required" ? snapshot.reconnectPaused ? "Нужно ваше действие" : "Восстанавливаем соединение" : phaseLabels[snapshot.phase];
   const boundaryNotice = !snapshot.backendAvailable && !snapshot.isDemo;
   const recoveryRequired = snapshot.phase === "recovery-required";
   return (
@@ -319,6 +319,10 @@ function HomePage({ snapshot, libraryBusy, headingRef, onNavigate, onModeChange,
           {active || pending ? <XCircleIcon size={23} /> : <ShieldIcon size={23} />}
           <span>{recoveryRequired ? "Повторить восстановление" : snapshot.phase === "disconnecting" ? "Отключаем…" : pending ? "Отменить подключение" : active ? "Отключить" : "Подключить"}</span>
         </button>
+        {snapshot.connectionRequested && !connected && !pending ? <p className="field-help" role="status">{snapshot.reconnectPaused
+          ? "Автовосстановление приостановлено: проверьте разрешение Windows и диагностику. Отключите и подключитесь снова."
+          : `RouteDeck продолжает попытки подключения${snapshot.retryDelaySeconds !== undefined ? `: следующая через ${snapshot.retryDelaySeconds} с` : "."}`}</p> : null}
+        <p className="field-help">{mode === "tun" ? "При остановке ядра или перезапуске трафик может пойти напрямую. Kill switch пока недоступен." : "System Proxy действует на приложения, использующие прокси Windows. Защита от прямого выхода при сбое не гарантируется."}</p>
         <div className="connection-metrics">
           <button type="button" className="latency-metric" onClick={onLatencyInfo} aria-label="Как измеряется отклик через VPN"><ActivityIcon size={16} /><strong>{liveLatency !== undefined ? `${liveLatency} мс` : "—"}</strong><span>Отклик · Google</span><InfoIcon size={14} /></button>
           <span>{connected ? liveLatency === undefined ? "Ожидаем замер" : "Обновляется автоматически" : "Замер после подключения"}</span>

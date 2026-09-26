@@ -5,7 +5,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 3;
+pub(crate) const PROTOCOL_VERSION: u16 = 4;
 pub(crate) const MAX_FRAME_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
@@ -47,6 +47,12 @@ pub(crate) enum Frame {
         protocol_version: u16,
         session: String,
         request_id: u64,
+    },
+    RestartOwnedCore {
+        protocol_version: u16,
+        session: String,
+        request_id: u64,
+        target_index: u16,
     },
     Stopped {
         request_id: u64,
@@ -271,6 +277,12 @@ pub(crate) fn validate_frame(frame: &Frame) -> Result<(), ProtocolError> {
             session,
             request_id,
         }
+        | Frame::RestartOwnedCore {
+            protocol_version,
+            session,
+            request_id,
+            ..
+        }
         | Frame::Status {
             protocol_version,
             session,
@@ -387,6 +399,12 @@ impl ServerState {
                 Frame::Status {
                     request_id: next, ..
                 },
+            )
+            | (
+                Self::Running { last_request_id },
+                Frame::RestartOwnedCore {
+                    request_id: next, ..
+                },
             ) if *next > last_request_id => {
                 *self = Self::Running {
                     last_request_id: *next,
@@ -444,6 +462,49 @@ mod tests {
                 interface_alias: "Ethernet".into(),
                 ipv4_dns_server: None,
             },
+        }
+    }
+
+    #[test]
+    fn owned_restart_is_narrow_versioned_monotonic_and_forbidden_after_stop() {
+        let restart = Frame::RestartOwnedCore {
+            protocol_version: PROTOCOL_VERSION,
+            session: "01".repeat(16),
+            request_id: 3,
+            target_index: 0,
+        };
+        let mut state = ServerState::Running { last_request_id: 2 };
+        state.accept(&restart).unwrap();
+        assert!(state.accept(&restart).is_err());
+        let mut not_authenticated = ServerState::AwaitingChallenge;
+        assert!(not_authenticated.accept(&restart).is_err());
+        state
+            .accept(&Frame::StopTun {
+                protocol_version: PROTOCOL_VERSION,
+                session: "01".repeat(16),
+                request_id: 4,
+            })
+            .unwrap();
+        let next = Frame::RestartOwnedCore {
+            protocol_version: PROTOCOL_VERSION,
+            session: "01".repeat(16),
+            request_id: 5,
+            target_index: 0,
+        };
+        assert!(state.accept(&next).is_err());
+        let value = serde_json::to_value(&restart).unwrap();
+        for (key, hostile) in [
+            ("config", serde_json::json!({})),
+            ("executable", serde_json::json!("arbitrary.exe")),
+            ("target_index", serde_json::json!(65536)),
+            ("protocol_version", serde_json::json!(3)),
+        ] {
+            let mut raw = value.clone();
+            raw[key] = hostile;
+            let payload = serde_json::to_vec(&raw).unwrap();
+            let mut framed = (payload.len() as u32).to_le_bytes().to_vec();
+            framed.extend(payload);
+            assert!(read_frame(&mut Cursor::new(framed)).is_err());
         }
     }
 

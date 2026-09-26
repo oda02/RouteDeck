@@ -125,6 +125,12 @@ pub struct ProofRow {
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeStatus {
     pub revision: u64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub connection_requested: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub reconnect_paused: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_delay_seconds: Option<u64>,
     pub session_id: Option<String>,
     pub scope: RuntimeScope,
     pub mode: RuntimeMode,
@@ -143,6 +149,9 @@ impl Default for RuntimeStatus {
     fn default() -> Self {
         Self {
             revision: 0,
+            connection_requested: false,
+            reconnect_paused: false,
+            retry_delay_seconds: None,
             session_id: None,
             scope: RuntimeScope::LocalOnly,
             mode: RuntimeMode::LocalOnly,
@@ -466,12 +475,19 @@ impl Drop for ProvisionalChild {
     }
 }
 
+struct SidecarRecovery {
+    launcher: Box<dyn EngineLauncher>,
+    redactor: Redactor,
+    diagnostics: Arc<Mutex<DiagnosticBuffer>>,
+}
+
 struct RealityProcessPair {
     front: Box<dyn ManagedChild>,
     sidecar: Box<dyn ManagedChild>,
     sidecar_ports: Vec<u16>,
     listener: Arc<dyn ListenerVerifier>,
     _sidecar_config: SessionConfig,
+    recovery: Option<SidecarRecovery>,
 }
 
 impl ManagedChild for RealityProcessPair {
@@ -494,6 +510,34 @@ impl ManagedChild for RealityProcessPair {
         let front_result = self.front.stop();
         let sidecar_result = self.sidecar.stop();
         front_result.and(sidecar_result)
+    }
+
+    fn can_restart_owned_core(&self) -> bool {
+        self.front.can_restart_owned_core()
+    }
+
+    fn restart_owned_core(&mut self, target_index: u16) -> Result<(), RuntimeError> {
+        if !self.sidecar.is_alive()? {
+            self.sidecar.stop()?;
+            let recovery = self.recovery.as_ref().ok_or_else(|| {
+                RuntimeError::new("engine_process", "owned Xray sidecar is unavailable")
+            })?;
+            recovery.launcher.check(
+                &self._sidecar_config,
+                recovery.redactor.clone(),
+                recovery.diagnostics.clone(),
+            )?;
+            self.sidecar = recovery.launcher.start(
+                &self._sidecar_config,
+                recovery.redactor.clone(),
+                recovery.diagnostics.clone(),
+            )?;
+            for port in &self.sidecar_ports {
+                self.listener
+                    .wait_until_sidecar_ready(*port, self.sidecar.as_mut())?;
+            }
+        }
+        self.front.restart_owned_core(target_index)
     }
 
     fn tun_capture_snapshot(&mut self) -> Result<TunCaptureSnapshot, RuntimeError> {
@@ -636,6 +680,23 @@ struct ActiveSession {
     generation: String,
 }
 
+#[derive(Clone)]
+enum ConnectionRequest {
+    Proxy(String, SystemProxyRouting),
+    Tun,
+}
+
+struct ReconnectIntent {
+    request: ConnectionRequest,
+    failures: u32,
+    next_attempt: Instant,
+    paused: bool,
+}
+
+fn reconnect_delay(failures: u32) -> Duration {
+    Duration::from_secs((2_u64 << failures.min(5)).min(60))
+}
+
 #[derive(Default)]
 struct State {
     nodes: HashMap<String, StoredNode>,
@@ -647,6 +708,7 @@ struct State {
     status: RuntimeStatus,
     recovery_required: bool,
     shutting_down: bool,
+    reconnect: Option<ReconnectIntent>,
 }
 
 type EventSink = Arc<dyn Fn(RuntimeStatus) + Send + Sync>;
@@ -765,6 +827,7 @@ impl ApplicationController {
                     break;
                 };
                 controller.monitor_tick();
+                controller.reconnect_tick();
             })
             .map(|_| ())
             .map_err(|error| RuntimeError::new("monitor", error.to_string()))
@@ -1593,9 +1656,7 @@ impl ApplicationController {
         node_id: &str,
         routing: SystemProxyRouting,
     ) -> Result<RuntimeStatus, PublicError> {
-        let requested_naive_udp_over_tcp = routing.naive_udp_over_tcp;
-        let policy = routing.into_policy();
-        policy.validate().map_err(|_| {
+        routing.clone().into_policy().validate().map_err(|_| {
             PublicError::fixed(
                 PublicErrorCode::RuntimeFailure,
                 PublicErrorStage::Start,
@@ -1606,6 +1667,51 @@ impl ApplicationController {
             .operation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            let mut state = self.lock_state();
+            if !state.nodes.contains_key(node_id) {
+                return Err(PublicError::fixed(
+                    PublicErrorCode::NodeNotFound,
+                    PublicErrorStage::Start,
+                    "Selected node does not exist in the confirmed import",
+                ));
+            }
+            if state.shutting_down
+                || state.recovery_required
+                || state.status.phase == RuntimePhase::BlockedByConflict
+            {
+                return Err(PublicError::fixed(
+                    PublicErrorCode::RecoveryRequired,
+                    PublicErrorStage::SessionRecovery,
+                    "Resolve ownership recovery before connecting",
+                ));
+            }
+            state.reconnect = Some(ReconnectIntent {
+                request: ConnectionRequest::Proxy(node_id.to_owned(), routing.clone()),
+                failures: 0,
+                next_attempt: Instant::now() + reconnect_delay(0),
+                paused: false,
+            });
+        }
+        let result = self.start_system_proxy_locked(node_id, routing);
+        self.finish_connection_attempt(result.is_ok());
+        result.map(|_| self.status())
+    }
+
+    fn start_system_proxy_locked(
+        &self,
+        node_id: &str,
+        routing: SystemProxyRouting,
+    ) -> Result<RuntimeStatus, PublicError> {
+        let requested_naive_udp_over_tcp = routing.naive_udp_over_tcp;
+        let policy = routing.into_policy();
+        policy.validate().map_err(|_| {
+            PublicError::fixed(
+                PublicErrorCode::RuntimeFailure,
+                PublicErrorStage::Start,
+                "Application routing rules are invalid",
+            )
+        })?;
         let mut state = self.lock_state();
         let naive_udp_over_tcp = requested_naive_udp_over_tcp
             && state
@@ -1842,6 +1948,60 @@ impl ApplicationController {
         node_id: &str,
         routing: TunRouting,
     ) -> Result<RuntimeStatus, PublicError> {
+        routing.clone().into_policy().validate().map_err(|_| {
+            PublicError::fixed(
+                PublicErrorCode::RuntimeFailure,
+                PublicErrorStage::Start,
+                "Application routing rules are invalid",
+            )
+        })?;
+        validate_tun_traffic_rules(&routing.traffic_rules).map_err(|_| {
+            PublicError::fixed(
+                PublicErrorCode::RuntimeFailure,
+                PublicErrorStage::Start,
+                "TUN traffic rules are invalid",
+            )
+        })?;
+        let _operation = self
+            .operation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            let mut state = self.lock_state();
+            if !state.nodes.contains_key(node_id) {
+                return Err(PublicError::fixed(
+                    PublicErrorCode::NodeNotFound,
+                    PublicErrorStage::Start,
+                    "Selected node does not exist in the confirmed import",
+                ));
+            }
+            if state.shutting_down
+                || state.recovery_required
+                || state.status.phase == RuntimePhase::BlockedByConflict
+            {
+                return Err(PublicError::fixed(
+                    PublicErrorCode::RecoveryRequired,
+                    PublicErrorStage::SessionRecovery,
+                    "Resolve ownership recovery before connecting",
+                ));
+            }
+            state.reconnect = Some(ReconnectIntent {
+                request: ConnectionRequest::Tun,
+                failures: 0,
+                next_attempt: Instant::now() + reconnect_delay(0),
+                paused: false,
+            });
+        }
+        let result = self.start_tun_locked(node_id, routing);
+        self.finish_connection_attempt(result.is_ok());
+        result.map(|_| self.status())
+    }
+
+    fn start_tun_locked(
+        &self,
+        node_id: &str,
+        routing: TunRouting,
+    ) -> Result<RuntimeStatus, PublicError> {
         let stack = routing.stack;
         let traffic_rules = routing.traffic_rules.clone();
         let requested_naive_udp_over_tcp = routing.naive_udp_over_tcp;
@@ -1860,10 +2020,6 @@ impl ApplicationController {
                 "Application routing rules are invalid",
             )
         })?;
-        let _operation = self
-            .operation
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let elevated = self.services.tun_privilege.is_elevated().map_err(|error| {
             PublicError::with_detail(
                 PublicErrorCode::RuntimeFailure,
@@ -2339,7 +2495,7 @@ impl ApplicationController {
                         .listener
                         .wait_until_sidecar_ready(*port, child.as_mut())?;
                 }
-                Some((child, sidecar, sidecar_ports))
+                Some((child, sidecar, sidecar_ports, launcher))
             } else {
                 None
             };
@@ -2349,17 +2505,22 @@ impl ApplicationController {
         reservations.release();
         let front = ProvisionalChild::new(launcher.start(
             &session,
-            process_redactor,
+            process_redactor.clone(),
             self.diagnostics.clone(),
         )?);
         let child: Box<dyn ManagedChild> =
-            if let Some((sidecar, sidecar_config, sidecar_ports)) = sidecar {
+            if let Some((sidecar, sidecar_config, sidecar_ports, sidecar_launcher)) = sidecar {
                 Box::new(RealityProcessPair {
                     front: front.take(),
                     sidecar: sidecar.take(),
                     sidecar_ports,
                     listener: Arc::clone(&self.services.listener),
                     _sidecar_config: sidecar_config,
+                    recovery: Some(SidecarRecovery {
+                        launcher: sidecar_launcher,
+                        redactor: process_redactor,
+                        diagnostics: self.diagnostics.clone(),
+                    }),
                 })
             } else {
                 front.take()
@@ -2578,6 +2739,11 @@ impl ApplicationController {
     }
 
     pub fn stop(&self) -> Result<RuntimeStatus, PublicError> {
+        {
+            let mut state = self.lock_state();
+            state.reconnect = None;
+            self.sync_reconnect_status(&mut state);
+        }
         let _operation = self
             .operation
             .lock()
@@ -2704,6 +2870,11 @@ impl ApplicationController {
             return Err(public);
         }
         if let Some(public) = proxy_conflict {
+            // ForeignPreserved includes a user switching proxy settings to DIRECT.
+            // Cleanup completion must never authorize automatic takeover of it.
+            if let Some(intent) = state.reconnect.as_mut() {
+                intent.paused = true;
+            }
             state.status.session_id = None;
             self.update_status(
                 state,
@@ -2859,6 +3030,197 @@ impl ApplicationController {
         safe_to_exit
     }
 
+    fn sync_reconnect_status(&self, state: &mut State) {
+        state.status.connection_requested = state.reconnect.is_some();
+        state.status.reconnect_paused =
+            state.reconnect.as_ref().is_some_and(|intent| intent.paused)
+                || (state.reconnect.is_some()
+                    && (state.recovery_required
+                        || state.status.phase == RuntimePhase::BlockedByConflict));
+        state.status.retry_delay_seconds = state
+            .reconnect
+            .as_ref()
+            .filter(|intent| !intent.paused && state.active.is_none() && !state.recovery_required)
+            .map(|intent| {
+                intent
+                    .next_attempt
+                    .saturating_duration_since(Instant::now())
+                    .as_secs()
+            });
+    }
+
+    fn finish_connection_attempt(&self, succeeded: bool) {
+        let mut state = self.lock_state();
+        let pause = state.status.error.as_ref().is_some_and(|error| {
+            matches!(
+                error.stage,
+                PublicErrorStage::EngineLayout
+                    | PublicErrorStage::EngineIntegrity
+                    | PublicErrorStage::ConfigCheck
+                    | PublicErrorStage::GenerateConfig
+                    | PublicErrorStage::SystemProxyOwnership
+            )
+        });
+        let no_active = state.active.is_none();
+        if let Some(intent) = state.reconnect.as_mut() {
+            intent.failures = if succeeded {
+                0
+            } else {
+                intent.failures.saturating_add(1)
+            };
+            intent.next_attempt = Instant::now() + reconnect_delay(intent.failures);
+            // Automatic retries cannot open another UAC dialog. An existing
+            // authenticated helper may restart its core; lost helpers need the user.
+            intent.paused |=
+                pause || (no_active && matches!(intent.request, ConnectionRequest::Tun));
+        }
+        self.sync_reconnect_status(&mut state);
+        state.status.revision = state.status.revision.saturating_add(1);
+        self.emit_status(state.status.clone());
+    }
+
+    fn reconnect_tick(&self) {
+        let Ok(_operation) = self.operation.try_lock() else {
+            return;
+        };
+        let mut state = self.lock_state();
+        if state.shutting_down
+            || state.recovery_required
+            || state.status.phase == RuntimePhase::BlockedByConflict
+        {
+            return;
+        }
+        let Some(intent) = state.reconnect.as_ref() else {
+            return;
+        };
+        if intent.paused || Instant::now() < intent.next_attempt {
+            return;
+        }
+        let request = intent.request.clone();
+        if let Some(active) = state.active.as_ref() {
+            let sustained_failure = active.consecutive_probe_failures >= 6;
+            if active.mode == RuntimeMode::SystemProxy {
+                if !sustained_failure {
+                    return;
+                }
+                if self.stop_active_locked(&mut state, None).is_err() {
+                    return;
+                }
+                drop(state);
+                let result = match request {
+                    ConnectionRequest::Proxy(node, routing) => {
+                        self.start_system_proxy_locked(&node, routing)
+                    }
+                    ConnectionRequest::Tun => return,
+                };
+                self.finish_connection_attempt(result.is_ok());
+                return;
+            }
+            if active.mode != RuntimeMode::Tun || !active.child.can_restart_owned_core() {
+                return;
+            }
+            // Short outages retain capture. A sustained failed proof can mean a
+            // wedged engine even while its process and listeners still exist.
+            if !sustained_failure
+                && state.status.error.as_ref().is_none_or(|error| {
+                    !matches!(
+                        error.stage,
+                        PublicErrorStage::EngineProcess
+                            | PublicErrorStage::Runtime
+                            | PublicErrorStage::VerifyListeners
+                    )
+                })
+            {
+                return;
+            }
+            let active = state.active.as_mut().expect("active checked");
+            let target_index = active
+                .switching
+                .as_ref()
+                .map(|switching| switching.current as u16)
+                .unwrap_or(0);
+            let restart = active.child.restart_owned_core(target_index);
+            if restart.is_ok() {
+                active.last_probe = Instant::now() - Duration::from_secs(10);
+                active.consecutive_probe_failures = 0;
+                if let Ok(generation) = random_hex(16) {
+                    active.generation = generation;
+                }
+                Self::set_proof(
+                    &mut state,
+                    ProofKind::EngineProcess,
+                    ProofState::Passed,
+                    None,
+                );
+                Self::set_proof(
+                    &mut state,
+                    ProofKind::SelectedOutboundHttps,
+                    ProofState::Failed,
+                    None,
+                );
+                state.status.route_check_ms = None;
+            }
+            if let Err(error) = restart.as_ref() {
+                let must_pause = matches!(
+                    error.stage(),
+                    "tun_preflight"
+                        | "config_check"
+                        | "engine_integrity"
+                        | "tun_helper_protocol"
+                        | "session_recovery"
+                );
+                if let Some(intent) = state.reconnect.as_mut() {
+                    intent.paused |= must_pause;
+                }
+                if error.stage() == "session_recovery" {
+                    state.recovery_required = true;
+                }
+                let redactor = state
+                    .active
+                    .as_ref()
+                    .map(|active| active.redactor.clone())
+                    .unwrap_or_default();
+                let public = public_runtime_error(error.clone(), &redactor);
+                let node_id = state.active.as_ref().map(|active| active.node_id.clone());
+                let phase = if state.recovery_required {
+                    RuntimePhase::RecoveryRequired
+                } else {
+                    RuntimePhase::Degraded
+                };
+                self.update_status(&mut state, phase, node_id, Some(public));
+            }
+            drop(state);
+            self.finish_connection_attempt(restart.is_ok());
+            return;
+        }
+        drop(state);
+        let result = match request {
+            ConnectionRequest::Proxy(node, routing) => {
+                self.start_system_proxy_locked(&node, routing)
+            }
+            ConnectionRequest::Tun => return,
+        };
+        self.finish_connection_attempt(result.is_ok());
+    }
+
+    fn handle_runtime_loss(&self, state: &mut State, error: PublicError) {
+        if state.reconnect.is_some()
+            && state.active.as_ref().is_some_and(|active| {
+                active.mode == RuntimeMode::Tun && active.child.can_restart_owned_core()
+            })
+        {
+            let node_id = state.active.as_ref().map(|active| active.node_id.clone());
+            self.update_status(state, RuntimePhase::Degraded, node_id, Some(error));
+        } else {
+            if let Some(intent) = state.reconnect.as_mut() {
+                if matches!(intent.request, ConnectionRequest::Tun) {
+                    intent.paused = true;
+                }
+            }
+            let _ = self.stop_active_locked(state, Some(error));
+        }
+    }
+
     fn monitor_tick(&self) {
         struct ProbeSnapshot {
             generation: String,
@@ -2894,7 +3256,7 @@ impl ApplicationController {
                 ProofState::Failed,
                 None,
             );
-            let _ = self.stop_active_locked(&mut state, Some(error));
+            self.handle_runtime_loss(&mut state, error);
             return;
         }
         if active.mode == RuntimeMode::SystemProxy {
@@ -3035,7 +3397,7 @@ impl ApplicationController {
                 ProofState::Failed,
                 None,
             );
-            let _ = self.stop_active_locked(&mut state, Some(public));
+            self.handle_runtime_loss(&mut state, public);
             return;
         }
         match proof {
@@ -3120,7 +3482,7 @@ impl ApplicationController {
                             ProofState::Failed,
                             None,
                         );
-                        let _ = self.stop_active_locked(&mut state, Some(error));
+                        self.handle_runtime_loss(&mut state, error);
                         return;
                     }
                     state.status.steady_latency_ms = latency;
@@ -3166,6 +3528,7 @@ impl ApplicationController {
         error: Option<PublicError>,
     ) {
         state.status.phase = phase;
+        self.sync_reconnect_status(state);
         state.status.node_id = node_id;
         state.status.error = error;
         if state.status.error.is_some()
@@ -4596,6 +4959,407 @@ mod tests {
         }
     }
 
+    fn make_retry_due(controller: &ApplicationController) {
+        controller
+            .lock_state()
+            .reconnect
+            .as_mut()
+            .unwrap()
+            .next_attempt = Instant::now();
+    }
+
+    struct RestartableChild {
+        child: FakeChild,
+        restarts: Arc<AtomicUsize>,
+    }
+
+    impl ManagedChild for RestartableChild {
+        fn pid(&self) -> u32 {
+            self.child.pid()
+        }
+        fn is_alive(&mut self) -> Result<bool, RuntimeError> {
+            self.child.is_alive()
+        }
+        fn stop(&mut self) -> Result<(), RuntimeError> {
+            self.child.stop()
+        }
+        fn tun_capture_snapshot(&mut self) -> Result<TunCaptureSnapshot, RuntimeError> {
+            self.child.tun_capture_snapshot()
+        }
+        fn can_restart_owned_core(&self) -> bool {
+            true
+        }
+        fn restart_owned_core(&mut self, _target_index: u16) -> Result<(), RuntimeError> {
+            self.restarts.fetch_add(1, Ordering::SeqCst);
+            self.child.alive.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn install_restartable_child(
+        controller: &ApplicationController,
+        alive: Arc<AtomicBool>,
+        stops: Arc<AtomicUsize>,
+    ) -> Arc<AtomicUsize> {
+        let restarts = Arc::new(AtomicUsize::new(0));
+        controller.lock_state().active.as_mut().unwrap().child = Box::new(RestartableChild {
+            child: FakeChild {
+                alive,
+                stops,
+                stop_fails: false,
+                tun: true,
+                capture_calls: 0,
+            },
+            restarts: restarts.clone(),
+        });
+        restarts
+    }
+
+    #[test]
+    fn reconnect_backoff_is_bounded_without_attempt_limit() {
+        assert_eq!(reconnect_delay(0).as_secs(), 2);
+        assert_eq!(reconnect_delay(1).as_secs(), 4);
+        assert_eq!(reconnect_delay(5).as_secs(), 60);
+        assert_eq!(reconnect_delay(u32::MAX).as_secs(), 60);
+    }
+
+    #[test]
+    fn proxy_process_death_recovers_without_losing_user_intent_and_stop_cancels_timer() {
+        let (controller, _proxy, _stops, alive) =
+            controller_with_system_proxy(Arc::new(FakeProber(true)));
+        let node = import_node(&controller);
+        controller
+            .start_system_proxy(
+                &node,
+                SystemProxyRouting {
+                    default_route: DefaultRoute::Vpn,
+                    naive_udp_over_tcp: false,
+                    apps: vec![],
+                },
+            )
+            .unwrap();
+        alive.store(false, Ordering::SeqCst);
+        controller.monitor_tick();
+        assert!(controller.status().connection_requested);
+        assert_eq!(
+            controller.status().phase,
+            RuntimePhase::DisconnectedWithError
+        );
+        controller.reconnect_tick();
+        assert!(!alive.load(Ordering::SeqCst));
+        make_retry_due(&controller);
+        controller.reconnect_tick();
+        assert_eq!(controller.status().phase, RuntimePhase::SystemProxyReady);
+        assert!(alive.load(Ordering::SeqCst));
+        alive.store(false, Ordering::SeqCst);
+        controller.monitor_tick();
+        make_retry_due(&controller);
+        controller.stop().unwrap();
+        controller.reconnect_tick();
+        assert!(!controller.status().connection_requested);
+        assert!(!alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn simultaneous_core_death_and_foreign_proxy_change_pause_automatic_takeover() {
+        let (controller, proxy, _stops, alive) =
+            controller_with_system_proxy(Arc::new(FakeProber(true)));
+        let node = import_node(&controller);
+        controller
+            .start_system_proxy(
+                &node,
+                SystemProxyRouting {
+                    default_route: DefaultRoute::Vpn,
+                    naive_udp_over_tcp: false,
+                    apps: vec![],
+                },
+            )
+            .unwrap();
+        let publishes = proxy.publishes.load(Ordering::SeqCst);
+        proxy.foreign.store(true, Ordering::SeqCst);
+        alive.store(false, Ordering::SeqCst);
+        controller.monitor_tick();
+        assert_eq!(
+            controller.status().error.as_ref().unwrap().stage,
+            PublicErrorStage::SystemProxyOwnership
+        );
+        assert!(controller.status().connection_requested);
+        assert!(controller.status().reconnect_paused);
+        // Simulate that foreign state is now DIRECT and publication could succeed.
+        proxy.foreign.store(false, Ordering::SeqCst);
+        make_retry_due(&controller);
+        controller.reconnect_tick();
+        assert_eq!(proxy.publishes.load(Ordering::SeqCst), publishes);
+        assert!(!alive.load(Ordering::SeqCst));
+        controller.stop().unwrap();
+    }
+
+    #[test]
+    fn tun_owned_core_restarts_in_existing_session_and_requires_fresh_traffic_proof() {
+        let (controller, stops, alive) = controller_with_tun(true, true, false);
+        let node = import_node(&controller);
+        let ready = controller
+            .start_tun(&node, tun_routing(DefaultRoute::Vpn))
+            .unwrap();
+        let restarts = install_restartable_child(&controller, alive.clone(), stops);
+        alive.store(false, Ordering::SeqCst);
+        controller.monitor_tick();
+        assert_eq!(controller.status().phase, RuntimePhase::Degraded);
+        assert_eq!(controller.status().session_id, ready.session_id);
+        make_retry_due(&controller);
+        controller.reconnect_tick();
+        assert_eq!(restarts.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.status().phase, RuntimePhase::Degraded);
+        assert_eq!(controller.status().route_check_ms, None);
+        controller.monitor_tick();
+        assert_eq!(controller.status().phase, RuntimePhase::TunReady);
+        assert_eq!(controller.status().session_id, ready.session_id);
+        controller.stop().unwrap();
+        controller.reconnect_tick();
+        assert_eq!(restarts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn sustained_failed_proof_restarts_owned_core_but_short_outage_does_not() {
+        let (mut controller, stops, alive) = controller_with_tun(true, true, false);
+        let node = import_node(&controller);
+        controller
+            .start_tun(&node, tun_routing(DefaultRoute::Vpn))
+            .unwrap();
+        let restarts = install_restartable_child(&controller, alive, stops);
+        controller.services.prober = Arc::new(FakeProber(false));
+        for _ in 0..5 {
+            controller.lock_state().active.as_mut().unwrap().last_probe =
+                Instant::now() - Duration::from_secs(11);
+            controller.monitor_tick();
+            make_retry_due(&controller);
+            controller.reconnect_tick();
+        }
+        assert_eq!(restarts.load(Ordering::SeqCst), 0);
+        controller.lock_state().active.as_mut().unwrap().last_probe =
+            Instant::now() - Duration::from_secs(11);
+        controller.monitor_tick();
+        make_retry_due(&controller);
+        controller.reconnect_tick();
+        assert_eq!(restarts.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.status().phase, RuntimePhase::Degraded);
+        controller.stop().unwrap();
+    }
+
+    #[test]
+    fn sustained_proxy_proof_failure_restarts_with_backoff_and_keeps_intent() {
+        let (mut controller, _proxy, stops, _alive) =
+            controller_with_system_proxy(Arc::new(FakeProber(true)));
+        let node = import_node(&controller);
+        controller
+            .start_system_proxy(
+                &node,
+                SystemProxyRouting {
+                    default_route: DefaultRoute::Vpn,
+                    naive_udp_over_tcp: false,
+                    apps: vec![],
+                },
+            )
+            .unwrap();
+        controller.services.prober = Arc::new(FakeProber(false));
+        controller
+            .lock_state()
+            .active
+            .as_mut()
+            .unwrap()
+            .consecutive_probe_failures = 6;
+        make_retry_due(&controller);
+        controller.reconnect_tick();
+        assert!(stops.load(Ordering::SeqCst) >= 1);
+        assert!(controller.status().connection_requested);
+        assert!(controller.status().retry_delay_seconds.is_some());
+        controller.stop().unwrap();
+    }
+
+    #[test]
+    fn changed_tun_topology_pauses_retries_until_user_disconnects() {
+        struct TopologyChanged(RestartableChild);
+        impl ManagedChild for TopologyChanged {
+            fn pid(&self) -> u32 {
+                self.0.pid()
+            }
+            fn is_alive(&mut self) -> Result<bool, RuntimeError> {
+                Ok(false)
+            }
+            fn stop(&mut self) -> Result<(), RuntimeError> {
+                self.0.stop()
+            }
+            fn can_restart_owned_core(&self) -> bool {
+                true
+            }
+            fn restart_owned_core(&mut self, _: u16) -> Result<(), RuntimeError> {
+                self.0.restarts.fetch_add(1, Ordering::SeqCst);
+                Err(RuntimeError::new(
+                    "tun_preflight",
+                    "sealed upstream topology changed",
+                ))
+            }
+        }
+        let (controller, stops, alive) = controller_with_tun(true, true, false);
+        let node = import_node(&controller);
+        controller
+            .start_tun(&node, tun_routing(DefaultRoute::Vpn))
+            .unwrap();
+        let restarts = Arc::new(AtomicUsize::new(0));
+        controller.lock_state().active.as_mut().unwrap().child =
+            Box::new(TopologyChanged(RestartableChild {
+                child: FakeChild {
+                    alive,
+                    stops,
+                    stop_fails: false,
+                    tun: true,
+                    capture_calls: 0,
+                },
+                restarts: restarts.clone(),
+            }));
+        controller.monitor_tick();
+        make_retry_due(&controller);
+        controller.reconnect_tick();
+        assert!(controller.status().connection_requested);
+        assert!(controller.status().reconnect_paused);
+        make_retry_due(&controller);
+        controller.reconnect_tick();
+        assert_eq!(restarts.load(Ordering::SeqCst), 1);
+        controller.stop().unwrap();
+    }
+
+    #[test]
+    fn warm_latency_process_death_uses_same_owned_tun_restart_path() {
+        struct DiesDuringWarm(Arc<AtomicBool>);
+        impl TrafficProber for DiesDuringWarm {
+            fn prove(&self, _: &HealthRoute) -> Result<ProofResult, RuntimeError> {
+                Ok(ProofResult { latency_ms: 42 })
+            }
+            fn prove_tun_capture(&self) -> Result<ProofResult, RuntimeError> {
+                Ok(ProofResult { latency_ms: 42 })
+            }
+            fn warm_latency(&self, _: &HealthRoute) -> Option<u64> {
+                self.0.store(false, Ordering::SeqCst);
+                None
+            }
+        }
+        let (mut controller, stops, alive) = controller_with_tun(true, true, false);
+        let node = import_node(&controller);
+        controller
+            .start_tun(&node, tun_routing(DefaultRoute::Vpn))
+            .unwrap();
+        let restarts = install_restartable_child(&controller, alive.clone(), stops);
+        controller.services.prober = Arc::new(DiesDuringWarm(alive.clone()));
+        controller.lock_state().active.as_mut().unwrap().last_probe =
+            Instant::now() - Duration::from_secs(11);
+        controller.monitor_tick();
+        assert_eq!(controller.status().phase, RuntimePhase::Degraded);
+        assert!(controller.lock_state().active.is_some());
+        assert!(!controller.status().reconnect_paused);
+        make_retry_due(&controller);
+        controller.reconnect_tick();
+        assert_eq!(restarts.load(Ordering::SeqCst), 1);
+        controller.stop().unwrap();
+    }
+
+    #[test]
+    fn lost_tun_helper_pauses_without_a_new_elevation_attempt() {
+        let (controller, _stops, alive) = controller_with_tun(true, true, false);
+        let node = import_node(&controller);
+        controller
+            .start_tun(&node, tun_routing(DefaultRoute::Vpn))
+            .unwrap();
+        alive.store(false, Ordering::SeqCst);
+        controller.monitor_tick();
+        assert!(controller.status().connection_requested);
+        assert!(controller.status().reconnect_paused);
+        make_retry_due(&controller);
+        controller.reconnect_tick();
+        assert!(!alive.load(Ordering::SeqCst));
+        controller.stop().unwrap();
+    }
+
+    #[test]
+    fn failed_proxy_proofs_retry_indefinitely_and_honor_disconnect() {
+        let (controller, _proxy, _stops, _) =
+            controller_with_system_proxy(Arc::new(FakeProber(false)));
+        let node = import_node(&controller);
+        assert!(controller
+            .start_system_proxy(
+                &node,
+                SystemProxyRouting {
+                    default_route: DefaultRoute::Vpn,
+                    naive_udp_over_tcp: false,
+                    apps: vec![]
+                }
+            )
+            .is_err());
+        for _ in 0..8 {
+            make_retry_due(&controller);
+            controller.reconnect_tick();
+            assert!(controller.status().connection_requested);
+            assert!(!controller.status().reconnect_paused);
+        }
+        assert_eq!(
+            controller.lock_state().reconnect.as_ref().unwrap().failures,
+            9
+        );
+        assert!(controller
+            .status()
+            .retry_delay_seconds
+            .is_some_and(|seconds| seconds > 0 && seconds <= 60));
+        controller.stop().unwrap();
+        controller.reconnect_tick();
+        assert!(!controller.status().connection_requested);
+    }
+
+    #[test]
+    fn sidecar_and_front_recover_using_only_their_owned_reviewed_launchers() {
+        let root = std::env::temp_dir().join(format!(
+            "routedeck-sidecar-retry-{}",
+            random_hex(8).unwrap()
+        ));
+        let alive = Arc::new(AtomicBool::new(false));
+        let front_alive = Arc::new(AtomicBool::new(false));
+        let restarts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let fake = |value| FakeChild {
+            alive: value,
+            stops: stops.clone(),
+            stop_fails: false,
+            tun: false,
+            capture_calls: 0,
+        };
+        let mut pair = RealityProcessPair {
+            front: Box::new(RestartableChild {
+                child: fake(front_alive.clone()),
+                restarts: restarts.clone(),
+            }),
+            sidecar: Box::new(fake(alive.clone())),
+            sidecar_ports: vec![18080],
+            listener: Arc::new(FakeListener(true)),
+            _sidecar_config: SessionConfig::create(&root, "{}").unwrap(),
+            recovery: Some(SidecarRecovery {
+                launcher: Box::new(FakeLauncher {
+                    check_fails: false,
+                    stop_fails: false,
+                    alive: alive.clone(),
+                    stops: stops.clone(),
+                    tun: false,
+                }),
+                redactor: Redactor::default(),
+                diagnostics: Arc::new(Mutex::new(DiagnosticBuffer::default())),
+            }),
+        };
+        pair.restart_owned_core(0).unwrap();
+        assert!(alive.load(Ordering::SeqCst));
+        assert!(front_alive.load(Ordering::SeqCst));
+        assert_eq!(restarts.load(Ordering::SeqCst), 1);
+        pair.stop().unwrap();
+        drop(pair);
+        let _ = std::fs::remove_dir(root);
+    }
+
     #[test]
     fn tun_switch_keeps_child_adapter_session_and_old_connections_owned_until_stop() {
         let (mut controller, stops, alive) = controller_with_tun(true, true, false);
@@ -5844,6 +6608,7 @@ mod tests {
             sidecar_ports: vec![1],
             listener: Arc::new(FakeListener(true)),
             _sidecar_config: sidecar_config,
+            recovery: None,
         };
 
         let error = pair.stop().unwrap_err();
@@ -5897,6 +6662,7 @@ mod tests {
             sidecar_ports: vec![1],
             listener: Arc::new(FakeListener(true)),
             _sidecar_config: sidecar_config,
+            recovery: None,
         };
 
         let error = pair.stop().unwrap_err();
