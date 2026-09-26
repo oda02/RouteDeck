@@ -87,7 +87,7 @@ NSIS `installMode: "currentUser"` устанавливает приложени�
 teardown. `on_before_exit` возвращает `()`, не отменяет установку: проверенный shutdown
 должен завершиться **до** вызова install. Это вывод из официального исходника,
 который нужно повторно проверить при выборе закреплённой версии зависимости.
-[Tauri updater source](https://github.com/tauri-apps/plugins-workspace/blob/v2/plugins/updater/src/updater.rs).
+[Tauri updater source, inspected commit 3a019435](https://github.com/tauri-apps/plugins-workspace/blob/3a01943572ba0d00909857a62588d06159e709ba/plugins/updater/src/updater.rs).
 
 ## Если выберем portable с заменой
 
