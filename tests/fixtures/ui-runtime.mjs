@@ -8,6 +8,7 @@ const legacy = "c".repeat(32);
 const previousUpdate = Date.now() - 25 * 60 * 60 * 1000;
 const fixture = {
   calls: [], failRefresh: false, failStop: false, failProxyCleanup: false, failUpdateCheck: false, failOpenReleases: false, proxyCleanupDelay: 0, startDelay: 40, refreshDelay: 0,
+  failUpdateDownload: true, failUpdateInstall: false, portableUpdate: { phase: "downloading", downloaded: 50, total: 100, version: "0.2.0", error: null },
   updateResponse: { currentVersion: "0.1.0", latestVersion: "0.1.0", status: "upToDate", releaseUrl: null },
   systemProxy: { state: "stale", endpoint: "127.0.0.1:24080", detail: "Локальный порт не отвечает.", cleanupToken: "e".repeat(64) },
   nodes: Array.from({ length: 130 }, (_, index) => ({
@@ -58,6 +59,9 @@ const transport = {
       if (fixture.failOpenReleases) throw "fixture release opener failed";
       return null;
     }
+    if (command === "stage_app_update") { if (fixture.failUpdateDownload) throw "portable_update_manual"; return null; }
+    if (command === "portable_update_status") return structuredClone(fixture.portableUpdate);
+    if (command === "install_app_update") { if (fixture.failUpdateInstall) throw "portable_update_failed"; if (fixture.snapshot().phase !== "disconnected" || fixture.snapshot().connectionRequested) throw "portable_update_disconnect_first"; return null; }
     if (command === "confirmed_nodes") return structuredClone(fixture.nodes);
     if (command === "runtime_diagnostics") return { status: current, lines: ["Fixture diagnostics"], systemProxy: structuredClone(fixture.systemProxy) };
     if (command === "clear_stale_system_proxy") {

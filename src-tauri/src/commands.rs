@@ -281,3 +281,62 @@ pub async fn switch_tun_server(
     .await
     .map_err(command_join_error)?
 }
+
+#[tauri::command]
+pub async fn stage_app_update(
+    checker: State<'_, Arc<AppUpdateChecker>>,
+    updater: State<'_, Arc<crate::portable_update::PortableUpdater>>,
+) -> Result<(), &'static str> {
+    let checker = checker.inner().clone();
+    let updater = updater.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let info = checker.check()?;
+        if info.status != app_updates::AppUpdateStatus::Available {
+            return Err("portable_update_unavailable");
+        }
+        updater.stage(info.latest_version.ok_or("portable_update_unavailable")?)
+    })
+    .await
+    .map_err(|_| "portable_update_failed")?
+}
+#[tauri::command]
+pub fn portable_update_status(
+    updater: State<'_, Arc<crate::portable_update::PortableUpdater>>,
+) -> crate::portable_update::PortableUpdateStatus {
+    updater.status()
+}
+#[tauri::command]
+pub async fn install_app_update(
+    app: tauri::AppHandle,
+    controller: State<'_, Arc<ApplicationController>>,
+    updater: State<'_, Arc<crate::portable_update::PortableUpdater>>,
+) -> Result<(), &'static str> {
+    let controller = controller.inner().clone();
+    let updater = updater.inner().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let gate = controller
+            .begin_portable_update()
+            .map_err(|_| "portable_update_disconnect_first")?;
+        let prepared = match updater.prepare_install() {
+            Ok(p) => p,
+            Err(error) => {
+                updater.install_failed(error);
+                return Err(error);
+            }
+        };
+        // The gate proves there are no owned processes/capture or pending recovery,
+        // and prevents Connect until authentication succeeds or this guard drops.
+        if let Err(error) = prepared.launch() {
+            updater.install_failed(error);
+            return Err(error);
+        }
+        gate.commit();
+        Ok(())
+    })
+    .await
+    .map_err(|_| "portable_update_failed")?;
+    if result.is_ok() {
+        app.exit(0);
+    }
+    result
+}

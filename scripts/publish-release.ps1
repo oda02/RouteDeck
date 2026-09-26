@@ -45,8 +45,36 @@ foreach ($file in @($inventory.files)) {
   }
 }
 if (-not $inventoryPaths.Contains('ENGINE-THIRD-PARTY-NOTICES.txt') -or -not $inventoryPaths.Contains('SOURCE-CODE.txt') -or $sourceCount -lt 4) { throw 'Engine distribution inventory is incomplete' }
+$updateAssets = @()
+if (-not $version.Contains('-')) {
+  $descriptor = Join-Path $artifacts 'RouteDeck-update.json'
+  $signature = Join-Path $artifacts 'RouteDeck-update.sig'
+  foreach ($path in @($descriptor,$signature)) {
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.Length -gt 262144) { throw 'Invalid update signature assets' }
+  }
+  & node (Join-Path $PSScriptRoot 'sign-update.mjs') verify $descriptor $archive $version
+  if ($LASTEXITCODE -ne 0) { throw 'Update signature verification failed' }
+  $update = Get-Content -LiteralPath $descriptor -Raw | ConvertFrom-Json
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  $zip = [IO.Compression.ZipFile]::OpenRead($archive)
+  try {
+    if ($zip.Entries.Count -ne @($update.files).Count) { throw 'Signed update file set mismatch' }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $zip.Entries) {
+      $expectedFile = @($update.files | Where-Object { $_.path -ceq $entry.FullName })
+      if (-not $seen.Add($entry.FullName) -or $expectedFile.Count -ne 1 -or $entry.Length -ne $expectedFile[0].size) { throw 'Signed update file set mismatch' }
+      $stream = $entry.Open(); $digest = [Security.Cryptography.SHA256]::Create()
+      try {
+        $actualHash = [Convert]::ToHexString($digest.ComputeHash($stream)).ToLowerInvariant()
+        if ($actualHash -cne $expectedFile[0].sha256) { throw 'Signed update packaged file integrity failed' }
+      } finally { $digest.Dispose(); $stream.Dispose() }
+    }
+  } finally { $zip.Dispose() }
+  $updateAssets = @($descriptor,$signature)
+}
 $expected = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
-foreach ($path in @($archive,$inventoryPath) + @($sourceAssets)) {
+foreach ($path in @($archive,$inventoryPath) + @($sourceAssets) + $updateAssets) {
   $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
   if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Invalid release asset' }
   $expected.Add($item.Name, (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant())
@@ -66,10 +94,10 @@ Portable для Windows x64: распакуйте весь архив и зап�
 
 The separately attached source archives are optional downloads for inspecting the corresponding external source code. They are not needed to run RouteDeck.
 
-`SHA256SUMS.txt` detects accidental corruption. It is not an independent cryptographic update signature. RouteDeck opens the release page for manual portable replacement and never replaces running files automatically.
+`SHA256SUMS.txt` detects accidental corruption. Stable full portable releases also include the detached Ed25519-signed update descriptor. Existing unsigned versions need a first manual update to a signed portable release. Prereleases remain manual downloads. Installation requires verified tunnel teardown and an explicit restart.
 '@
 [IO.File]::WriteAllText($notes, $releaseText, [Text.UTF8Encoding]::new($false))
-$assets = @($archive,$inventoryPath) + @($sourceAssets) + @($sums)
+$assets = @($archive,$inventoryPath) + @($sourceAssets) + $updateAssets + @($sums)
 $arguments = @('release','create',$tag) + $assets + @('--repo',$env:GH_REPO,'--verify-tag','--title',"RouteDeck $version",'--notes-file',$notes,'--generate-notes')
 if ($version.Contains('-')) { $arguments += @('--prerelease','--latest=false') } else { $arguments += '--latest' }
 & gh @arguments

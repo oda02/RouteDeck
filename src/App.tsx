@@ -703,17 +703,20 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
   );
 }
 
-function SettingsPage({ headingRef, draft, onDraftChange, onReset, saveState, resetDisabled, actionFailure, onClearFailure }: {
+function SettingsPage({ headingRef, draft, onDraftChange, onReset, saveState, resetDisabled, updateDraftPending, actionFailure, onClearFailure }: {
   headingRef: React.RefObject<HTMLHeadingElement | null>;
   draft: SettingsConfig;
   onDraftChange: (settings: SettingsConfig) => void;
   onReset: () => void;
   saveState: SaveFeedback;
   resetDisabled: boolean;
+  updateDraftPending: boolean;
   actionFailure: ActionFailure | null;
   onClearFailure: () => void;
 }) {
   const update = useAppUpdates();
+  const runtime = useController();
+  const installDisabled = updateDraftPending || runtime.connectionRequested || runtime.phase !== "disconnected";
   const updateMessage = update.status === "checking" ? "Проверяем выпуск…"
     : update.status === "available" ? `Доступна версия ${update.latestVersion}`
       : update.status === "upToDate" ? "Установлена актуальная версия"
@@ -737,8 +740,13 @@ function SettingsPage({ headingRef, draft, onDraftChange, onReset, saveState, re
       <section className="card settings-group lean-settings update-settings" aria-labelledby="app-updates-title">
         <div className="settings-card-heading"><div><h2 id="app-updates-title">Обновления RouteDeck</h2>{update.currentVersion ? <small>Версия {update.currentVersion}</small> : null}</div><button className="secondary-button compact-action" type="button" disabled={update.status === "checking" || update.status === "unavailable"} aria-busy={update.status === "checking"} onClick={() => { void appUpdateMonitor.check(false); }}>{update.status === "checking" ? <LoaderIcon size={17} /> : <RefreshIcon size={17} />}{update.status === "error" ? "Повторить" : "Проверить"}</button></div>
         <p className="update-status" role="status" aria-live="polite">{updateMessage}</p>
-        {update.status === "available" ? <><p className="settings-explanation">Обновление устанавливается вручную: скачайте portable-выпуск и замените текущие файлы после закрытия RouteDeck.</p><button className="primary-button compact-action" type="button" onClick={() => { void appUpdateMonitor.openReleases().catch(() => undefined); }}>Скачать на GitHub</button></> : null}
-        <label className="paths-toggle"><input type="checkbox" checked={update.automatic} disabled={update.status === "unavailable"} onChange={(event) => appUpdateMonitor.setAutomatic(event.target.checked)} />Проверять автоматически раз в 6 часов</label>
+        {update.status === "available" ? <>
+          {update.portable.phase === "downloading" ? <><p className="settings-explanation" role="status">Скачиваем обновление в фоне{update.portable.total ? ` · ${Math.floor(update.portable.downloaded / update.portable.total * 100)}%` : "…"}</p><progress aria-label="Загрузка обновления" max={update.portable.total || 1} value={update.portable.downloaded} /></> : null}
+          {update.portable.phase === "ready" || update.portable.phase === "installing" ? <><p className="settings-explanation">{update.portable.phase === "installing" ? "Устанавливаем обновление…" : updateDraftPending ? "Сначала примените или отмените изменения в настройках и правилах." : installDisabled ? `Версия ${update.portable.version} готова. Отключите VPN, чтобы установить.` : `Версия ${update.portable.version} готова. RouteDeck перезапустится, ваши настройки сохранятся.`}</p><button className="primary-button compact-action" type="button" disabled={installDisabled || update.portable.phase === "installing"} onClick={() => { void appUpdateMonitor.install(); }}>Обновить и перезапустить</button><p className="field-help">Предыдущая папка останется для ручного восстановления и займёт место на диске.</p></> : null}
+          {update.portable.phase === "error" ? <><p className="settings-explanation" role="alert">{update.portable.error === "portable_update_foreign_files" ? "Файлы в папке изменены или добавлены. Чтобы сохранить их, установите выпуск из GitHub в новую папку." : update.portable.error === "portable_update_disconnect_first" ? "Сначала отключите VPN и повторите обновление." : update.portable.error === "portable_update_manual" ? "Для этой сборки нужен полный portable-выпуск из GitHub." : update.portable.error === "portable_update_repair" ? "Обновление прервано. Скачайте полный выпуск в новую папку." : "Не удалось подготовить обновление. Текущая версия сохранена."}</p><button className="secondary-button compact-action" type="button" onClick={() => { void appUpdateMonitor.download(); }}>Повторить загрузку</button></> : null}
+          {update.portable.phase === "idle" || update.portable.phase === "error" ? <button className="secondary-button compact-action" type="button" onClick={() => { void appUpdateMonitor.openReleases().catch(() => undefined); }}>Скачать на GitHub</button> : null}
+        </> : null}
+        <label className="paths-toggle"><input type="checkbox" checked={update.automatic} disabled={update.status === "unavailable"} onChange={(event) => appUpdateMonitor.setAutomatic(event.target.checked)} />Проверять и скачивать автоматически</label>
       </section>
       <details className="card settings-details">
         <summary>Как устроено подключение</summary>
@@ -1251,7 +1259,7 @@ export default function App() {
       case "routing":
         return <RoutingPage snapshot={snapshot} headingRef={headingRef} draft={routingDraft} onDraftChange={routingSave.change} saveState={routingSave} />;
       case "settings":
-        return <SettingsPage headingRef={headingRef} draft={settingsDraft} onDraftChange={settingsSave.change} saveState={settingsSave} resetDisabled={routingSave.running || settingsSave.running || (routingSave.pending && !routingSave.error) || (settingsSave.pending && !settingsSave.error) || Boolean(snapshot.switching)} onReset={() => setDialog("reset")} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
+        return <SettingsPage headingRef={headingRef} draft={settingsDraft} onDraftChange={settingsSave.change} saveState={settingsSave} updateDraftPending={routingSave.pending || settingsSave.pending || routingSave.running || settingsSave.running} resetDisabled={routingSave.running || settingsSave.running || (routingSave.pending && !routingSave.error) || (settingsSave.pending && !settingsSave.error) || Boolean(snapshot.switching)} onReset={() => setDialog("reset")} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />;
       case "diagnostics":
         return <DiagnosticsPage snapshot={snapshot} headingRef={headingRef} onToast={showToast} runAsyncAction={runAsyncAction} actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} onClearStaleProxy={requestProxyCleanup} />;
     }

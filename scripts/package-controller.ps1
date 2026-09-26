@@ -21,11 +21,11 @@ $checksums = Join-Path $output 'SHA256SUMS.txt'
 if ((Test-Path -LiteralPath $archive) -or (Test-Path -LiteralPath $checksums)) { throw 'Output already exists; release artifacts are never overwritten' }
 $manifestPath = Join-Path $BuildRoot 'routedeck-build.json'
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-if ($manifest.schemaVersion -ne 2 -or $manifest.applicationVersion -cne $version -or $manifest.sourceCommit -cnotmatch '^[a-f0-9]{40}$' -or
+if ($manifest.schemaVersion -ne 3 -or $manifest.applicationVersion -cne $version -or $manifest.sourceCommit -cnotmatch '^[a-f0-9]{40}$' -or
     $manifest.buildMetadata -cne "RouteDeckBuildCommit=$($manifest.sourceCommit)") { throw 'Invalid build provenance' }
-$expectedNames = @('routedeck.exe', 'routedeck-tun-helper.exe')
-if (@($manifest.files).Count -ne 2) { throw 'Unexpected build file count' }
-for ($i = 0; $i -lt 2; $i++) {
+$expectedNames = @('routedeck.exe', 'routedeck-tun-helper.exe', 'routedeck-updater.exe')
+if (@($manifest.files).Count -ne 3) { throw 'Unexpected build file count' }
+for ($i = 0; $i -lt 3; $i++) {
   $entry = $manifest.files[$i]
   if ($entry.path -cne $expectedNames[$i] -or $entry.sha256 -cnotmatch '^[a-f0-9]{64}$') { throw 'Unexpected build file entry' }
   $file = Get-Item -LiteralPath (Join-Path $BuildRoot $expectedNames[$i]) -Force
@@ -33,7 +33,7 @@ for ($i = 0; $i -lt 2; $i++) {
       (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -cne $entry.sha256) { throw 'Build file integrity failed' }
 }
 $guiText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Join-Path $BuildRoot 'routedeck.exe')))
-if (-not $guiText.Contains([string]$manifest.files[1].sha256) -or -not $guiText.Contains([string]$manifest.buildMetadata)) { throw 'GUI does not pin this helper and source' }
+if (-not $guiText.Contains([string]$manifest.files[1].sha256) -or -not $guiText.Contains([string]$manifest.files[2].sha256) -or -not $guiText.Contains([string]$manifest.buildMetadata)) { throw 'GUI does not pin this helper, updater and source' }
 $notices = [IO.Path]::GetFullPath($NoticesRoot)
 foreach ($notice in @('THIRD-PARTY-NOTICES.txt', 'third-party-inventory.json')) {
   if (-not (Test-Path -LiteralPath (Join-Path $notices $notice) -PathType Leaf)) { throw 'Generate controller dependency notices before packaging' }
@@ -68,7 +68,7 @@ try {
   $pins = Join-Path $stage 'runtime-pins'
   [IO.Directory]::CreateDirectory($pins) | Out-Null
   foreach ($file in @('sing-box.lock.json', 'xray-core.lock.json')) { Copy-Item -LiteralPath (Join-Path $repoRoot "engine\$file") -Destination $pins }
-  $allowed = @('routedeck.exe','routedeck-tun-helper.exe','routedeck-build.json','README.txt','THIRD-PARTY-NOTICES.txt','dependency-inventory.json','runtime-pins/sing-box.lock.json','runtime-pins/xray-core.lock.json',"controller-sources/$sourceName")
+  $allowed = @('routedeck.exe','routedeck-tun-helper.exe','routedeck-updater.exe','routedeck-build.json','README.txt','THIRD-PARTY-NOTICES.txt','dependency-inventory.json','runtime-pins/sing-box.lock.json','runtime-pins/xray-core.lock.json',"controller-sources/$sourceName")
   if ($IncludeRuntimes) {
     Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\portable-full-release.txt') -Destination (Join-Path $stage 'README.txt') -Force
     foreach ($entry in $runtimeEntries) {
@@ -107,6 +107,11 @@ try {
   } finally { $zip.Dispose() }
   $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
   $sumLines = @("$hash  $name")
+  if ($IncludeRuntimes -and $version -cmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+    & (Join-Path $PSScriptRoot 'write-update-manifest.ps1') -ArchivePath $archive -Version $version
+    $descriptor = Join-Path $output 'RouteDeck-update.json'
+    $sumLines += "$((Get-FileHash -LiteralPath $descriptor -Algorithm SHA256).Hash.ToLowerInvariant())  RouteDeck-update.json"
+  }
   if ($IncludeRuntimes) {
     foreach ($entry in @($distribution | Where-Object { $_.path.StartsWith('sources/') })) {
       $assetName = [IO.Path]::GetFileName($entry.path)

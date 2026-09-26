@@ -79,6 +79,7 @@ try {
     'licenses',
     'routedeck-build.json',
     'routedeck-tun-helper.exe',
+    'routedeck-updater.exe',
     'routedeck.exe',
     'xray'
   ) | Sort-Object
@@ -95,7 +96,7 @@ try {
 
   $tamperedBuild = Join-Path $tempRoot 'tampered-build'
   [IO.Directory]::CreateDirectory($tamperedBuild) | Out-Null
-  foreach ($name in @('routedeck.exe', 'routedeck-tun-helper.exe', 'routedeck-build.json')) {
+  foreach ($name in @('routedeck.exe', 'routedeck-tun-helper.exe', 'routedeck-updater.exe', 'routedeck-build.json')) {
     Copy-Item -LiteralPath (Join-Path $resolvedBuild $name) -Destination (Join-Path $tamperedBuild $name)
   }
   $gui = Join-Path $tamperedBuild 'routedeck.exe'

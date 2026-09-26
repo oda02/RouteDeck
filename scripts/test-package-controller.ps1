@@ -16,15 +16,18 @@ try {
   [IO.Directory]::CreateDirectory($build) | Out-Null
   [IO.Directory]::CreateDirectory((Join-Path $notices 'sources')) | Out-Null
   $helper = Join-Path $build 'routedeck-tun-helper.exe'
+  $updater = Join-Path $build 'routedeck-updater.exe'
+  [IO.File]::WriteAllText($updater, 'synthetic updater, never executable')
+  $updaterHash = (Get-FileHash $updater).Hash.ToLowerInvariant()
   $gui = Join-Path $build 'routedeck.exe'
   [IO.File]::WriteAllText($helper, 'synthetic helper, never executable')
   $helperHash = (Get-FileHash $helper).Hash.ToLowerInvariant()
   $commit = '1' * 40
   $metadata = "RouteDeckBuildCommit=$commit"
-  [IO.File]::WriteAllText($gui, "synthetic GUI $metadata $helperHash")
-  $entries = @($gui,$helper) | ForEach-Object { @{path=[IO.Path]::GetFileName($_);size=(Get-Item $_).Length;sha256=(Get-FileHash $_).Hash.ToLowerInvariant()} }
+  [IO.File]::WriteAllText($gui, "synthetic GUI $metadata $helperHash $updaterHash")
+  $entries = @($gui,$helper,$updater) | ForEach-Object { @{path=[IO.Path]::GetFileName($_);size=(Get-Item $_).Length;sha256=(Get-FileHash $_).Hash.ToLowerInvariant()} }
   $version = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\package.json') -Raw | ConvertFrom-Json).version
-  @{schemaVersion=2;applicationVersion=$version;sourceCommit=$commit;buildMetadata=$metadata;files=@($entries)} | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $build 'routedeck-build.json')
+  @{schemaVersion=3;applicationVersion=$version;sourceCommit=$commit;buildMetadata=$metadata;files=@($entries)} | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $build 'routedeck-build.json')
   [IO.File]::WriteAllText((Join-Path $build 'must-not-ship.env'), 'synthetic private state')
   [IO.File]::WriteAllText((Join-Path $notices 'THIRD-PARTY-NOTICES.txt'), 'synthetic notices')
   $source = Join-Path $notices 'sources\selectors-0.36.1.crate'
