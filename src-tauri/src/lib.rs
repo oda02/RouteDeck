@@ -7,6 +7,7 @@ pub mod config;
 pub mod domain;
 pub mod engine_runtime;
 pub mod health;
+pub mod portable_update;
 pub mod redaction;
 pub mod running_applications;
 mod runtime_constants;
@@ -29,7 +30,10 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run(expected_tun_helper_sha256: Option<&'static str>) {
+pub fn run(
+    expected_tun_helper_sha256: Option<&'static str>,
+    expected_updater_sha256: Option<&'static str>,
+) {
     let app = tauri::Builder::default()
         .setup(move |app| {
             let session_root = app.path().app_local_data_dir()?.join("sessions");
@@ -43,6 +47,10 @@ pub fn run(expected_tun_helper_sha256: Option<&'static str>) {
                 expected_tun_helper_sha256,
             )?);
             app.manage(Arc::new(app_updates::AppUpdateChecker::default()));
+            app.manage(Arc::new(portable_update::PortableUpdater::new(
+                app.path().app_local_data_dir()?.join("updates"),
+                expected_updater_sha256,
+            )));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -70,6 +78,9 @@ pub fn run(expected_tun_helper_sha256: Option<&'static str>) {
             commands::get_app_version,
             commands::check_app_update,
             commands::open_app_releases,
+            commands::stage_app_update,
+            commands::portable_update_status,
+            commands::install_app_update,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build RouteDeck");

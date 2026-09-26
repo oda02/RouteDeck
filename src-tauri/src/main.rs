@@ -20,6 +20,10 @@ fn attach_diagnostic_console() {
 fn attach_diagnostic_console() {}
 
 fn main() {
+    if !routedeck_lib::portable_update::startup_is_complete() {
+        routedeck_lib::portable_update::show_repair_notice();
+        return;
+    }
     // Retain a plain-text provenance marker in release binaries so a portable
     // artifact can be tied to the exact reviewed source without executing it.
     std::hint::black_box(
@@ -49,5 +53,8 @@ fn main() {
         }
         return;
     }
-    routedeck_lib::run(option_env!("ROUTEDECK_TUN_HELPER_SHA256"));
+    routedeck_lib::run(
+        option_env!("ROUTEDECK_TUN_HELPER_SHA256"),
+        option_env!("ROUTEDECK_UPDATER_SHA256"),
+    );
 }

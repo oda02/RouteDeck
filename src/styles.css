@@ -2155,3 +2155,8 @@ body:has(.dialog-scrim) > .toast { display: none; }
   .route-default .themed-select { width: 100%; }
   .settings-details dl > div { grid-template-columns: 1fr; gap: 2px; }
 }
+
+.update-settings progress { display: block; width: 100%; height: 7px; border: 0; border-radius: 8px; overflow: hidden; appearance: none; background: var(--bg-hover); color: var(--accent); }
+.update-settings progress::-webkit-progress-bar { background: var(--bg-hover); border-radius: 8px; }
+.update-settings progress::-webkit-progress-value { background: var(--accent); border-radius: 8px; }
+.update-settings progress::-moz-progress-bar { background: var(--accent); border-radius: 8px; }

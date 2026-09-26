@@ -35,6 +35,21 @@ jobs:
         with:
           name: RouteDeck-windows-x64
           path: artifacts
+      - name: Set up pinned Node for signing
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.19.0'
+      - name: Sign stable full portable update descriptor
+        if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') && github.repository == 'oda02/RouteDeck'
+        env:
+          ROUTEDECK_UPDATE_SIGNING_KEY: ${{ secrets.ROUTEDECK_UPDATE_SIGNING_KEY }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $version = $env:RELEASE_TAG.Substring(1)
+          node scripts/sign-update.mjs sign artifacts/RouteDeck-update.json "artifacts/RouteDeck-$version-windows-x64.zip" $version
+          if ($LASTEXITCODE -ne 0) { throw 'Signed update descriptor validation failed' }
+          $hash = (Get-FileHash -LiteralPath artifacts/RouteDeck-update.sig -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::AppendAllText((Join-Path $pwd 'artifacts/SHA256SUMS.txt'), "$hash  RouteDeck-update.sig`n", [Text.UTF8Encoding]::new($false))
       - name: Publish immutable versioned release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -24,6 +24,9 @@ fn main() {
         "get_app_version",
         "check_app_update",
         "open_app_releases",
+        "stage_app_update",
+        "portable_update_status",
+        "install_app_update",
     ];
     let attributes = tauri_build::Attributes::new()
         .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS));

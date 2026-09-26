@@ -8,6 +8,8 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $tauriRoot = Join-Path $repoRoot 'src-tauri'
 $portableTargetRoot = Join-Path $tauriRoot 'target\portable'
 $releaseRoot = Join-Path $portableTargetRoot 'release'
+$updaterPath = Join-Path $releaseRoot 'routedeck-updater.exe'
+$updaterHashVariable = 'ROUTEDECK_UPDATER_SHA256'
 $helperPath = Join-Path $releaseRoot 'routedeck-tun-helper.exe'
 $guiPath = Join-Path $releaseRoot 'routedeck.exe'
 $manifestPath = Join-Path $releaseRoot 'routedeck-build.json'
@@ -81,7 +83,7 @@ Push-Location $tauriRoot
 try {
   # Match the production GUI feature set. A helper built without custom-protocol
   # would not be the exact sibling from the final portable release configuration.
-  & cargo.exe build --locked --release --features tauri/custom-protocol --bin routedeck-tun-helper
+  & cargo.exe build --locked --release --features tauri/custom-protocol --bin routedeck-tun-helper --bin routedeck-updater
   if ($LASTEXITCODE -ne 0) {
     throw 'TUN helper release build failed'
   }
@@ -94,14 +96,19 @@ if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
   throw 'TUN helper build did not produce the fixed sibling executable'
 }
 Assert-BuildMetadata $helperPath
+if (-not (Test-Path -LiteralPath $updaterPath -PathType Leaf)) { throw 'Updater release build is missing' }
+Assert-BuildMetadata $updaterPath
+$updaterHash = (Get-FileHash -LiteralPath $updaterPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $helperHash = (Get-FileHash -LiteralPath $helperPath -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($helperHash -notmatch '^[0-9a-f]{64}$') {
   throw 'TUN helper SHA-256 is invalid'
 }
 
+$previousUpdaterHash = [Environment]::GetEnvironmentVariable($updaterHashVariable, 'Process')
 $previousHash = [Environment]::GetEnvironmentVariable($hashVariable, 'Process')
 try {
   [Environment]::SetEnvironmentVariable($hashVariable, $helperHash, 'Process')
+  [Environment]::SetEnvironmentVariable($updaterHashVariable, $updaterHash, 'Process')
   Push-Location $repoRoot
   try {
     & npm.cmd run build
@@ -128,6 +135,7 @@ try {
 }
 finally {
   [Environment]::SetEnvironmentVariable($hashVariable, $previousHash, 'Process')
+  [Environment]::SetEnvironmentVariable($updaterHashVariable, $previousUpdaterHash, 'Process')
 }
 
 if (-not (Test-Path -LiteralPath $guiPath -PathType Leaf)) {
@@ -139,11 +147,13 @@ $postBuildHash = (Get-FileHash -LiteralPath $helperPath -Algorithm SHA256).Hash.
 if ($postBuildHash -cne $helperHash) {
   throw 'TUN helper changed after its SHA-256 was embedded in the GUI build'
 }
+if ((Get-FileHash -LiteralPath $updaterPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $updaterHash) { throw 'Updater changed after GUI hash pinning' }
+$updaterItem = Get-Item -LiteralPath $updaterPath -Force
 $guiItem = Get-Item -LiteralPath $guiPath -Force
 $helperItem = Get-Item -LiteralPath $helperPath -Force
 $guiHash = (Get-FileHash -LiteralPath $guiPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $manifest = [ordered] @{
-  schemaVersion = 2
+  schemaVersion = 3
   applicationVersion = $applicationVersion
   sourceCommit = $sourceCommit
   buildMetadata = $buildMetadata
@@ -157,7 +167,8 @@ $manifest = [ordered] @{
       path = 'routedeck-tun-helper.exe'
       size = [long] $helperItem.Length
       sha256 = $helperHash
-    }
+    },
+    [ordered] @{ path = 'routedeck-updater.exe'; size = [long] $updaterItem.Length; sha256 = $updaterHash }
   )
 }
 $manifestJson = $manifest | ConvertTo-Json -Depth 4
@@ -165,6 +176,8 @@ $manifestJson = $manifest | ConvertTo-Json -Depth 4
 
 $result = [pscustomobject]@{
   Gui = $guiPath
+  Updater = $updaterPath
+  UpdaterSha256 = $updaterHash
   Helper = $helperPath
   HelperSha256 = $helperHash
   Manifest = $manifestPath

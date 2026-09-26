@@ -1083,7 +1083,7 @@ fn sealed_acl_matches(
 }
 
 #[cfg(windows)]
-fn current_user_sid() -> Result<Vec<u8>, RuntimeError> {
+pub(crate) fn current_user_sid() -> Result<Vec<u8>, RuntimeError> {
     use std::{mem::size_of, ptr, slice};
     use windows_sys::Win32::{
         Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER},
@@ -1738,7 +1738,7 @@ fn config_identity(file: &File) -> Result<ConfigIdentity, RuntimeError> {
 }
 
 #[cfg(windows)]
-fn create_private_directory(path: &Path) -> Result<(), RuntimeError> {
+pub(crate) fn create_private_directory(path: &Path) -> Result<(), RuntimeError> {
     use std::{mem::size_of, os::windows::ffi::OsStrExt, ptr};
     use windows_sys::Win32::{
         Foundation::{GetLastError, LocalFree, ERROR_ALREADY_EXISTS},
@@ -1796,7 +1796,7 @@ fn create_private_directory(path: &Path) -> Result<(), RuntimeError> {
 }
 
 #[cfg(not(windows))]
-fn create_private_directory(path: &Path) -> Result<(), RuntimeError> {
+pub(crate) fn create_private_directory(path: &Path) -> Result<(), RuntimeError> {
     fs::create_dir(path).map_err(|error| RuntimeError::new("session_storage", error.to_string()))
 }
 

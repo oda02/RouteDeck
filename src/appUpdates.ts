@@ -5,9 +5,10 @@ const STORAGE_KEY = "routedeck.updates.v1";
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 
 export type AppUpdateStatus = "idle" | "checking" | "upToDate" | "available" | "noRelease" | "error" | "unavailable";
-export interface AppUpdateSnapshot { automatic: boolean; currentVersion: string | null; latestVersion: string | null; status: AppUpdateStatus; }
+export interface PortableUpdateState { phase: "idle" | "downloading" | "ready" | "installing" | "error"; downloaded: number; total: number; version: string | null; error: string | null; }
+export interface AppUpdateSnapshot { portable: PortableUpdateState; automatic: boolean; currentVersion: string | null; latestVersion: string | null; status: AppUpdateStatus; }
 export interface AppUpdateInfo { currentVersion: string; latestVersion: string | null; status: "upToDate" | "available" | "noRelease"; releaseUrl: string | null; }
-export interface AppUpdateClient { available(): boolean; getVersion(): Promise<unknown>; check(): Promise<unknown>; openReleases(): Promise<unknown>; }
+export interface AppUpdateClient { available(): boolean; getVersion(): Promise<unknown>; check(): Promise<unknown>; openReleases(): Promise<unknown>; stage?(): Promise<unknown>; portableStatus?(): Promise<unknown>; install?(): Promise<unknown>; }
 export interface UpdateScheduler { setInterval(callback: () => void, milliseconds: number): unknown; clearInterval(handle: unknown): void; }
 
 function version(value: unknown): string {
@@ -30,11 +31,27 @@ export function parseAppUpdateInfo(value: unknown): AppUpdateInfo {
   return { currentVersion, latestVersion, status: input.status as AppUpdateInfo["status"], releaseUrl: releaseUrl as string | null };
 }
 
+const UPDATE_ERRORS = ["portable_update_failed", "portable_update_manual", "portable_update_repair", "portable_update_foreign_files", "portable_update_disconnect_first", "portable_update_teardown_failed", "portable_update_unavailable"] as const;
+function updateError(value: unknown): string { return typeof value === "string" && UPDATE_ERRORS.includes(value as typeof UPDATE_ERRORS[number]) ? value : "portable_update_failed"; }
+export function parsePortableUpdateState(value: unknown): PortableUpdateState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid update response");
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).some((k) => !["phase", "downloaded", "total", "version", "error"].includes(k)) || !["idle", "downloading", "ready", "installing", "error"].includes(input.phase as string)
+    || !Number.isSafeInteger(input.downloaded) || !Number.isSafeInteger(input.total) || (input.downloaded as number) < 0 || (input.total as number) < 0 || (input.total as number) > 512 * 1024 * 1024
+    || (input.downloaded as number) > (input.total as number) || (input.error !== null && !UPDATE_ERRORS.includes(input.error as typeof UPDATE_ERRORS[number]))) throw new Error("invalid update response");
+  const updateVersion = input.version === null ? null : version(input.version);
+  if (["ready", "installing"].includes(input.phase as string) && (updateVersion === null || input.total === 0 || input.downloaded !== input.total || input.error !== null)) throw new Error("invalid update response");
+  return { phase: input.phase as PortableUpdateState["phase"], downloaded: input.downloaded as number, total: input.total as number, version: updateVersion, error: input.error as string | null };
+}
+
 const nativeClient: AppUpdateClient = {
   available: () => isTauri(),
   getVersion: () => invoke("get_app_version"),
   check: () => invoke("check_app_update"),
   openReleases: () => invoke("open_app_releases"),
+  stage: () => invoke("stage_app_update"),
+  portableStatus: () => invoke("portable_update_status"),
+  install: () => invoke("install_app_update"),
 };
 
 const browserScheduler: UpdateScheduler = {
@@ -48,6 +65,9 @@ export class AppUpdateMonitor {
   private snapshot: AppUpdateSnapshot;
   private readonly listeners = new Set<() => void>();
   private timer?: unknown;
+  private downloadTimer?: unknown;
+  private downloadPending?: Promise<void>;
+  private polling = false;
   private pending?: Promise<void>;
   private started = false;
   private disposed = false;
@@ -55,7 +75,7 @@ export class AppUpdateMonitor {
   constructor(client: AppUpdateClient = nativeClient, scheduler: UpdateScheduler = browserScheduler, automatic = true) {
     this.client = client;
     this.scheduler = scheduler;
-    this.snapshot = { automatic, currentVersion: null, latestVersion: null, status: client.available() ? "idle" : "unavailable" };
+    this.snapshot = { portable: { phase: "idle", downloaded: 0, total: 0, version: null, error: null }, automatic, currentVersion: null, latestVersion: null, status: client.available() ? "idle" : "unavailable" };
   }
   getSnapshot = () => this.snapshot;
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => this.listeners.delete(listener); };
@@ -90,16 +110,60 @@ export class AppUpdateMonitor {
     this.publish({ status: "checking" });
     this.pending = this.client.check().then((raw) => {
       const info = parseAppUpdateInfo(raw);
-      if (!this.disposed && generation === this.generation) this.publish({ currentVersion: info.currentVersion, latestVersion: info.latestVersion, status: info.status });
+      if (!this.disposed && generation === this.generation) {
+        this.publish({ currentVersion: info.currentVersion, latestVersion: info.latestVersion, status: info.status });
+        if (info.status === "available" && this.client.stage && (!quiet || this.snapshot.portable.phase !== "error" || this.snapshot.portable.version !== info.latestVersion)) void this.download();
+      }
     }).catch(() => { if (!this.disposed && generation === this.generation) this.publish({ status: quiet ? "idle" : "error", latestVersion: null }); }).finally(() => { this.pending = undefined; });
     return this.pending;
+  };
+  private stopDownloadPolling() {
+    if (this.downloadTimer !== undefined) this.scheduler.clearInterval(this.downloadTimer);
+    this.downloadTimer = undefined;
+  }
+  private pollDownload = async () => {
+    if (this.disposed || this.polling || !this.client.portableStatus) return;
+    this.polling = true;
+    const generation = this.generation;
+    try {
+      const portable = parsePortableUpdateState(await this.client.portableStatus());
+      if (!this.disposed && generation === this.generation) {
+        this.publish({ portable });
+        if (portable.phase !== "downloading") this.stopDownloadPolling();
+      }
+    } catch {
+      if (!this.disposed && generation === this.generation) this.publish({ portable: { ...this.snapshot.portable, phase: "error", error: "portable_update_failed" } });
+      this.stopDownloadPolling();
+    } finally { this.polling = false; }
+  };
+  download = (): Promise<void> => {
+    if (this.downloadPending) return this.downloadPending;
+    if (this.disposed || !this.client.stage || !this.client.portableStatus || this.snapshot.portable.phase === "ready" || this.snapshot.portable.phase === "installing" || this.snapshot.portable.phase === "downloading") return Promise.resolve();
+    const generation = this.generation;
+    this.publish({ portable: { phase: "downloading", downloaded: 0, total: 0, version: this.snapshot.latestVersion, error: null } });
+    this.downloadPending = this.client.stage().then(async (result) => {
+      if (result !== null) throw new Error("invalid update response");
+      if (this.disposed || generation !== this.generation) return;
+      await this.pollDownload();
+      if (!this.disposed && generation === this.generation && this.snapshot.portable.phase === "downloading" && this.downloadTimer === undefined) this.downloadTimer = this.scheduler.setInterval(() => { void this.pollDownload(); }, 1000);
+    }).catch((error: unknown) => {
+      if (!this.disposed && generation === this.generation) this.publish({ portable: { ...this.snapshot.portable, phase: "error", error: updateError(error) } });
+    }).finally(() => { this.downloadPending = undefined; });
+    return this.downloadPending;
+  };
+  install = async () => {
+    if (this.disposed || !this.client.install || this.snapshot.portable.phase !== "ready") return;
+    const generation = this.generation;
+    this.publish({ portable: { ...this.snapshot.portable, phase: "installing", error: null } });
+    try { if (await this.client.install() !== null) throw new Error("invalid update response"); }
+    catch (error: unknown) { if (!this.disposed && generation === this.generation) this.publish({ portable: { ...this.snapshot.portable, phase: "error", error: updateError(error) } }); }
   };
   openReleases = async () => {
     if (!this.client.available()) return;
     try { if (await this.client.openReleases() !== null) throw new Error("invalid update response"); }
     catch (error) { this.publish({ status: "error" }); throw error; }
   };
-  dispose = () => { this.disposed = true; this.generation += 1; if (this.timer !== undefined) this.scheduler.clearInterval(this.timer); this.timer = undefined; this.listeners.clear(); };
+  dispose = () => { this.stopDownloadPolling(); this.disposed = true; this.generation += 1; if (this.timer !== undefined) this.scheduler.clearInterval(this.timer); this.timer = undefined; this.listeners.clear(); };
 }
 
 function loadAutomatic(): boolean {

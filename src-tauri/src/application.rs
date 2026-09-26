@@ -731,6 +731,24 @@ pub struct ApplicationController {
     _instance_guard: Option<AppInstanceGuard>,
 }
 
+pub struct PortableUpdateGuard<'a> {
+    controller: &'a ApplicationController,
+    _operation: std::sync::MutexGuard<'a, ()>,
+    committed: bool,
+}
+impl PortableUpdateGuard<'_> {
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+impl Drop for PortableUpdateGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.controller.lock_state().shutting_down = false;
+        }
+    }
+}
+
 impl ApplicationController {
     pub fn production(
         session_root: PathBuf,
@@ -3008,6 +3026,32 @@ impl ApplicationController {
         Ok(self.diagnostics())
     }
 
+    /// Serializes update installation with Connect/Stop. Updating never stops
+    /// a newly requested or active tunnel: the user must disconnect first.
+    pub fn begin_portable_update(&self) -> Result<PortableUpdateGuard<'_>, PublicError> {
+        let operation = self.operation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.lock_state();
+        if state.shutting_down
+            || state.active.is_some()
+            || state.reconnect.is_some()
+            || state.recovery_required
+            || state.status.phase != RuntimePhase::Disconnected
+        {
+            return Err(PublicError::fixed(
+                PublicErrorCode::ActiveSessionConflict,
+                PublicErrorStage::Start,
+                "Disconnect and resolve session recovery before updating",
+            ));
+        }
+        state.shutting_down = true;
+        drop(state);
+        Ok(PortableUpdateGuard {
+            controller: self,
+            _operation: operation,
+            committed: false,
+        })
+    }
+
     pub fn shutdown(&self) -> bool {
         {
             let mut state = self.lock_state();
@@ -4695,6 +4739,42 @@ mod tests {
             Arc::new(FakeProber(proof)),
         );
         (controller, stops, alive)
+    }
+
+    #[test]
+    fn portable_update_gate_abort_preserves_events_and_explicit_connect() {
+        let (controller, stops, alive) = controller(false, true, true);
+        let node = import_node(&controller);
+        {
+            let _gate = controller.begin_portable_update().unwrap();
+            assert!(controller.lock_state().shutting_down);
+            assert!(controller.event_sink.lock().unwrap().is_some());
+        }
+        assert!(!controller.lock_state().shutting_down);
+        assert!(controller.event_sink.lock().unwrap().is_some());
+        controller
+            .start_local_proxy(&node, DefaultRoute::Vpn)
+            .unwrap();
+        assert!(alive.load(Ordering::SeqCst));
+        assert!(controller.begin_portable_update().is_err());
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        controller.stop().unwrap();
+    }
+    #[test]
+    fn portable_update_gate_serializes_connect_and_refuses_recovery() {
+        let (controller, _, _) = controller(false, true, true);
+        let controller = Arc::new(controller);
+        let node = import_node(&controller);
+        let gate = controller.begin_portable_update().unwrap();
+        assert!(controller.operation.try_lock().is_err());
+        gate.commit();
+        assert!(controller
+            .start_local_proxy(&node, DefaultRoute::Vpn)
+            .is_err());
+        assert!(controller.begin_portable_update().is_err());
+        let (other, _, _) = self::controller(false, true, true);
+        other.lock_state().recovery_required = true;
+        assert!(other.begin_portable_update().is_err());
     }
 
     fn controller_with_prober(

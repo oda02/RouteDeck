@@ -28,6 +28,9 @@
     "allow-get-app-version",
     "allow-check-app-update",
     "allow-open-app-releases",
+    "allow-stage-app-update",
+    "allow-portable-update-status",
+    "allow-install-app-update",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

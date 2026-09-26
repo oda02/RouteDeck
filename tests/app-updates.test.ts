@@ -1,6 +1,43 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AppUpdateMonitor, parseAppUpdateInfo, type AppUpdateClient, type UpdateScheduler } from "../src/appUpdates.ts";
+import { AppUpdateMonitor, parseAppUpdateInfo, parsePortableUpdateState, type AppUpdateClient, type UpdateScheduler } from "../src/appUpdates.ts";
+
+test("portable progress parser accepts only bounded typed progress and redacted errors", () => {
+  assert.equal(parsePortableUpdateState({ phase: "ready", downloaded: 100, total: 100, version: "1.2.0", error: null }).phase, "ready");
+  for (const input of [
+    { phase: "ready", downloaded: 1, total: 2, version: "1.2.0", error: null },
+    { phase: "downloading", downloaded: 3, total: 2, version: "1.2.0", error: null },
+    { phase: "downloading", downloaded: 0, total: 1024 ** 3, version: "1.2.0", error: null },
+    { phase: "error", downloaded: 0, total: 0, version: null, error: "secret or local path" },
+    { phase: "ready", downloaded: 2, total: 2, version: "1.2.0", error: null, path: "caller-controlled" },
+  ]) assert.throws(() => parsePortableUpdateState(input));
+});
+
+test("signed update stages in background, progress reaches ready, install failure can retry", async () => {
+  const timers = new Map<number, () => void>(); let nextTimer = 0; let phase = "downloading"; let stages = 0; let installs = 0; let failInstall = true;
+  const scheduler: UpdateScheduler = { setInterval: (callback) => { timers.set(++nextTimer, callback); return nextTimer; }, clearInterval: (id) => { timers.delete(id as number); } };
+  const client: AppUpdateClient = { available: () => true, getVersion: async () => "1.0.0", check: async () => ({ currentVersion: "1.0.0", latestVersion: "1.2.0", status: "available", releaseUrl }), openReleases: async () => null,
+    stage: async () => { stages++; return null; }, portableStatus: async () => ({ phase, downloaded: phase === "ready" ? 100 : 50, total: 100, version: "1.2.0", error: null }), install: async () => { installs++; if (failInstall) throw "portable_update_failed"; return null; } };
+  const monitor = new AppUpdateMonitor(client, scheduler, true);
+  await monitor.start(); await monitor.download();
+  assert.equal(stages, 1); assert.equal(monitor.getSnapshot().portable.downloaded, 50);
+  phase = "ready"; for (const callback of timers.values()) callback(); await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(monitor.getSnapshot().portable.phase, "ready");
+  await monitor.install(); assert.equal(monitor.getSnapshot().portable.phase, "error");
+  await monitor.download(); assert.equal(monitor.getSnapshot().portable.phase, "ready");
+  failInstall = false; await monitor.install(); assert.equal(installs, 2); assert.equal(monitor.getSnapshot().portable.phase, "installing");
+  monitor.dispose(); assert.equal(timers.size, 0);
+});
+
+test("late background status after disposal cannot publish or retain polling", async () => {
+  let finish!: (value: unknown) => void; let timers = 0;
+  const scheduler: UpdateScheduler = { setInterval: () => { timers++; return timers; }, clearInterval: () => undefined };
+  const client: AppUpdateClient = { available: () => true, getVersion: async () => "1.0.0", check: async () => ({ currentVersion: "1.0.0", latestVersion: "1.2.0", status: "available", releaseUrl }), openReleases: async () => null, stage: async () => null, portableStatus: () => new Promise((resolve) => { finish = resolve; }) };
+  const monitor = new AppUpdateMonitor(client, scheduler, false); await monitor.check();
+  await new Promise<void>((resolve) => setImmediate(resolve)); monitor.dispose();
+  finish({ phase: "ready", downloaded: 100, total: 100, version: "1.2.0", error: null }); await monitor.download();
+  assert.equal(monitor.getSnapshot().portable.phase, "downloading"); assert.equal(timers, 0);
+});
 
 const releaseUrl = "https://github.com/oda02/RouteDeck/releases/latest";
 

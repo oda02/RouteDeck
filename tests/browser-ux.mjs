@@ -658,11 +658,48 @@ try {
     assert.equal(await page.locator(".update-settings").evaluate((element) => element.scrollWidth > element.clientWidth), false);
     await page.screenshot({ path: `.cache/ux-qa/update-settings-${width}.png` });
   }
-  await page.getByLabel("Проверять автоматически раз в 6 часов", { exact: true }).uncheck();
+  // Portable update IPC is entirely synthetic: background download preserves
+  // runtime, explicit install is gated until disconnect, failed launch can retry.
+  await page.evaluate(() => { window.__routeDeckFixture.failUpdateDownload = false; window.__routeDeckFixture.updateResponse = { currentVersion: "0.1.0", latestVersion: "0.2.0", status: "available", releaseUrl: "https://github.com/oda02/RouteDeck/releases/latest" }; });
+  await page.getByRole("button", { name: "Проверить", exact: true }).click();
+  await page.getByRole("progressbar", { name: "Загрузка обновления" }).waitFor();
+  assert.equal(await page.getByRole("progressbar", { name: "Загрузка обновления" }).getAttribute("value"), "50");
+  await page.screenshot({ path: ".cache/ux-qa/portable-update-downloading.png" });
+  await nav("Главная"); if (await page.getByRole("button", { name: "Подключить", exact: true }).count()) await page.getByRole("button", { name: "Подключить", exact: true }).click(); await connected();
+  const updaterStarts = await page.evaluate(() => window.__routeDeckFixture.calls.filter((c) => /^(start|stop)_/.test(c.command)).length);
+  await nav("Настройки"); await page.evaluate(() => { window.__routeDeckFixture.portableUpdate = { phase: "ready", downloaded: 100, total: 100, version: "0.2.0", error: null }; });
+  await page.clock.runFor(1200);
+  await page.getByRole("button", { name: "Обновить и перезапустить", exact: true }).waitFor();
+  assert.equal(await page.getByRole("button", { name: "Обновить и перезапустить", exact: true }).isDisabled(), true);
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((c) => /^(start|stop)_/.test(c.command)).length), updaterStarts);
+  await page.screenshot({ path: ".cache/ux-qa/portable-update-active.png" });
+  await nav("Главная"); await page.getByRole("button", { name: "Отключить", exact: true }).click(); await settle(); await nav("Настройки");
+  await nav("Правила"); await page.getByRole("button", { name: "Удалить правило Приложение 20", exact: true }).click();
+  await nav("Настройки");
+  assert.equal(await page.getByRole("button", { name: "Обновить и перезапустить", exact: true }).isDisabled(), true);
+  await page.getByText("Сначала примените или отмените изменения в настройках и правилах.", { exact: true }).waitFor();
+  await nav("Правила"); await page.getByRole("button", { name: "Отменить изменения", exact: true }).click(); await nav("Настройки");
+  assert.equal(await page.getByRole("button", { name: "Обновить и перезапустить", exact: true }).isDisabled(), false);
+  scenarios++;
+  await page.evaluate(() => { window.__routeDeckFixture.failUpdateInstall = true; });
+  await page.getByRole("button", { name: "Обновить и перезапустить", exact: true }).click();
+  await page.getByText("Не удалось подготовить обновление. Текущая версия сохранена.", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Повторить загрузку", exact: true }).click();
+  await page.getByRole("button", { name: "Обновить и перезапустить", exact: true }).waitFor();
+  await page.screenshot({ path: ".cache/ux-qa/portable-update-ready.png" });
+  await chooseSelect(page, page.getByLabel("Тема", { exact: true }), "dark"); await saveEdits();
+  await page.setViewportSize({ width: 360, height: 800 }); await page.locator(".update-settings").scrollIntoViewIfNeeded(); await checkFrame();
+  await page.screenshot({ path: ".cache/ux-qa/portable-update-ready-dark-360.png" });
+  await page.evaluate(() => { window.__routeDeckFixture.failUpdateInstall = false; });
+  await page.getByRole("button", { name: "Обновить и перезапустить", exact: true }).click();
+  await page.getByText("Устанавливаем обновление…", { exact: true }).waitFor();
+  assert.equal(await page.getByRole("button", { name: "Обновить и перезапустить", exact: true }).isDisabled(), true);
+  scenarios += 5;
+  await page.getByLabel("Проверять и скачивать автоматически", { exact: true }).uncheck();
   assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem("routedeck.updates.v1")).automatic), false);
   await page.reload(); await page.waitForFunction(() => window.__routeDeckFixture?.snapshot().backendAvailable);
   await nav("Настройки");
-  assert.equal(await page.getByLabel("Проверять автоматически раз в 6 часов", { exact: true }).isChecked(), false);
+  assert.equal(await page.getByLabel("Проверять и скачивать автоматически", { exact: true }).isChecked(), false);
   assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command === "check_app_update").length), 0);
   scenarios += 6;
 

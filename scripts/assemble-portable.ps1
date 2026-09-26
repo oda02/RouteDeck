@@ -96,7 +96,7 @@ if ([IO.File]::Exists($target) -or [IO.Directory]::Exists($target)) {
 $manifestPath = Join-Path $build 'routedeck-build.json'
 $manifestItem = Assert-RegularFile $manifestPath 'build manifest'
 $manifest = Get-Content -Raw -LiteralPath $manifestItem.FullName | ConvertFrom-Json
-if ([int] $manifest.schemaVersion -ne 2) {
+if ([int] $manifest.schemaVersion -ne 3) {
   Fail 'unsupported build manifest schema'
 }
 if ([string] $manifest.sourceCommit -cnotmatch '^[0-9a-f]{40}$' -or
@@ -104,11 +104,12 @@ if ([string] $manifest.sourceCommit -cnotmatch '^[0-9a-f]{40}$' -or
   Fail 'build manifest source metadata is invalid'
 }
 $files = @($manifest.files)
-if ($files.Count -ne 2) {
-  Fail 'build manifest must contain exactly the GUI and helper'
+if ($files.Count -ne 3) {
+  Fail 'build manifest must contain exactly the GUI, helper and updater'
 }
 $guiSource = Assert-BuildFile $files[0] 'routedeck.exe' $build
 $helperSource = Assert-BuildFile $files[1] 'routedeck-tun-helper.exe' $build
+$updaterSource = Assert-BuildFile $files[2] 'routedeck-updater.exe' $build
 
 & (Join-Path $PSScriptRoot 'verify-engine.ps1') -Path $engine | Write-Output
 & (Join-Path $PSScriptRoot 'verify-xray.ps1') -Path $xray | Write-Output
@@ -144,6 +145,7 @@ try {
 
   Copy-Item -LiteralPath $guiSource -Destination (Join-Path $stage 'routedeck.exe')
   Copy-Item -LiteralPath $helperSource -Destination (Join-Path $stage 'routedeck-tun-helper.exe')
+  Copy-Item -LiteralPath $updaterSource -Destination (Join-Path $stage 'routedeck-updater.exe')
   Copy-Item -LiteralPath $manifestPath -Destination (Join-Path $stage 'routedeck-build.json')
 
   foreach ($name in @('sing-box.exe', 'libcronet.dll', 'LICENSE')) {
@@ -158,6 +160,7 @@ try {
 
   [void] (Assert-BuildFile $files[0] 'routedeck.exe' $stage)
   [void] (Assert-BuildFile $files[1] 'routedeck-tun-helper.exe' $stage)
+  [void] (Assert-BuildFile $files[2] 'routedeck-updater.exe' $stage)
   & (Join-Path $PSScriptRoot 'verify-engine.ps1') -Path $stageEngine | Write-Output
   & (Join-Path $PSScriptRoot 'verify-xray.ps1') -Path $stageXray | Write-Output
 
