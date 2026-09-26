@@ -2830,7 +2830,7 @@ dependencies = [
 
 [[package]]
 name = "routedeck"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
