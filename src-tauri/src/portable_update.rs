@@ -28,6 +28,12 @@ use manifest::*;
 struct DirectoryLease {
     _handles: Vec<File>,
 }
+enum LeafLease {
+    Rename,
+    Namespace,
+    #[cfg(windows)]
+    Observe,
+}
 fn metadata_safe(path: &Path) -> Result<fs::Metadata> {
     let m = fs::symlink_metadata(path).map_err(|_| ERROR)?;
     #[cfg(windows)]
@@ -44,13 +50,16 @@ fn metadata_safe(path: &Path) -> Result<fs::Metadata> {
 }
 impl DirectoryLease {
     fn acquire(path: &Path) -> Result<Self> {
-        Self::open(path, true)
+        Self::open(path, LeafLease::Rename)
+    }
+    fn pin_namespace(path: &Path) -> Result<Self> {
+        Self::open(path, LeafLease::Namespace)
     }
     #[cfg(windows)]
     fn observe(path: &Path) -> Result<Self> {
-        Self::open(path, false)
+        Self::open(path, LeafLease::Observe)
     }
-    fn open(path: &Path, exclusive: bool) -> Result<Self> {
+    fn open(path: &Path, kind: LeafLease) -> Result<Self> {
         if !path.is_absolute() {
             return Err(ERROR);
         }
@@ -68,12 +77,20 @@ impl DirectoryLease {
                 use std::os::windows::fs::OpenOptionsExt;
                 // BACKUP_SEMANTICS | OPEN_REPARSE_POINT; never follow a junction.
                 let f = OpenOptions::new()
-                    .access_mode(if ancestor == path && exclusive {
+                    .access_mode(if ancestor == path && matches!(kind, LeafLease::Rename) {
                         0x30080
+                    } else if ancestor == path && matches!(kind, LeafLease::Namespace) {
+                        // FILE_LIST_DIRECTORY registers read sharing; attributes
+                        // alone would not enforce the no-delete share policy.
+                        0x20081
                     } else {
                         0x20080
                     })
-                    .share_mode(if ancestor == path && exclusive { 3 } else { 7 })
+                    .share_mode(if ancestor == path && !matches!(kind, LeafLease::Observe) {
+                        3
+                    } else {
+                        7
+                    })
                     .custom_flags(0x02200000)
                     .open(ancestor)
                     .map_err(|_| ERROR)?;
@@ -430,7 +447,7 @@ impl PortableUpdater {
         verify_tree(&target, &current, &[])?;
         let (body, signature, next) = fetch_manifest(&client, latest)?;
         let parent = self.stage_root.parent().ok_or(ERROR)?;
-        let _parent = DirectoryLease::acquire(parent)?;
+        let _parent = DirectoryLease::pin_namespace(parent)?;
         if !self.stage_root.try_exists().map_err(|_| ERROR)? {
             private_directory(&self.stage_root)?;
         }
@@ -666,7 +683,9 @@ fn replace_bundle(
         return Err(ERROR);
     }
     let parent = target.parent().ok_or(ERROR)?;
-    let _parent = DirectoryLease::acquire(parent)?;
+    // Deny deletion of the namespace, but do not request DELETE on the target
+    // parent: the kernel's rename-target open can conflict with that access.
+    let _parent = DirectoryLease::pin_namespace(parent)?;
     let _stage = DirectoryLease::acquire(stage)?;
     let mut old = verify_tree(target, current, &[])?;
     let mut payload = verify_tree(&stage.join("payload"), next, &[])?;
@@ -727,10 +746,14 @@ fn replace_bundle(
     if actual != expected {
         return Err("portable_update_foreign_files");
     }
+    #[cfg(test)]
+    eprintln!("owned bundle rename checkpoint: 1 (previous)");
     rename_verified_directory(&mut old, target, &previous)?;
     checkpoint(2)?;
     drop(old);
     verify_tree(&previous, current, &[MARKER])?;
+    #[cfg(test)]
+    eprintln!("owned bundle rename checkpoint: 2 (install)");
     rename_verified_directory(&mut new, &incoming, target)?;
     checkpoint(3)?;
     drop(new);
@@ -1235,6 +1258,24 @@ mod tests {
         fs::create_dir(&p).unwrap();
         let lease = DirectoryLease::acquire(&p).unwrap();
         windows::rename_directory(&lease, &fixture.0.join("moved")).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn namespace_pin_denies_parent_move_but_allows_exact_child_rename() {
+        let fixture = Fixture::new();
+        let parent = fixture.0.join("parent");
+        private_directory(&parent).unwrap();
+        let source = parent.join("source");
+        private_directory(&source).unwrap();
+        let namespace = DirectoryLease::pin_namespace(&parent).unwrap();
+        assert!(fs::rename(&parent, fixture.0.join("foreign-move")).is_err());
+        let child = DirectoryLease::acquire(&source).unwrap();
+        windows::rename_directory(&child, &parent.join("moved")).unwrap();
+        assert!(parent.join("moved").is_dir());
+        assert!(!source.exists());
+        drop(child);
+        drop(namespace);
+        fs::rename(&parent, fixture.0.join("foreign-move")).unwrap();
     }
     #[cfg(windows)]
     #[test]

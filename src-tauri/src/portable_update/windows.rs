@@ -199,7 +199,7 @@ pub(super) fn run() -> Result<()> {
     }
     let target = image.parent().ok_or(ERROR)?;
     let target_parent = target.parent().ok_or(ERROR)?;
-    let _ancestor = DirectoryLease::acquire(target_parent)?;
+    let _ancestor = DirectoryLease::pin_namespace(target_parent)?;
     // No UNC/device/protected-folder elevation fallback. Current user must own
     // a normal local portable folder, and target is derived only from parent.
     if target.to_str().is_none_or(|p| p.starts_with("\\\\")) {

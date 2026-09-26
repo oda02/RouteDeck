@@ -103,7 +103,7 @@ new lock entry, including optional/target-only entries:
 
 ## Validation and limits
 
-Combined validation with the reviewed UI and stable-app rules: 386 Rust tests
+Combined validation with the reviewed UI and stable-app rules: 387 Rust tests
 passed (two existing integration tests ignored), 144 Node tests, 89 synthetic
 browser scenarios, production frontend build and offline Rust all-target checks.
 Controller packaging, publisher and portable-input hostile fixtures passed.
