@@ -18,6 +18,7 @@ import { ThemedSelect } from "./ThemedSelect";
 import { nextSubscriptionRefresh } from "./subscriptionRefresh";
 import { appUpdateMonitor } from "./appUpdates";
 import { toPublicActionError, type PublicActionError } from "./actionErrors";
+import { appRuleMatchKey, executableName, validExecutableName } from "./appRuleMatching";
 import {
   ActivityIcon,
   CheckIcon,
@@ -44,6 +45,7 @@ import {
   destinations,
   type AppNotice,
   type AppRouteChoice,
+  type AppRule,
   type ConnectionMode,
   type ConnectionPhase,
   type ConnectionProof,
@@ -486,6 +488,8 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
   const [trafficEditor, setTrafficEditor] = useState<TrafficRule | null>(null);
   const [trafficEditorOriginalId, setTrafficEditorOriginalId] = useState<string | null>(null);
   const [trafficEditorError, setTrafficEditorError] = useState("");
+  const [appEditor, setAppEditor] = useState<AppRule | null>(null);
+  const [appEditorError, setAppEditorError] = useState("");
   const deferredPickerSearch = useDeferredValue(pickerSearch);
   const summary = draft.defaultRoute === "direct"
     ? `По умолчанию напрямую · ${draft.apps.filter((app) => app.route === "vpn").length} исключений через VPN`
@@ -503,6 +507,18 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
     ...draft,
     apps: draft.apps.map((app) => app.id === id ? { ...app, route } : app),
   });
+  const closeAppEditor = () => { setAppEditor(null); setAppEditorError(""); };
+  const saveAppEditor = () => {
+    if (!appEditor) return;
+    if (appEditor.matchBy === "name" && !validExecutableName(executableName(appEditor.path))) {
+      setAppEditorError("Выберите приложение с обычным именем файла .exe."); return;
+    }
+    if (draft.apps.some((app) => app.id !== appEditor.id && appRuleMatchKey(app) === appRuleMatchKey(appEditor))) {
+      setAppEditorError("Правило с таким сопоставлением уже есть. Измените существующее правило."); return;
+    }
+    onDraftChange({ ...draft, apps: draft.apps.map((app) => app.id === appEditor.id ? { ...app, matchBy: appEditor.matchBy ?? "path" } : app) });
+    closeAppEditor();
+  };
 
   const loadRunningApplications = () => {
     if (pickerLoading) return;
@@ -612,7 +628,7 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
         </div> : null}
         <div className="app-rule-list">
           {matchingApps.map((app) => <div className="compact-rule" key={app.id}>
-            <span className="rule-app-copy"><strong title={app.path}>{app.name}</strong>{showPaths ? <small>{app.path}</small> : null}</span>
+            <span className="rule-app-copy"><button className="app-match-button" type="button" aria-label={`Сопоставление для ${app.name}`} title="Изменить сопоставление" onClick={() => { setAppEditor(app); setAppEditorError(""); }}><strong>{app.name}</strong><span>{app.matchBy === "name" ? `Имя: ${executableName(app.path)}` : "Точный путь"}</span></button>{showPaths ? <small>{app.path}</small> : null}</span>
             <ThemedSelect label={`Маршрут для ${app.name}`} value={app.route} onChange={(value) => updateApp(app.id, value as AppRouteChoice)}
               options={[{ value: "inherit", label: "По умолчанию" }, { value: "vpn", label: "Через VPN" }, { value: "direct", label: "Напрямую" }]} />
             <button className="icon-button rule-remove" type="button" aria-label={`Удалить правило ${app.name}`} title="Удалить правило" onClick={() => onDraftChange({ ...draft, apps: draft.apps.filter((item) => item.id !== app.id) })}><XIcon size={16} /></button>
@@ -698,6 +714,14 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
           {trafficEditorError ? <p id="traffic-rule-error" className="field-error" role="alert">{trafficEditorError}</p> : null}
         </Dialog>
       ) : null}
+      {appEditor ? <Dialog title="Сопоставление приложения" description="Изменение добавится в черновик правил." onClose={closeAppEditor}
+        actions={<><button className="secondary-button" type="button" onClick={closeAppEditor}>Отмена</button><button className="primary-button dialog-primary" type="button" onClick={saveAppEditor}>Добавить в черновик</button></>}>
+        <label className="dialog-field"><span>Сопоставление</span><ThemedSelect label="Сопоставление приложения" value={appEditor.matchBy ?? "path"} autoFocus onChange={(value) => { setAppEditor({ ...appEditor, matchBy: value as AppRule["matchBy"] }); setAppEditorError(""); }} options={[{ value: "path", label: "Точный путь" }, { value: "name", label: "Имя файла · после обновлений" }]} /></label>
+        <p className="app-match-value">{appEditor.matchBy === "name" ? executableName(appEditor.path) : appEditor.path}</p>
+        <p className="settings-explanation">{appEditor.matchBy === "name" ? "Применяется к любому процессу с этим именем файла, независимо от папки и регистра. Сохранится при обновлении, если имя не изменится. Другая программа с тем же именем тоже совпадёт." : "Применяется к выбранному пути. При смене папки после обновления потребуется изменить правило."}</p>
+        <p className="settings-explanation">Вспомогательные процессы с другими именами добавляйте отдельно. Точные пути имеют приоритет перед правилами по имени. Для надёжной маршрутизации приложений используйте TUN.</p>
+        {appEditorError ? <p className="field-error" role="alert">{appEditorError}</p> : null}
+      </Dialog> : null}
     </div>
   );
 }

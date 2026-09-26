@@ -306,6 +306,31 @@ try {
   await page.getByLabel("Пути", { exact: true }).uncheck();
   await saveEdits(); scenarios += 3;
   await page.evaluate(() => { Storage.prototype.setItem = window.fixturePickerSetItem; });
+  // Filename matching is an explicit draft edit, with cancel and keyboard support.
+  const matchingStarts = await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command.startsWith("start_")).length);
+  await page.getByRole("button", { name: "Сопоставление для Приложение 01", exact: true }).click();
+  const matcher = page.getByRole("combobox", { name: "Сопоставление приложения", exact: true });
+  await matcher.press("Enter"); await matcher.press("ArrowDown"); await matcher.press("Escape");
+  assert.equal(await page.getByRole("dialog").count(), 1, "selector Escape closed the editor");
+  assert.equal(await matcher.getAttribute("data-value"), "path");
+  await chooseSelect(page, matcher, "name");
+  for (const width of [360, 1000]) {
+    await page.setViewportSize({ width, height: width === 360 ? 760 : 900 });
+    await page.screenshot({ path: `.cache/ux-qa/app-matching-${width}.png` }); await checkFrame();
+  }
+  await page.getByRole("button", { name: "Отмена", exact: true }).click();
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps[0].matchBy), undefined);
+  await page.getByRole("button", { name: "Сопоставление для Приложение 01", exact: true }).click();
+  await chooseSelect(page, page.getByRole("combobox", { name: "Сопоставление приложения", exact: true }), "name");
+  await page.getByRole("button", { name: "Добавить в черновик", exact: true }).click();
+  await page.waitForTimeout(750);
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps[0].matchBy), undefined, "matcher persisted before Apply");
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command.startsWith("start_")).length), matchingStarts);
+  await saveEdits(); await connected();
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps[0].matchBy), "name");
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command.startsWith("start_")).length), matchingStarts + 1);
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command.startsWith("start_")).at(-1).routing.apps[0].matchBy), "name");
+  scenarios += 3;
   for (const size of [{ width: 360, height: 560 }, { width: 1000, height: 900 }]) {
     await page.setViewportSize(size); await checkFrame();
     await page.locator("main").evaluate((element) => { element.scrollTop = 0; });
@@ -335,6 +360,7 @@ try {
   await page.reload(); await page.waitForFunction(() => window.__routeDeckFixture?.snapshot().backendAvailable);
   assert.equal(await page.locator("html").getAttribute("data-theme"), "light");
   await nav("Правила"); assert.equal(await page.locator(".compact-rule").count(), 20); scenarios++;
+  assert.equal(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps[0].matchBy), "name", "stable matcher did not survive reload");
   await page.setViewportSize({ width: 900, height: 900 });
   await page.evaluate(() => { document.documentElement.style.zoom = "2"; });
   for (const destination of ["Правила", "Настройки"]) {

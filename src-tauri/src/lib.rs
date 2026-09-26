@@ -1,4 +1,5 @@
 mod app_instance;
+mod app_rule_matching;
 mod app_updates;
 pub mod application;
 pub mod commands;
