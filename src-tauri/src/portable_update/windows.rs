@@ -290,33 +290,99 @@ pub(crate) fn repair_notice() {
         );
     }
 }
-pub(super) fn rename_directory(lease: &DirectoryLease, target: &Path) -> Result<()> {
-    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
-    };
-    let name: Vec<u16> = target.as_os_str().encode_wide().collect();
+fn rename_buffer(target: &Path) -> Result<(Vec<usize>, u32)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+    let mut name: Vec<u16> = target.as_os_str().encode_wide().collect();
+    if name.contains(&0) {
+        return Err(ERROR);
+    }
+    let name_bytes = u32::try_from(name.len().checked_mul(2).ok_or(ERROR)?).map_err(|_| ERROR)?;
+    // FileName is NUL-terminated, while FileNameLength counts only the path.
+    // The terminator must be inside dwBufferSize, not incidental alignment padding.
+    name.push(0);
     let base = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    let bytes = base.checked_add(name.len() * 2).ok_or(ERROR)?;
+    let bytes = base
+        .checked_add(name.len().checked_mul(2).ok_or(ERROR)?)
+        .ok_or(ERROR)?;
+    let buffer_bytes = u32::try_from(bytes).map_err(|_| ERROR)?;
     let mut storage = vec![0usize; bytes.div_ceil(std::mem::size_of::<usize>())];
     let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     unsafe {
         (*info).Anonymous.ReplaceIfExists = false;
         (*info).RootDirectory = ptr::null_mut();
-        (*info).FileNameLength = (name.len() * 2) as u32;
-        ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+        (*info).FileNameLength = name_bytes;
+        let destination = storage.as_mut_ptr().cast::<u8>().add(base).cast::<u16>();
+        ptr::copy_nonoverlapping(name.as_ptr(), destination, name.len());
+    }
+    Ok((storage, buffer_bytes))
+}
+pub(super) fn rename_directory(lease: &DirectoryLease, target: &Path) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{FileRenameInfo, SetFileInformationByHandle};
+    let (mut storage, bytes) = rename_buffer(target)?;
+    unsafe {
         let file = lease._handles.last().ok_or(ERROR)?;
         if SetFileInformationByHandle(
             file.as_raw_handle(),
             FileRenameInfo,
-            info.cast(),
-            bytes as u32,
+            storage.as_mut_ptr().cast(),
+            bytes,
         ) == 0
         {
+            #[cfg(test)]
+            eprintln!(
+                "owned directory rename OS error: {}",
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+            );
             return Err(ERROR);
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+    #[test]
+    fn rename_buffer_counts_path_without_nul_but_contains_terminator() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+        // Cover every alignment: accidental zero allocation padding is not a
+        // valid replacement for a terminator within dwBufferSize.
+        for length in 1..=16 {
+            let target = PathBuf::from(format!(r"C:\fixture\{}", "x".repeat(length)));
+            let expected: Vec<u16> = target.as_os_str().encode_wide().collect();
+            let (storage, bytes) = rename_buffer(&target).unwrap();
+            assert_eq!(
+                bytes as usize,
+                std::mem::offset_of!(FILE_RENAME_INFO, FileName) + (expected.len() + 1) * 2
+            );
+            assert!(
+                storage.len() * std::mem::size_of::<usize>()
+                    >= std::mem::size_of::<FILE_RENAME_INFO>()
+            );
+            assert_eq!(
+                storage.as_ptr() as usize % std::mem::align_of::<FILE_RENAME_INFO>(),
+                0
+            );
+            let info = unsafe { &*storage.as_ptr().cast::<FILE_RENAME_INFO>() };
+            assert!(info.RootDirectory.is_null());
+            assert!(!unsafe { info.Anonymous.ReplaceIfExists });
+            assert_eq!(info.FileNameLength as usize, expected.len() * 2);
+            let encoded = unsafe {
+                let name = storage
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(std::mem::offset_of!(FILE_RENAME_INFO, FileName))
+                    .cast::<u16>();
+                std::slice::from_raw_parts(name, expected.len() + 1)
+            };
+            assert_eq!(&encoded[..expected.len()], expected);
+            assert_eq!(encoded[expected.len()], 0);
+        }
+        assert!(rename_buffer(Path::new("C:\\fixture\\bad\0name")).is_err());
+    }
 }
 pub(super) fn verify_private_directory(
     lease: &DirectoryLease,
