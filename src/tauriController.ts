@@ -538,7 +538,7 @@ export class TauriController implements RouteDeckController {
       if (this.disposed || this.boundaryFailed) return;
       const authoritativeStatus = this.runtime ?? status;
       if (this.intentRevision === 0) {
-        this.wantsConnection = this.hasRuntimeSession();
+        this.wantsConnection = authoritativeStatus.connectionRequested ?? this.hasRuntimeSession();
         if (this.hasRuntimeSession()) this.publish({ mode: authoritativeStatus.mode === "tun" ? "tun" : "proxy" });
       }
       const servers = projectRuntimeLatency(projectConfirmedNodes(restoredNodes), authoritativeStatus);
@@ -579,12 +579,16 @@ export class TauriController implements RouteDeckController {
     if (this.boundaryFailed || !this.revisions.accept(status)) return;
     this.diagnosticsGeneration += 1;
     this.runtime = status;
-    if (this.queuedOperations === 0 && ["disconnected", "disconnected_with_error", "recovery_required", "blocked_by_conflict"].includes(status.phase)) this.wantsConnection = false;
+    if (status.connectionRequested !== undefined && this.queuedOperations === 0) this.wantsConnection = status.connectionRequested;
+    else if (status.connectionRequested === undefined && this.queuedOperations === 0 && ["disconnected", "disconnected_with_error", "recovery_required", "blocked_by_conflict"].includes(status.phase)) this.wantsConnection = false;
     const activeMode = status.phase !== "disconnected" && status.phase !== "disconnected_with_error" && status.mode !== "local_only"
       ? status.mode === "tun" ? "tun" : "proxy"
       : undefined;
     this.publish({
       backendAvailable: true,
+      connectionRequested: this.queuedOperations > 0 ? this.wantsConnection : status.connectionRequested,
+      reconnectPaused: status.reconnectPaused,
+      retryDelaySeconds: status.retryDelaySeconds,
       activeMode,
       activeServerId: activeMode ? status.nodeId : undefined,
       routingPending: this.hasRuntimeSession() && this.routingRevision !== this.runtimeRoutingRevision,
@@ -738,7 +742,7 @@ export class TauriController implements RouteDeckController {
       }
     } catch (error) {
       const cancelled = !this.wantsConnection;
-      if (!(this.runtime?.mode === "tun" && this.hasRuntimeSession())) this.wantsConnection = false;
+      if (!this.runtime?.connectionRequested && !(this.runtime?.mode === "tun" && this.hasRuntimeSession())) this.wantsConnection = false;
       if (cancelled && this.hasRuntimeSession()) await this.stopRuntime();
       throw error;
     }
@@ -801,7 +805,7 @@ export class TauriController implements RouteDeckController {
     this.wantsConnection = false;
     await this.enqueue(async () => {
       await this.requireTransport();
-      if (this.hasRuntimeSession()) await this.stopRuntime();
+      if (this.hasRuntimeSession() || this.runtime?.connectionRequested) await this.stopRuntime();
     });
   };
 

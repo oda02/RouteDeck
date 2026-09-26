@@ -144,6 +144,9 @@ export interface SystemProxyDiagnostic {
 }
 
 export interface ControllerSnapshot {
+  connectionRequested?: boolean;
+  reconnectPaused?: boolean;
+  retryDelaySeconds?: number;
   isDemo: boolean;
   runtimeScope: "demo" | "system-proxy" | "tun" | "local-only" | "unavailable";
   backendAvailable: boolean;

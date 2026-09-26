@@ -14,7 +14,7 @@ pub(super) struct TunSwitchSession {
     pub candidate_port: u16,
     candidate_route: HealthRoute,
     targets: Vec<SwitchTarget>,
-    current: usize,
+    pub(super) current: usize,
     pub uncertain: bool,
 }
 

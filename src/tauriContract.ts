@@ -98,6 +98,9 @@ export interface RuntimeProofDto {
 
 export interface RuntimeStatusDto {
   revision: number;
+  connectionRequested?: boolean;
+  reconnectPaused?: boolean;
+  retryDelaySeconds?: number;
   sessionId?: string;
   scope: "local_only" | "system_proxy" | "tun";
   mode: "local_only" | "system_proxy" | "tun";
@@ -236,11 +239,16 @@ export function parsePublicError(value: unknown): PublicErrorDto {
   return error;
 }
 
+function runtimeBoolean(value: unknown): boolean {
+  if (typeof value !== "boolean") throw new ContractViolation();
+  return value;
+}
+
 export function parseRuntimeStatus(value: unknown): RuntimeStatusDto {
   const input = record(value);
   exactKeys(
     input,
-    ["revision", "sessionId", "scope", "mode", "phase", "nodeId", "ports", "routeCheckMs", "steadyLatencyMs", "engineVersion", "proofs", "error"],
+    ["revision", "connectionRequested", "reconnectPaused", "retryDelaySeconds", "sessionId", "scope", "mode", "phase", "nodeId", "ports", "routeCheckMs", "steadyLatencyMs", "engineVersion", "proofs", "error"],
     ["revision", "scope", "mode", "phase", "proofs"],
   );
   if (!Array.isArray(input.proofs) || input.proofs.length > proofKinds.length) throw new ContractViolation();
@@ -270,6 +278,9 @@ export function parseRuntimeStatus(value: unknown): RuntimeStatusDto {
 
   const status: RuntimeStatusDto = {
     revision: finiteInteger(input.revision),
+    connectionRequested: input.connectionRequested === undefined ? undefined : runtimeBoolean(input.connectionRequested),
+    reconnectPaused: input.reconnectPaused === undefined ? undefined : runtimeBoolean(input.reconnectPaused),
+    retryDelaySeconds: input.retryDelaySeconds === undefined ? undefined : finiteInteger(input.retryDelaySeconds, 0, 60),
     sessionId: optionalIdentifier(input.sessionId, 256),
     scope: member(input.scope, ["local_only", "system_proxy", "tun"] as const),
     mode: member(input.mode, ["local_only", "system_proxy", "tun"] as const),
@@ -282,6 +293,8 @@ export function parseRuntimeStatus(value: unknown): RuntimeStatusDto {
     proofs,
     error: input.error === undefined || input.error === null ? undefined : parsePublicError(input.error),
   };
+  if (status.reconnectPaused && !status.connectionRequested
+    || status.retryDelaySeconds !== undefined && (!status.connectionRequested || status.reconnectPaused)) throw new ContractViolation();
   validateRuntimeRelationships(status);
   return status;
 }

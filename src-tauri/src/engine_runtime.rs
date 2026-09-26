@@ -1858,6 +1858,19 @@ pub(crate) trait ManagedChild: Send {
     fn is_alive(&mut self) -> Result<bool, RuntimeError>;
     fn stop(&mut self) -> Result<(), RuntimeError>;
 
+    // Only the authenticated TUN helper can restart its already sealed session.
+    // Ordinary engines and dead helpers never request elevation through this API.
+    fn can_restart_owned_core(&self) -> bool {
+        false
+    }
+
+    fn restart_owned_core(&mut self, _target_index: u16) -> Result<(), RuntimeError> {
+        Err(RuntimeError::new(
+            "engine_process",
+            "the owned helper cannot restart this session",
+        ))
+    }
+
     fn tun_capture_snapshot(&mut self) -> Result<TunCaptureSnapshot, RuntimeError> {
         Err(RuntimeError::new(
             "tun_capture",

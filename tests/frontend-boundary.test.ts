@@ -2009,3 +2009,51 @@ test("rapid TUN selection applies the last requested server without replacing th
     assert.equal(f.controller.getSnapshot().activeServerId, "c");
   } finally { f.controller.dispose(); }
 });
+
+
+test("backend recovery metadata is bounded and cannot assert retry without intent", () => {
+  const disconnected = runtimeStatus(1, "disconnected");
+  assert.equal(parseRuntimeStatus({ ...disconnected, connectionRequested: true, retryDelaySeconds: 60 }).connectionRequested, true);
+  for (const invalid of [{ connectionRequested: "yes" }, { connectionRequested: true, retryDelaySeconds: 61 },
+    { retryDelaySeconds: 5 }, { reconnectPaused: true }, { connectionRequested: true, reconnectPaused: true, retryDelaySeconds: 2 }]) {
+    assert.throws(() => parseRuntimeStatus({ ...disconnected, ...invalid }));
+  }
+});
+
+test("late backend intent cannot undo disconnect while startup is queued", async () => {
+  const fixture = await lifecycleFixture(false);
+  const started = deferred<unknown>();
+  const entered = deferred();
+  fixture.hooks.start = () => { entered.resolve(); return started.promise; };
+  const connecting = fixture.controller.connect();
+  await entered.promise;
+  const disconnecting = fixture.controller.disconnect();
+  started.resolve({ ...fixture.status("system_proxy_ready"), connectionRequested: true });
+  await connecting;
+  await disconnecting;
+  assert.deepEqual(fixture.calls.map((call) => call.command), ["start_system_proxy", "stop_system_proxy"]);
+  assert.equal(fixture.controller.getSnapshot().phase, "disconnected");
+  fixture.controller.dispose();
+});
+
+test("canceling backend retry with no live session still sends the typed stop", async () => {
+  let handler: (payload: unknown) => void = () => undefined;
+  const calls: string[] = [];
+  const transport: TauriTransport = {
+    listen: async (_event, listener) => { handler = listener; return () => undefined; },
+    invoke: async (command) => {
+      calls.push(command);
+      if (command === "runtime_status") return { ...runtimeStatus(1, "disconnected"), connectionRequested: true, retryDelaySeconds: 2 };
+      if (command === "confirmed_nodes") return [];
+      if (command === "stop_local_proxy") return runtimeStatus(3, "disconnected");
+      throw new Error("Unexpected command");
+    },
+  };
+  const controller = new TauriController(async () => transport);
+  await controller.ready();
+  assert.equal(controller.getSnapshot().connectionRequested, true);
+  handler({ ...runtimeStatus(2, "disconnected"), connectionRequested: true, retryDelaySeconds: 2 });
+  await controller.disconnect();
+  assert.equal(calls.at(-1), "stop_local_proxy");
+  controller.dispose();
+});

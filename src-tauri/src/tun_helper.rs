@@ -287,6 +287,7 @@ mod windows {
                 engine_created,
             } => Ok(TunHelperChild {
                 pipe: Some(pipe),
+                _config_transfer_guard: prepared.config_guard,
                 helper_process: Some(helper_process),
                 helper_pid,
                 engine_pid,
@@ -462,6 +463,7 @@ mod windows {
     }
 
     struct TunHelperChild {
+        _config_transfer_guard: File,
         pipe: Option<PipeTransport>,
         helper_process: Option<OwnedHandle>,
         helper_pid: u32,
@@ -644,6 +646,75 @@ mod windows {
             Ok(())
         }
 
+        fn can_restart_owned_core(&self) -> bool {
+            !self.stopped && self.helper_running().unwrap_or(false)
+        }
+
+        fn restart_owned_core(&mut self, target_index: u16) -> Result<(), RuntimeError> {
+            if !self.can_restart_owned_core() {
+                return Err(RuntimeError::new(
+                    "engine_process",
+                    "the TUN helper is unavailable",
+                ));
+            }
+            let request_id = self.next_request()?;
+            let pipe = self.pipe.as_mut().ok_or_else(|| {
+                RuntimeError::new("engine_process", "TUN helper channel is closed")
+            })?;
+            write_frame(
+                pipe,
+                &Frame::RestartOwnedCore {
+                    protocol_version: PROTOCOL_VERSION,
+                    session: self.session.clone(),
+                    request_id,
+                    target_index,
+                },
+            )
+            .map_err(protocol_runtime_error)?;
+            match read_frame(pipe).map_err(protocol_runtime_error)? {
+                Frame::Started {
+                    request_id: response_id,
+                    engine_pid,
+                    engine_created,
+                } if response_id == request_id => {
+                    let handle =
+                        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, engine_pid) };
+                    let process = OwnedHandle::new(
+                        handle,
+                        "engine_process",
+                        "replacement engine unavailable",
+                    )?;
+                    if process_creation_time(process.raw())? != engine_created {
+                        return Err(RuntimeError::new(
+                            "engine_process",
+                            "replacement process identity changed",
+                        ));
+                    }
+                    self.engine_pid = engine_pid;
+                    self.engine_created = engine_created;
+                    Ok(())
+                }
+                Frame::Failure {
+                    request_id: response_id,
+                    code,
+                    safe_detail,
+                } if response_id == request_id => Err(RuntimeError::new(
+                    match code {
+                        HelperFailureCode::CleanupConflict => "session_recovery",
+                        HelperFailureCode::PreflightConflict => "tun_preflight",
+                        HelperFailureCode::ConfigRejected => "config_check",
+                        HelperFailureCode::EngineRejected => "engine_integrity",
+                        _ => "tun_restart",
+                    },
+                    safe_detail.unwrap_or_else(|| "owned TUN core restart failed".into()),
+                )),
+                _ => Err(RuntimeError::new(
+                    "tun_helper_protocol",
+                    "unexpected restart response",
+                )),
+            }
+        }
+
         fn tun_capture_snapshot(&mut self) -> Result<TunCaptureSnapshot, RuntimeError> {
             self.query_running_state()?.ok_or_else(|| {
                 RuntimeError::new("tun_capture", "the helper-owned TUN engine is not running")
@@ -763,64 +834,149 @@ mod windows {
             }
         };
 
-        match start_engine_session(&invocation, &start) {
-            Ok(mut running) => {
-                let mut stop_request = None;
-                let result = with_tun_cleanup(
-                    running.child.as_mut(),
-                    &mut running.journal,
-                    CleanupWhen::Always,
-                    |child, _journal| {
-                        write_frame(
-                            &mut pipe,
-                            &Frame::Started {
-                                request_id: start.request_id,
-                                engine_pid: child.pid(),
-                                engine_created: running.engine_created,
-                            },
-                        )
-                        .map_err(protocol_runtime_error)?;
-                        stop_request = serve_running(
-                            &mut pipe,
-                            &invocation,
-                            &mut state,
-                            child,
-                            &running.capture,
-                        )?;
-                        Ok(())
-                    },
-                    |luid| wait_for_cleanup(luid, Duration::from_secs(3)),
-                );
-                if let Some(request_id) = stop_request {
-                    // Never report Complete merely because routes disappeared: child
-                    // termination and durable journal finalization must also succeed.
-                    let response = write_frame(
-                        &mut pipe,
-                        &Frame::Stopped {
-                            request_id,
-                            cleanup: if result.is_ok() {
-                                CleanupState::Complete
-                            } else {
-                                CleanupState::Conflict
-                            },
+        let mut next_start_id = start.request_id;
+        let mut target_index = 0;
+        let mut initial = true;
+        loop {
+            match start_engine_session(&invocation, &start, target_index) {
+                Ok(mut running) => {
+                    let mut command = None;
+                    let result = with_tun_cleanup(
+                        running.child.as_mut(),
+                        &mut running.journal,
+                        CleanupWhen::Always,
+                        |child, _journal| {
+                            write_frame(
+                                &mut pipe,
+                                &Frame::Started {
+                                    request_id: next_start_id,
+                                    engine_pid: child.pid(),
+                                    engine_created: running.engine_created,
+                                },
+                            )
+                            .map_err(protocol_runtime_error)?;
+                            command = serve_running(
+                                &mut pipe,
+                                &invocation,
+                                &mut state,
+                                child,
+                                &running.capture,
+                            )?;
+                            Ok(())
                         },
+                        |luid| wait_for_cleanup(luid, Duration::from_secs(3)),
                     );
-                    if result.is_ok() {
-                        response.map_err(protocol_runtime_error)?;
+                    // The original config lease lives in the GUI. Release the nested
+                    // engine config only after exact adapter/route cleanup is verified.
+                    drop(running);
+                    match command {
+                        Some(HelperCommand::Stop(request_id)) => {
+                            let response = write_frame(
+                                &mut pipe,
+                                &Frame::Stopped {
+                                    request_id,
+                                    cleanup: if result.is_ok() {
+                                        CleanupState::Complete
+                                    } else {
+                                        CleanupState::Conflict
+                                    },
+                                },
+                            );
+                            result?;
+                            response.map_err(protocol_runtime_error)?;
+                            return Ok(());
+                        }
+                        Some(HelperCommand::Restart(request_id, next_target)) => {
+                            result?;
+                            next_start_id = request_id;
+                            target_index = next_target;
+                            initial = false;
+                        }
+                        None => return result,
                     }
                 }
-                result
+                Err(error) => {
+                    write_frame(
+                        &mut pipe,
+                        &Frame::Failure {
+                            request_id: next_start_id,
+                            code: helper_failure_code(error.stage()),
+                            safe_detail: Some(safe_helper_detail(error.stage()).into()),
+                        },
+                    )
+                    .map_err(protocol_runtime_error)?;
+                    // A failed first launch must finish the initial elevation request.
+                    // Cleanup ambiguity always preserves evidence and stops retries.
+                    if initial || error.stage() == "session_recovery" {
+                        return Err(error);
+                    }
+                    (next_start_id, target_index) = serve_idle(&mut pipe, &invocation, &mut state)?;
+                    if next_start_id == 0 {
+                        return Ok(());
+                    }
+                }
             }
-            Err(error) => {
-                let _ = write_frame(
-                    &mut pipe,
-                    &Frame::Failure {
-                        request_id: start.request_id,
-                        code: helper_failure_code(error.stage()),
-                        safe_detail: Some(safe_helper_detail(error.stage()).into()),
-                    },
-                );
-                Err(error)
+        }
+    }
+
+    enum HelperCommand {
+        Stop(u64),
+        Restart(u64, u16),
+    }
+
+    fn serve_idle(
+        pipe: &mut PipeTransport,
+        invocation: &HelperInvocation,
+        state: &mut ServerState,
+    ) -> Result<(u64, u16), RuntimeError> {
+        let parent = open_verified_parent(invocation)?;
+        loop {
+            let frame = pipe
+                .read_frame_from_peer(parent.raw())
+                .map_err(protocol_runtime_error)?;
+            if frame_session(&frame) != Some(invocation.session.as_str()) {
+                return Err(RuntimeError::new(
+                    "tun_helper_protocol",
+                    "TUN helper session changed",
+                ));
+            }
+            state.accept(&frame).map_err(protocol_runtime_error)?;
+            match frame {
+                Frame::RestartOwnedCore {
+                    request_id,
+                    target_index,
+                    ..
+                } => return Ok((request_id, target_index)),
+                Frame::StopTun { request_id, .. } => {
+                    write_frame(
+                        pipe,
+                        &Frame::Stopped {
+                            request_id,
+                            cleanup: CleanupState::Complete,
+                        },
+                    )
+                    .map_err(protocol_runtime_error)?;
+                    return Ok((0, 0));
+                }
+                Frame::Status { request_id, .. } => {
+                    write_frame(
+                        pipe,
+                        &Frame::State {
+                            request_id,
+                            phase: HelperPhase::Failed,
+                            engine_pid: None,
+                            cleanup: CleanupState::Complete,
+                            capture: None,
+                        },
+                    )
+                    .map_err(protocol_runtime_error)?;
+                }
+                _ => {
+                    return Err(RuntimeError::new(
+                        "tun_helper_protocol",
+                        "unexpected idle request",
+                    ))
+                }
             }
         }
     }
@@ -850,6 +1006,7 @@ mod windows {
     fn start_engine_session(
         invocation: &HelperInvocation,
         request: &StartRequest,
+        target_index: u16,
     ) -> Result<RunningSession, RuntimeError> {
         let route_context = preflight_route_context(&request.upstream)?;
         let choice = upstream_choice(&request.upstream);
@@ -879,17 +1036,27 @@ mod windows {
             request.upstream.ipv4_dns_server,
         )?;
 
+        let contents = restart_target_config(&contents, target_index)?;
         let session = SessionConfig::create(&config_directory, &contents)?;
         let diagnostics = Arc::new(Mutex::new(DiagnosticBuffer::default()));
         let redactor = Redactor::default().with_secret(&contents);
         let launcher = VerifiedEngineLauncher::resolve()?;
         let _version = launcher.check(&session, redactor.clone(), diagnostics.clone())?;
-        let mut journal = TunJournal::create(
+        let mut journal = TunJournal::create_for_engine(
             &config_directory,
             &invocation.session,
             &request.config_sha256,
+            &format!("{:x}", Sha256::digest(contents.as_bytes())),
         )?;
-        let mut child = launcher.start(&session, redactor, diagnostics)?;
+        let mut child = launcher
+            .start(&session, redactor, diagnostics)
+            .map_err(|_| {
+                let _ = journal.mark_conflict();
+                RuntimeError::new(
+                    "session_recovery",
+                    "owned engine startup was incomplete; preserved journal requires review",
+                )
+            })?;
         let (engine_created, owned_luid) = with_tun_cleanup(
             child.as_mut(),
             &mut journal,
@@ -951,6 +1118,44 @@ mod windows {
                 upstream: request.upstream.clone(),
             },
         })
+    }
+
+    // The only restart customization is choosing one already validated target.
+    // Never allow the caller to provide an outbound, endpoint, or configuration.
+    fn restart_target_config(contents: &str, index: u16) -> Result<String, RuntimeError> {
+        if index == 0 {
+            return Ok(contents.to_owned());
+        }
+        let mut value: serde_json::Value = serde_json::from_str(contents)
+            .map_err(|_| RuntimeError::new("tun_helper_config", "sealed config is invalid"))?;
+        if let Some(selector) = value
+            .get_mut("outbounds")
+            .and_then(|value| value.as_array_mut())
+            .and_then(|values| {
+                values.iter_mut().find(|value| {
+                    value.get("type").and_then(|value| value.as_str()) == Some("selector")
+                        && value.get("tag").and_then(|value| value.as_str()) == Some("selected")
+                })
+            })
+        {
+            let target = selector
+                .get("outbounds")
+                .and_then(|value| value.as_array())
+                .and_then(|values| values.get(usize::from(index)))
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    RuntimeError::new("tun_helper_config", "sealed restart target does not exist")
+                })?
+                .to_owned();
+            selector["default"] = serde_json::Value::String(target);
+        } else if index != 0 {
+            return Err(RuntimeError::new(
+                "tun_helper_config",
+                "sealed restart target does not exist",
+            ));
+        }
+        serde_json::to_string(&value)
+            .map_err(|_| RuntimeError::new("tun_helper_config", "sealed config is invalid"))
     }
 
     #[derive(Clone, Copy)]
@@ -1017,7 +1222,7 @@ mod windows {
         state: &mut ServerState,
         child: &mut dyn ManagedChild,
         capture: &CaptureExpectation,
-    ) -> Result<Option<u64>, RuntimeError> {
+    ) -> Result<Option<HelperCommand>, RuntimeError> {
         let parent = open_verified_parent(invocation)?;
         loop {
             let frame = match pipe.read_frame_from_peer(parent.raw()) {
@@ -1086,8 +1291,15 @@ mod windows {
                         .map_err(protocol_runtime_error)?;
                     }
                 }
+                Frame::RestartOwnedCore {
+                    request_id,
+                    target_index,
+                    ..
+                } => {
+                    return Ok(Some(HelperCommand::Restart(request_id, target_index)));
+                }
                 Frame::StopTun { request_id, .. } => {
-                    return Ok(Some(request_id));
+                    return Ok(Some(HelperCommand::Stop(request_id)));
                 }
                 _ => {
                     return Err(RuntimeError::new(
@@ -1101,7 +1313,9 @@ mod windows {
 
     fn frame_session(frame: &Frame) -> Option<&str> {
         match frame {
-            Frame::StopTun { session, .. } | Frame::Status { session, .. } => Some(session),
+            Frame::StopTun { session, .. }
+            | Frame::Status { session, .. }
+            | Frame::RestartOwnedCore { session, .. } => Some(session),
             _ => None,
         }
     }
@@ -2920,6 +3134,8 @@ mod windows {
         phase: String,
         config_sha256: String,
         #[serde(default)]
+        engine_config_sha256: Option<String>,
+        #[serde(default)]
         engine_pid: Option<u32>,
         #[serde(default)]
         engine_created: Option<u64>,
@@ -3133,7 +3349,13 @@ mod windows {
         for nested in &nested_directories {
             let path = nested.join("config.json");
             if path.exists() {
-                verify_stale_config_digest(&path, &journal.config_sha256)?;
+                verify_stale_config_digest(
+                    &path,
+                    journal
+                        .engine_config_sha256
+                        .as_deref()
+                        .unwrap_or(&journal.config_sha256),
+                )?;
             }
         }
         Ok(StaleTunCandidate {
@@ -3192,7 +3414,13 @@ mod windows {
     }
 
     fn validate_stored_tun_journal(journal: &StoredTunJournal) -> Result<(), RuntimeError> {
-        if journal.schema_version != 2
+        if !matches!(journal.schema_version, 2 | 3)
+            || (journal.schema_version == 2 && journal.engine_config_sha256.is_some())
+            || (journal.schema_version == 3
+                && journal
+                    .engine_config_sha256
+                    .as_deref()
+                    .is_none_or(|digest| exact_hex(digest, 64).is_err()))
             || session_id(&journal.session).is_err()
             || exact_hex(&journal.config_sha256, 64).is_err()
             || journal.engine_pid == Some(0)
@@ -3333,6 +3561,7 @@ mod windows {
         file: Option<File>,
         session: String,
         config_sha256: String,
+        engine_config_sha256: String,
         engine_pid: Option<u32>,
         engine_created: Option<u64>,
         owned_luid: Option<u64>,
@@ -3352,10 +3581,20 @@ mod windows {
     }
 
     impl TunJournal {
+        #[cfg(test)]
         fn create(
             session_directory: &Path,
             session: &str,
             config_sha256: &str,
+        ) -> Result<Self, RuntimeError> {
+            Self::create_for_engine(session_directory, session, config_sha256, config_sha256)
+        }
+
+        fn create_for_engine(
+            session_directory: &Path,
+            session: &str,
+            config_sha256: &str,
+            engine_config_sha256: &str,
         ) -> Result<Self, RuntimeError> {
             let path = session_directory.join("tun-journal.json");
             let mut options = OpenOptions::new();
@@ -3370,10 +3609,11 @@ mod windows {
             write_journal(
                 &mut file,
                 serde_json::json!({
-                    "schemaVersion": 2,
+                    "schemaVersion": 3,
                     "session": session,
                     "phase": "starting",
                     "configSha256": config_sha256,
+                    "engineConfigSha256": engine_config_sha256,
                 }),
             )?;
             Ok(Self {
@@ -3381,6 +3621,7 @@ mod windows {
                 file: Some(file),
                 session: session.to_owned(),
                 config_sha256: config_sha256.to_owned(),
+                engine_config_sha256: engine_config_sha256.to_owned(),
                 engine_pid: None,
                 engine_created: None,
                 owned_luid: None,
@@ -3461,10 +3702,11 @@ mod windows {
                 })
                 .collect::<Vec<_>>();
             serde_json::json!({
-                "schemaVersion": 2,
+                "schemaVersion": 3,
                 "session": self.session,
                 "phase": phase,
                 "configSha256": self.config_sha256,
+                "engineConfigSha256": self.engine_config_sha256,
                 "enginePid": self.engine_pid,
                 "engineCreated": self.engine_created,
                 "ownedInterfaceLuid": self.owned_luid,
@@ -3726,6 +3968,24 @@ mod windows {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn restart_preserves_every_sealed_field_except_validated_selector_default() {
+            let original = serde_json::json!({"outbounds":[
+                {"type":"selector","tag":"selected","default":"vpn-0","outbounds":["vpn-0","vpn-1"]},
+                {"type":"socks","tag":"vpn-0","server":"127.0.0.1","server_port":18090},
+                {"type":"socks","tag":"vpn-1","server":"127.0.0.1","server_port":18091}],
+                "route":{"final":"selected"}});
+            let mut expected = original.clone();
+            expected["outbounds"][0]["default"] = serde_json::json!("vpn-1");
+            let actual: serde_json::Value =
+                serde_json::from_str(&restart_target_config(&original.to_string(), 1).unwrap())
+                    .unwrap();
+            assert_eq!(actual, expected);
+            assert!(restart_target_config(&original.to_string(), 2).is_err());
+            assert!(restart_target_config(&original.to_string(), u16::MAX).is_err());
+            assert!(restart_target_config("{}", 1).is_err());
+        }
+
         #[test]
         fn pipe_peer_must_be_the_process_returned_by_helper_launch() {
             assert!(super::verify_launched_peer_pid(42, 42).is_ok());
@@ -5136,6 +5396,64 @@ mod windows {
             ] {
                 assert!(!stale_recovery_is_safe(true, &[], &[], Some(7), identity));
             }
+        }
+
+        #[test]
+        fn switched_restart_crash_recovers_exact_original_and_launched_config_hashes() {
+            let root = std::env::temp_dir().join(format!(
+                "routedeck-restarted-recovery-{}",
+                random_hex(8).unwrap()
+            ));
+            let original = serde_json::json!({"outbounds":[{"type":"selector","tag":"selected","default":"vpn-0","outbounds":["vpn-0","vpn-1"]}]}).to_string();
+            let launched = restart_target_config(&original, 1).unwrap();
+            let outer = SessionConfig::create(&root, &original).unwrap();
+            let outer_path = outer.path().parent().unwrap().to_path_buf();
+            let nested = SessionConfig::create(&outer_path, &launched).unwrap();
+            let nested_path = nested.path().to_path_buf();
+            let mut journal = TunJournal::create_for_engine(
+                &outer_path,
+                &"01".repeat(16),
+                &format!("{:x}", Sha256::digest(original.as_bytes())),
+                &format!("{:x}", Sha256::digest(launched.as_bytes())),
+            )
+            .unwrap();
+            journal.engine_pid = Some(123);
+            journal.engine_created = Some(456);
+            journal.owned_luid = Some(7);
+            journal.write(journal.value("adapter_observed")).unwrap();
+            drop(journal);
+            nested.abandon_for_recovery_test();
+            outer.abandon_for_recovery_test();
+            // Exercise the journal-only recovery path after partial marker cleanup.
+            fs::remove_file(outer_path.join(crate::engine_runtime::session_recovery::MARKER))
+                .unwrap();
+            fs::remove_file(
+                nested_path
+                    .parent()
+                    .unwrap()
+                    .join(crate::engine_runtime::session_recovery::MARKER),
+            )
+            .unwrap();
+            let candidate = inspect_stale_tun_candidate(outer_path.clone()).unwrap();
+            assert_eq!(candidate.journal.schema_version, 3);
+            assert_ne!(
+                candidate.journal.engine_config_sha256.as_ref().unwrap(),
+                &candidate.journal.config_sha256
+            );
+            // Unknown nested content still blocks exact owned cleanup.
+            let original_nested = fs::read(&nested_path).unwrap();
+            fs::write(&nested_path, b"hostile config").unwrap();
+            assert!(inspect_stale_tun_candidate(outer_path.clone()).is_err());
+            fs::write(&nested_path, original_nested).unwrap();
+            reconcile_stale_sessions_with_probes(
+                &root,
+                || Ok(vec![]),
+                || Ok(vec![]),
+                |_, _| StaleProcessIdentity::Absent,
+            )
+            .unwrap();
+            assert!(!outer_path.exists());
+            fs::remove_dir(root).unwrap();
         }
 
         #[test]
