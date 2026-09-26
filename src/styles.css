@@ -1973,6 +1973,14 @@ body:has(.dialog-scrim) > .toast { display: none; }
 }
 /* Compact utility pages: stable rows, one explanation per section. */
 .routing-page, .settings-page { gap: 16px; }
+.routing-apply-bar { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.routing-apply-bar p { margin: 0; font-size: 13px; line-height: 1.5; }
+.routing-apply-bar small { display: block; color: var(--text-secondary); margin-top: 5px; }
+.routing-apply-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.routing-apply-actions button { flex: 1 1 150px; }
+.header-status { display: flex; align-items: center; gap: 8px; }
+.routing-pending-button { display: flex; align-items: center; gap: 5px; border: 1px solid var(--accent); border-radius: 8px; padding: 5px 8px; background: var(--bg-hover); color: var(--text-primary); font-size: 11px; cursor: pointer; }
+@media (max-width: 480px) { .routing-pending-button span { display: none; } }
 .save-feedback { color: var(--text-secondary); font-size: 12px; text-align: right; max-width: 240px; }
 .save-feedback p { margin-top: 6px; }
 .save-feedback[data-error="true"] { color: var(--danger-text); }

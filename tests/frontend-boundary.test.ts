@@ -322,7 +322,7 @@ test("TUN and System Proxy application routing state their capture boundaries", 
   assert.match(source, /[Тт]олько TCP приложений, использующих прокси Windows/);
   assert.match(source, /UDP и системный DNS не перехватываются/);
   assert.match(source, /Для остальных приложений и UDP нужен TUN/);
-  assert.match(source, /Изменения сохраняются автоматически; активное соединение переподключится/);
+  assert.match(source, /Для сохранения изменений нажмите «Применить правила»/);
   assert.doesNotMatch(source, /Настройки Direct и исключений применяются только в TUN|Правила приложений используются в режиме TUN|Прокси Windows: через выбранный VPN/);
   assert.doesNotMatch(source, /tun-preflight|nested|Физический адаптер|security mode|режим безопасности/i);
   assert.doesNotMatch(source, /запустите .*администратор/i);
@@ -1797,6 +1797,24 @@ test("failed routing restart keeps saved edits and marks old active rules pendin
     assert.equal(f.controller.getSnapshot().routingPending, true);
     assert.equal(JSON.parse(storage.get("routedeck.routing.v1")!).defaultRoute, "vpn");
     assert.equal(f.calls.some((call) => call.command.startsWith("start_")), false);
+    f.controller.dispose();
+  });
+});
+
+test("retrying an identical saved routing batch reconciles retained old TUN runtime", async () => {
+  await withPreferenceStorage(async () => {
+    const f = await lifecycleFixture();
+    await f.controller.setMode("tun");
+    const routing = { ...f.controller.getSnapshot().routing, defaultRoute: "vpn" as const };
+    f.hooks.stop = async () => { throw { code: "runtime_failure", stage: "stop_engine", message: "Fixture teardown failure" }; };
+    await assert.rejects(f.controller.applyRouting(routing));
+    assert.equal(f.controller.getSnapshot().routingPending, true);
+    f.hooks.stop = undefined;
+    f.calls.length = 0;
+    await f.controller.applyRouting(routing);
+    assert.deepEqual(f.calls.map((call) => call.command), ["stop_tun", "start_tun"]);
+    assert.equal(f.controller.getSnapshot().routingPending, false);
+    assert.equal(f.controller.getSnapshot().phase, "connected");
     f.controller.dispose();
   });
 });
