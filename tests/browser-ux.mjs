@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { chooseSelect, verifySelectControls } from "./fixtures/select-controls.mjs";
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.ROUTEDECK_PLAYWRIGHT_PATH || "playwright");
 const base = process.env.ROUTEDECK_UI_URL || "http://127.0.0.1:1421";
@@ -256,13 +257,13 @@ try {
   // All rule controls stage a batch, and Discard restores the last saved set.
   const savedBatch = await page.evaluate(() => structuredClone(window.__routeDeckFixture.snapshot().routing));
   const beforeDraftCommands = await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => /^(start|stop)_/.test(entry.command)).length);
-  await page.getByLabel("Маршрут для Приложение 01").selectOption("direct");
-  await page.locator("#default-route").selectOption("vpn");
+  await chooseSelect(page, page.getByLabel("Маршрут для Приложение 01"), "direct");
+  await chooseSelect(page, page.locator("#default-route"), "vpn");
   await page.getByRole("button", { name: "Удалить правило Приложение 03", exact: true }).click();
   await page.locator(".traffic-rules summary").click();
   await page.getByLabel("Включить правило 1", { exact: true }).uncheck();
   await page.locator(".tun-stack-settings summary").click();
-  await page.getByLabel("Стек TUN", { exact: true }).selectOption("system");
+  await chooseSelect(page, page.getByLabel("Стек TUN", { exact: true }), "system");
   await page.locator(".naive-settings summary").click();
   await page.getByLabel("UDP over TCP для Naive", { exact: true }).check();
   await page.waitForTimeout(750);
@@ -276,9 +277,9 @@ try {
   await page.getByRole("button", { name: "Отменить изменения", exact: true }).click();
   assert.equal(await page.getByRole("button", { name: "Открыть неприменённые правила", exact: true }).count(), 0);
   assert.equal(await page.locator(".compact-rule").count(), 3);
-  assert.equal(await page.getByLabel("Маршрут для Приложение 01").inputValue(), "vpn");
+  assert.equal(await page.getByLabel("Маршрут для Приложение 01").getAttribute("data-value"), "vpn");
   assert.equal(await page.getByLabel("Включить правило 1", { exact: true }).isChecked(), true);
-  assert.equal(await page.getByLabel("Стек TUN", { exact: true }).inputValue(), "gvisor");
+  assert.equal(await page.getByLabel("Стек TUN", { exact: true }).getAttribute("data-value"), "gvisor");
   assert.equal(await page.getByLabel("UDP over TCP для Naive", { exact: true }).isChecked(), false);
   await page.setViewportSize({ width: 1000, height: 900 });
   scenarios += 3;
@@ -298,7 +299,7 @@ try {
   assert.equal(await page.getByRole("button", { name: "Сохранить правила", exact: true }).count(), 0);
   await page.getByRole("searchbox", { name: "Найти правило" }).fill("Приложение 17");
   assert.equal(await page.locator(".compact-rule").count(), 1);
-  await page.getByLabel("Маршрут для Приложение 17").selectOption("inherit");
+  await chooseSelect(page, page.getByLabel("Маршрут для Приложение 17"), "inherit");
   await page.getByLabel("Пути", { exact: true }).check();
   assert.match(await page.locator(".rule-app-copy small").innerText(), /app17.exe/);
   await page.getByRole("searchbox", { name: "Найти правило" }).fill("");
@@ -319,7 +320,7 @@ try {
   }
   // A failed local write is visible, retained across pages and explicitly retryable.
   await page.evaluate(() => { window.fixtureOriginalSetItem = Storage.prototype.setItem; Storage.prototype.setItem = function () { throw new DOMException("Fixture", "QuotaExceededError"); }; });
-  await page.getByLabel("Маршрут для Приложение 01").selectOption("direct");
+  await chooseSelect(page, page.getByLabel("Маршрут для Приложение 01"), "direct");
   await page.getByRole("button", { name: "Применить правила", exact: true }).click();
   await page.locator(".save-feedback [role=alert]").waitFor();
   await nav("Настройки"); await nav("Правила");
@@ -328,7 +329,7 @@ try {
   await page.getByRole("button", { name: "Повторить применение", exact: true }).click();
   await saveEdits(); scenarios++;
   await nav("Настройки");
-  await page.getByLabel("Тема", { exact: true }).selectOption("light");
+  await chooseSelect(page, page.getByLabel("Тема", { exact: true }), "light");
   await saveEdits();
   assert.equal(await page.locator("html").getAttribute("data-theme"), "light");
   await page.reload(); await page.waitForFunction(() => window.__routeDeckFixture?.snapshot().backendAvailable);
@@ -348,16 +349,16 @@ try {
   // Editing while connected triggers one safe stop/start and keeps current page.
   await nav("Главная"); await page.getByRole("button", { name: "Подключить", exact: true }).click(); await connected();
   const beforeRules = await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command.startsWith("start_")).length);
-  await nav("Правила"); await page.getByLabel("Маршрут для Приложение 01").selectOption("vpn");
+  await nav("Правила"); await chooseSelect(page, page.getByLabel("Маршрут для Приложение 01"), "vpn");
   await saveEdits(); await connected();
   assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command.startsWith("start_")).length), beforeRules + 1);
   await checkFrame(); scenarios++;
   await page.evaluate(() => { window.__routeDeckFixture.startDelay = 1500; });
-  await page.getByLabel("Маршрут для Приложение 02").selectOption("direct");
+  await chooseSelect(page, page.getByLabel("Маршрут для Приложение 02"), "direct");
   await page.getByRole("button", { name: "Применить правила", exact: true }).click();
   await page.waitForFunction(() => window.__routeDeckFixture.snapshot().phase === "starting-core");
-  await page.getByLabel("Маршрут для Приложение 02").selectOption("vpn");
-  await page.getByLabel("Маршрут для Приложение 03").selectOption("direct");
+  await chooseSelect(page, page.getByLabel("Маршрут для Приложение 02"), "vpn");
+  await chooseSelect(page, page.getByLabel("Маршрут для Приложение 03"), "direct");
   await connected();
   await page.waitForFunction(() => document.querySelector('.routing-apply-actions .primary-button')?.disabled === false);
   assert.deepEqual(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps.slice(1, 3).map((app) => app.route)), ["direct", "vpn"], "newer edits were submitted automatically");
@@ -365,7 +366,7 @@ try {
   assert.deepEqual(await page.evaluate(() => window.__routeDeckFixture.snapshot().routing.apps.slice(1, 3).map((app) => app.route)), ["vpn", "direct"], "late save completion overwrote a newer draft");
   await page.evaluate(() => { window.__routeDeckFixture.startDelay = 40; }); scenarios++;
   // Background refresh waits until disconnected and reuses URLs without dialogs.
-  await nav("Настройки"); await page.getByLabel("Автообновление подписок").selectOption("6");
+  await nav("Настройки"); await chooseSelect(page, page.getByLabel("Автообновление подписок"), "6");
   await saveEdits();
   await page.clock.fastForward(61_000);
   assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command === "refresh_source").length), 0);
@@ -395,7 +396,7 @@ try {
   }
   await page.screenshot({ path: ".cache/ux-qa/status-wide.png" }); scenarios++;
   for (const theme of ["dark", "light"]) {
-    await nav("Настройки"); await page.getByLabel("Тема", { exact: true }).selectOption(theme);
+    await nav("Настройки"); await chooseSelect(page, page.getByLabel("Тема", { exact: true }), theme);
     await saveEdits();
     await nav("Серверы");
     for (const width of [360, 1920, 440, 1200, 360, 1600, 720, 440]) {
@@ -471,7 +472,7 @@ try {
   // through stop/start; the same preference edit leaves System Proxy running.
   await nav("Правила");
   await page.locator(".tun-stack-settings summary").click();
-  await page.getByLabel("Стек TUN", { exact: true }).selectOption("gvisor");
+  await chooseSelect(page, page.getByLabel("Стек TUN", { exact: true }), "gvisor");
   await saveEdits();
   await page.setViewportSize({ width: 360, height: 760 }); await checkFrame();
   assert.equal(await page.locator("main").evaluate((element) => element.scrollWidth > element.clientWidth), false);
@@ -484,7 +485,7 @@ try {
   const beforeStack = await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => /^(start|stop)_/.test(entry.command)).length);
   await nav("Правила");
   await page.locator(".tun-stack-settings summary").click();
-  await page.getByLabel("Стек TUN", { exact: true }).selectOption("system");
+  await chooseSelect(page, page.getByLabel("Стек TUN", { exact: true }), "system");
   await saveEdits(); await connected();
   assert.deepEqual(await page.evaluate((count) => window.__routeDeckFixture.calls.filter((entry) => /^(start|stop)_/.test(entry.command)).slice(count).map((entry) => entry.command), beforeStack), ["stop_tun", "start_tun"]);
   assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => entry.command === "start_tun").at(-1).routing.stack), "system");
@@ -493,7 +494,7 @@ try {
   const beforeProxyStack = await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => /^(start|stop)_/.test(entry.command)).length);
   await nav("Правила");
   await page.locator(".tun-stack-settings summary").click();
-  await page.getByLabel("Стек TUN", { exact: true }).selectOption("gvisor");
+  await chooseSelect(page, page.getByLabel("Стек TUN", { exact: true }), "gvisor");
   await saveEdits(); await connected();
   assert.equal(await page.evaluate(() => window.__routeDeckFixture.calls.filter((entry) => /^(start|stop)_/.test(entry.command)).length), beforeProxyStack);
   assert.equal(await page.evaluate(() => Object.hasOwn(window.__routeDeckFixture.calls.filter((entry) => entry.command === "start_system_proxy").at(-1).routing, "stack")), false);
@@ -512,7 +513,7 @@ try {
   await page.getByRole("dialog").waitFor({ state: "hidden" }); scenarios++;
 
   await page.getByRole("button", { name: "Добавить правило", exact: true }).click();
-  await page.getByLabel("Действие", { exact: true }).selectOption("direct");
+  await chooseSelect(page, page.getByLabel("Действие", { exact: true }), "direct");
   for (const size of [{ width: 360, height: 560 }, { width: 1200, height: 800 }]) {
     await page.setViewportSize(size); await checkFrame();
     const box = await page.getByRole("dialog").boundingBox();
@@ -532,9 +533,9 @@ try {
   await page.locator(".traffic-rules summary").getByText("UDP 443 блокируется", { exact: true }).waitFor(); scenarios += 3;
 
   await page.locator(".traffic-rule-row").first().getByRole("button", { name: "Изменить", exact: true }).click();
-  await page.getByLabel("Сеть", { exact: true }).selectOption("tcp");
+  await chooseSelect(page, page.getByLabel("Сеть", { exact: true }), "tcp");
   await page.getByLabel("Порт", { exact: true }).fill("8443");
-  await page.getByLabel("Действие", { exact: true }).selectOption("vpn");
+  await chooseSelect(page, page.getByLabel("Действие", { exact: true }), "vpn");
   await page.getByRole("button", { name: "Применить", exact: true }).click();
   await page.getByRole("dialog").waitFor({ state: "hidden" });
   await saveEdits();
@@ -656,6 +657,7 @@ try {
   assert.deepEqual(await page.evaluate(() => window.__routeDeckFixture.calls.map((call) => call.command)), ["retry_session_recovery"]);
   scenarios += 2;
 
+  scenarios += await verifySelectControls(browser, base, fixtureModule);
   assert.deepEqual(errors, []);
   console.log(`PASS: ${scenarios} browser scenarios; real frontend controller with synthetic IPC, no native networking`);
 } catch (error) {
