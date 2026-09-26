@@ -13,7 +13,7 @@
 - The Windows artifact is `RouteDeck-<version>-windows-x64.zip` with `SHA256SUMS.txt`.
   CI artifacts expire after one day; published release assets remain available.
   They contain the controller and its exact
-  helper, pinned sing-box/Cronet and Xray, dependency notices and runtime pins,
+  helper and updater, pinned sing-box/Cronet and Xray, dependency notices and runtime pins,
   without user state. Extract the ZIP and run `routedeck.exe`; see
   `docs/portable-full-release.txt`. Corresponding runtime source archives and an
   inventory are published alongside it. Source downloads are optional for users
@@ -70,22 +70,29 @@ versions and foreign release URLs are rejected. A repository without an accessib
 stable release reports that no public stable release exists, not that a download
 was found. No GitHub token is stored in the application.
 
-The current download button opens the fixed GitHub Releases page. It does not
-disconnect the VPN, download code automatically or overwrite a running portable
-folder. Extract the full new archive into a new folder and keep the old folder
-until the new one works. Matching `engine` and `xray` files are already included;
-do not mix files from different versions. Preferences/subscriptions remain in
-Windows user data.
+Available stable updates download in the background when automatic checks are
+enabled. A pinned Ed25519 public key verifies the detached descriptor for the
+complete portable ZIP and every bundled file. After explicit VPN disconnection
+and applying or discarding pending drafts, the user selects **Обновить и
+перезапустить**. An unprivileged standalone updater waits for the exact GUI
+process to exit, replaces the verified complete folder, and restarts the GUI.
+It never silently reconnects the VPN. The full bundle includes matching GUI,
+helper, updater, `engine` and `xray` files; do not mix versions.
 
-## Next installation phase
+**0.1.3 is the first signed updater-capable release.** Users of 0.1.2 and earlier
+must download the complete ZIP and extract it into a new folder once.
+Preferences/subscriptions remain in Windows user data. Changed or extra bundle
+files require a manual full-ZIP update in a new folder. Previous/staging folders
+retain manual repair evidence and consume disk space; automatic rollback and
+garbage collection are outside this implementation. Incomplete replacements
+refuse to launch and provide a manual repair path.
 
-The standard Tauri Windows updater targets installer artifacts and verifies a
-mandatory update signature. A portable installation needs a deliberate replacement
-and rollback design for the GUI, matching elevated helper and reviewed engines.
-That phase should provide a pinned signing key, staged verification, clean owned
-VPN teardown, replacement after process exit and rollback on failure. Checksums
-in the current release are integrity evidence, not independent update signatures.
-No private signing key or update-install privilege was introduced in this phase.
+Only trusted stable tag publishing receives `ROUTEDECK_UPDATE_SIGNING_KEY`; PR
+builds never receive it. `SHA256SUMS.txt` is integrity metadata; the detached
+Ed25519 signature authenticates update metadata. See
+[the release-signing workflow](portable-updater-release.md) and
+[implementation/qualification limits](portable-updater.md). No real isolated
+signed N→N+1 GUI-restart qualification has been performed or claimed.
 
 Runtime acquisition is separate from dependency installation and frontend builds.
 Only the exact reviewed files are packaged, together with upstream notices and
