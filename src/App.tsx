@@ -14,6 +14,7 @@ import { controller } from "./controller";
 import { syncWindowTheme } from "./windowAppearance";
 import { useAutoSave } from "./useAutoSave";
 import { useStagedSave } from "./useStagedSave";
+import { ThemedSelect } from "./ThemedSelect";
 import { nextSubscriptionRefresh } from "./subscriptionRefresh";
 import { appUpdateMonitor } from "./appUpdates";
 import { toPublicActionError, type PublicActionError } from "./actionErrors";
@@ -595,9 +596,8 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
       </section>
       <section className="card route-default">
         <label htmlFor="default-route"><strong>Остальной трафик</strong><small>Приложения ниже — исключения</small></label>
-        <select id="default-route" value={draft.defaultRoute} onChange={(event) => onDraftChange({ ...draft, defaultRoute: event.target.value as RoutingConfig["defaultRoute"] })}>
-          <option value="vpn">Через VPN</option><option value="direct">Напрямую</option>
-        </select>
+        <ThemedSelect id="default-route" label="Остальной трафик" value={draft.defaultRoute} onChange={(value) => onDraftChange({ ...draft, defaultRoute: value as RoutingConfig["defaultRoute"] })}
+          options={[{ value: "vpn", label: "Через VPN" }, { value: "direct", label: "Напрямую" }]} />
       </section>
 
       <details className="routing-scope"><summary>{snapshot.mode === "tun" ? "TUN · трафик Windows" : "Системный прокси · ограниченный охват"}</summary><p>{snapshot.mode === "tun" ? "Правила охватывают трафик Windows." : "Только TCP приложений, использующих прокси Windows. Для остальных приложений и UDP нужен TUN."} Для сохранения изменений нажмите «Применить правила».</p></details>
@@ -613,9 +613,8 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
         <div className="app-rule-list">
           {matchingApps.map((app) => <div className="compact-rule" key={app.id}>
             <span className="rule-app-copy"><strong title={app.path}>{app.name}</strong>{showPaths ? <small>{app.path}</small> : null}</span>
-            <select aria-label={`Маршрут для ${app.name}`} value={app.route} onChange={(event) => updateApp(app.id, event.target.value as AppRouteChoice)}>
-              <option value="inherit">По умолчанию</option><option value="vpn">Через VPN</option><option value="direct">Напрямую</option>
-            </select>
+            <ThemedSelect label={`Маршрут для ${app.name}`} value={app.route} onChange={(value) => updateApp(app.id, value as AppRouteChoice)}
+              options={[{ value: "inherit", label: "По умолчанию" }, { value: "vpn", label: "Через VPN" }, { value: "direct", label: "Напрямую" }]} />
             <button className="icon-button rule-remove" type="button" aria-label={`Удалить правило ${app.name}`} title="Удалить правило" onClick={() => onDraftChange({ ...draft, apps: draft.apps.filter((item) => item.id !== app.id) })}><XIcon size={16} /></button>
           </div>)}
           {matchingApps.length === 0 ? <div className="empty-state compact-empty"><RoutingIcon size={22} /><strong>{draft.apps.length ? "Ничего не найдено" : "Исключений пока нет"}</strong><span>{draft.apps.length ? "Измените запрос или очистите поиск." : "Добавьте запущенное приложение и выберите его маршрут."}</span></div> : null}
@@ -649,7 +648,7 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
 
       <details className="card settings-details tun-stack-settings">
         <summary>Дополнительные настройки TUN</summary>
-        <label className="field-row"><span><strong>Стек TUN</strong><small>Применяется только в режиме TUN</small></span><select aria-label="Стек TUN" value={draft.tunStack} onChange={(event) => onDraftChange({ ...draft, tunStack: event.target.value as RoutingConfig["tunStack"] })}><option value="gvisor">gVisor</option><option value="system">System</option></select></label>
+        <label className="field-row"><span><strong>Стек TUN</strong><small>Применяется только в режиме TUN</small></span><ThemedSelect label="Стек TUN" value={draft.tunStack} onChange={(value) => onDraftChange({ ...draft, tunStack: value as RoutingConfig["tunStack"] })} options={[{ value: "gvisor", label: "gVisor" }, { value: "system", label: "System" }]} /></label>
         <p className="settings-explanation">По умолчанию используется gVisor. Он может помочь с совместимостью с zapret. При необходимости можно выбрать System; настройка сохраняется.</p>
       </details>
 
@@ -691,9 +690,9 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
         <Dialog title={trafficEditorOriginalId ? "Изменить правило трафика" : "Добавить правило трафика"} description="Правило применяется только после нажатия «Применить»." onClose={closeTrafficEditor}
           actions={<><button className="secondary-button" type="button" onClick={closeTrafficEditor}>Отмена</button><button className="primary-button dialog-primary" type="submit" form="traffic-rule-form">Применить</button></>}>
           <form id="traffic-rule-form" className="traffic-rule-form" onSubmit={(event) => { event.preventDefault(); applyTrafficEditor(); }}>
-            <label className="dialog-field"><span>Сеть</span><select aria-label="Сеть" value={trafficEditor.network} data-autofocus onChange={(event) => { setTrafficEditor({ ...trafficEditor, network: event.target.value as TrafficRule["network"] }); setTrafficEditorError(""); }}><option value="udp">UDP</option><option value="tcp">TCP</option></select></label>
+            <label className="dialog-field"><span>Сеть</span><ThemedSelect label="Сеть" value={trafficEditor.network} autoFocus onChange={(value) => { setTrafficEditor({ ...trafficEditor, network: value as TrafficRule["network"] }); setTrafficEditorError(""); }} options={[{ value: "udp", label: "UDP" }, { value: "tcp", label: "TCP" }]} /></label>
             <label className="dialog-field"><span>Порт</span><input type="number" inputMode="numeric" min={1} max={65535} value={trafficEditor.port} aria-invalid={Boolean(trafficEditorError)} aria-describedby={trafficEditorError ? "traffic-rule-error" : undefined} onChange={(event) => { setTrafficEditor({ ...trafficEditor, port: Number(event.target.value) }); setTrafficEditorError(""); }} /></label>
-            <label className="dialog-field"><span>Действие</span><select aria-label="Действие" value={trafficEditor.action} onChange={(event) => setTrafficEditor({ ...trafficEditor, action: event.target.value as TrafficRule["action"] })}><option value="block">Блокировать</option><option value="direct">Напрямую</option><option value="vpn">Через VPN</option></select></label>
+            <label className="dialog-field"><span>Действие</span><ThemedSelect label="Действие" value={trafficEditor.action} onChange={(value) => setTrafficEditor({ ...trafficEditor, action: value as TrafficRule["action"] })} options={[{ value: "block", label: "Блокировать" }, { value: "direct", label: "Напрямую" }, { value: "vpn", label: "Через VPN" }]} /></label>
             <label className="paths-toggle"><input type="checkbox" checked={trafficEditor.enabled} onChange={(event) => setTrafficEditor({ ...trafficEditor, enabled: event.target.checked })} />Правило включено</label>
           </form>
           {trafficEditorError ? <p id="traffic-rule-error" className="field-error" role="alert">{trafficEditorError}</p> : null}
@@ -727,11 +726,11 @@ function SettingsPage({ headingRef, draft, onDraftChange, onReset, saveState, re
       <ActionFailureNotice failure={actionFailure} page="settings" onClear={onClearFailure} />
       <section className="card settings-group lean-settings">
         <h2>Интерфейс</h2>
-        <label className="field-row"><span><strong>Тема</strong></span><select aria-label="Тема" value={draft.theme} onChange={(event) => onDraftChange({ ...draft, theme: event.target.value as SettingsConfig["theme"] })}><option value="dark">Тёмная</option><option value="light">Светлая</option><option value="system">Как в Windows</option></select></label>
+        <label className="field-row"><span><strong>Тема</strong></span><ThemedSelect label="Тема" value={draft.theme} onChange={(value) => onDraftChange({ ...draft, theme: value as SettingsConfig["theme"] })} options={[{ value: "dark", label: "Тёмная" }, { value: "light", label: "Светлая" }, { value: "system", label: "Как в Windows" }]} /></label>
       </section>
       <section className="card settings-group lean-settings">
         <h2>Подписки</h2>
-        <label className="field-row"><span><strong>Автообновление</strong></span><select aria-label="Автообновление подписок" value={draft.subscriptionRefreshHours} onChange={(event) => onDraftChange({ ...draft, subscriptionRefreshHours: Number(event.target.value) as SettingsConfig["subscriptionRefreshHours"] })}><option value={0}>Выключено</option><option value={6}>Раз в 6 часов</option><option value={24}>Раз в сутки</option></select></label>
+        <label className="field-row"><span><strong>Автообновление</strong></span><ThemedSelect label="Автообновление подписок" value={String(draft.subscriptionRefreshHours)} onChange={(value) => onDraftChange({ ...draft, subscriptionRefreshHours: Number(value) as SettingsConfig["subscriptionRefreshHours"] })} options={[{ value: "0", label: "Выключено" }, { value: "6", label: "Раз в 6 часов" }, { value: "24", label: "Раз в сутки" }]} /></label>
         <p className="settings-explanation">Работает, пока RouteDeck открыт и отключён. Во время подключения обновление откладывается, чтобы не прерывать сеанс. Вручную обновить можно в списке серверов.</p>
       </section>
       <section className="card settings-group lean-settings update-settings" aria-labelledby="app-updates-title">
@@ -894,7 +893,7 @@ function Dialog({ title, description, focusKey, onClose, busy = false, closeDisa
   return createPortal(
     <div className="dialog-scrim" role="presentation">
       <div className="dialog" ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby={description ? "dialog-description" : undefined}>
-        <div className="dialog-header"><div><h2 id="dialog-title">{title}</h2>{description ? <p id="dialog-description">{description}</p> : null}</div><button className="icon-button" type="button" aria-label="Закрыть окно" title={closeDisabled ? "Дождитесь завершения импорта" : "Закрыть"} disabled={closeDisabled} onClick={onClose}><XIcon size={19} /></button></div>
+        <div className="dialog-header"><div><h2 id="dialog-title">{title}</h2>{description ? <p id="dialog-description">{description}</p> : null}</div><button className="icon-button dialog-close" type="button" aria-label="Закрыть окно" title={closeDisabled ? "Дождитесь завершения импорта" : undefined} disabled={closeDisabled} onClick={onClose}><XIcon size={19} /></button></div>
         <div className="dialog-content">{children}</div>
         <div className="dialog-actions">{actions}</div>
       </div>
