@@ -3270,6 +3270,23 @@ impl ApplicationController {
         }
     }
 
+    fn handle_tun_capture_loss(&self, state: &mut State, error: PublicError, count_failure: bool) {
+        if count_failure {
+            if let Some(active) = state.active.as_mut() {
+                active.consecutive_probe_failures =
+                    active.consecutive_probe_failures.saturating_add(1);
+            }
+        }
+        state.status.route_check_ms = None;
+        for kind in [
+            ProofKind::LocalScopeOwnership,
+            ProofKind::SelectedOutboundHttps,
+        ] {
+            Self::set_proof(state, kind, ProofState::Failed, None);
+        }
+        self.handle_runtime_loss(state, error);
+    }
+
     fn monitor_tick(&self) {
         struct ProbeSnapshot {
             generation: String,
@@ -3291,14 +3308,33 @@ impl ApplicationController {
         };
         let process_error = match active.child.is_alive() {
             Ok(true) => None,
-            Ok(false) => Some(PublicError::fixed(
-                PublicErrorCode::RuntimeFailure,
-                PublicErrorStage::EngineProcess,
-                "The local proxy process exited unexpectedly",
+            Ok(false) => Some((
+                PublicError::fixed(
+                    PublicErrorCode::RuntimeFailure,
+                    PublicErrorStage::EngineProcess,
+                    "The local proxy process exited unexpectedly",
+                ),
+                false,
             )),
-            Err(error) => Some(public_runtime_error(error, &active.redactor)),
+            Err(error) => {
+                let capture_loss =
+                    active.mode == RuntimeMode::Tun && error.stage() == "tun_capture";
+                Some((public_runtime_error(error, &active.redactor), capture_loss))
+            }
         };
-        if let Some(error) = process_error {
+        if let Some((error, capture_loss)) = process_error {
+            if capture_loss {
+                // Helper status validates capture as well as process liveness.
+                // Count an unavailable capture at the normal proof cadence, not
+                // on every one-second monitor tick. Short wake-up outages retain
+                // the session; sustained losses reach the owned restart path.
+                let count_failure = active.last_probe.elapsed() >= Duration::from_secs(10);
+                if count_failure {
+                    active.last_probe = Instant::now();
+                }
+                self.handle_tun_capture_loss(&mut state, error, count_failure);
+                return;
+            }
             Self::set_proof(
                 &mut state,
                 ProofKind::EngineProcess,
@@ -3406,40 +3442,49 @@ impl ApplicationController {
         }) else {
             return;
         };
-        let ownership = if active.child.is_alive().unwrap_or(false) {
-            let listeners = self
-                .services
-                .listener
-                .verify_owned_now(active.ports, active.child.as_mut());
-            if snapshot.mode == RuntimeMode::Tun {
-                listeners.and_then(|_| {
-                    let before = snapshot.tun_before.ok_or_else(|| {
-                        RuntimeError::new(
-                            "tun_capture",
-                            "the owned TUN capture snapshot was unavailable",
-                        )
-                    })?;
-                    let after = active.child.tun_capture_snapshot()?;
-                    if after.proves_traffic_since(before) {
-                        Ok(())
-                    } else {
-                        Err(RuntimeError::new(
-                            "tun_capture",
-                            "periodic unproxied traffic did not traverse the owned TUN adapter",
-                        ))
-                    }
-                })
-            } else {
-                listeners
+        let ownership = match active.child.is_alive() {
+            Ok(true) => {
+                let listeners = self
+                    .services
+                    .listener
+                    .verify_owned_now(active.ports, active.child.as_mut());
+                if snapshot.mode == RuntimeMode::Tun {
+                    listeners.and_then(|_| {
+                        let before = snapshot.tun_before.ok_or_else(|| {
+                            RuntimeError::new(
+                                "tun_capture",
+                                "the owned TUN capture snapshot was unavailable",
+                            )
+                        })?;
+                        let after = active.child.tun_capture_snapshot()?;
+                        if after.proves_traffic_since(before) {
+                            Ok(())
+                        } else {
+                            Err(RuntimeError::new(
+                                "tun_capture",
+                                "periodic unproxied traffic did not traverse the owned TUN adapter",
+                            ))
+                        }
+                    })
+                } else {
+                    listeners
+                }
             }
-        } else {
-            Err(RuntimeError::new(
+            Ok(false) => Err(RuntimeError::new(
                 "engine_process",
                 "sing-box exited during traffic proof",
-            ))
+            )),
+            Err(error) => Err(error),
         };
         if let Err(error) = ownership {
+            let capture_loss = snapshot.mode == RuntimeMode::Tun && error.stage() == "tun_capture";
             let public = public_runtime_error(error, &snapshot.redactor);
+            if capture_loss {
+                // The periodic proof interval has already elapsed. Capture
+                // failures must contribute even when HTTPS itself succeeded.
+                self.handle_tun_capture_loss(&mut state, public, true);
+                return;
+            }
             Self::set_proof(
                 &mut state,
                 ProofKind::LocalScopeOwnership,
@@ -5098,6 +5143,240 @@ mod tests {
             restarts: restarts.clone(),
         });
         restarts
+    }
+
+    struct CaptureFailureChild {
+        child: RestartableChild,
+        status_unavailable: Arc<AtomicBool>,
+        traffic_stalled: Arc<AtomicBool>,
+        restart_error: Option<&'static str>,
+    }
+
+    impl ManagedChild for CaptureFailureChild {
+        fn pid(&self) -> u32 {
+            self.child.pid()
+        }
+        fn is_alive(&mut self) -> Result<bool, RuntimeError> {
+            if self.status_unavailable.load(Ordering::SeqCst) {
+                Err(RuntimeError::new(
+                    "tun_capture",
+                    "fixture capture unavailable",
+                ))
+            } else {
+                self.child.is_alive()
+            }
+        }
+        fn stop(&mut self) -> Result<(), RuntimeError> {
+            self.child.stop()
+        }
+        fn tun_capture_snapshot(&mut self) -> Result<TunCaptureSnapshot, RuntimeError> {
+            if self.traffic_stalled.load(Ordering::SeqCst) {
+                Ok(TunCaptureSnapshot {
+                    interface_luid: 1,
+                    in_octets: 0,
+                    out_octets: 0,
+                })
+            } else {
+                self.child.tun_capture_snapshot()
+            }
+        }
+        fn can_restart_owned_core(&self) -> bool {
+            self.child.can_restart_owned_core()
+        }
+        fn restart_owned_core(&mut self, target: u16) -> Result<(), RuntimeError> {
+            if let Some(stage) = self.restart_error {
+                self.child.restarts.fetch_add(1, Ordering::SeqCst);
+                return Err(RuntimeError::new(stage, "fixture restart refused"));
+            }
+            self.child.restart_owned_core(target)?;
+            self.status_unavailable.store(false, Ordering::SeqCst);
+            self.traffic_stalled.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn install_capture_failure_child(
+        controller: &ApplicationController,
+        alive: Arc<AtomicBool>,
+        stops: Arc<AtomicUsize>,
+        unavailable_status: bool,
+        restart_error: Option<&'static str>,
+    ) -> (Arc<AtomicUsize>, Arc<AtomicBool>) {
+        let restarts = Arc::new(AtomicUsize::new(0));
+        let status_unavailable = Arc::new(AtomicBool::new(unavailable_status));
+        controller.lock_state().active.as_mut().unwrap().child = Box::new(CaptureFailureChild {
+            child: RestartableChild {
+                child: FakeChild {
+                    alive,
+                    stops,
+                    stop_fails: false,
+                    tun: true,
+                    capture_calls: 0,
+                },
+                restarts: restarts.clone(),
+            },
+            status_unavailable: status_unavailable.clone(),
+            traffic_stalled: Arc::new(AtomicBool::new(!unavailable_status)),
+            restart_error,
+        });
+        (restarts, status_unavailable)
+    }
+
+    fn make_probe_due(controller: &ApplicationController) {
+        controller.lock_state().active.as_mut().unwrap().last_probe =
+            Instant::now() - Duration::from_secs(11);
+    }
+
+    #[test]
+    fn sustained_tun_capture_losses_restart_owned_core_and_require_fresh_proof() {
+        // Exercise helper status failures and successful HTTPS with no attributed
+        // TUN traffic. Neither may bypass sustained failure accounting.
+        for unavailable_status in [true, false] {
+            let (mut controller, stops, alive) = controller_with_tun(true, true, false);
+            let node = import_node(&controller);
+            let ready = controller
+                .start_tun(&node, tun_routing(DefaultRoute::Vpn))
+                .unwrap();
+            let (restarts, _) =
+                install_capture_failure_child(&controller, alive, stops, unavailable_status, None);
+            for failure in 1..=6 {
+                make_probe_due(&controller);
+                controller.monitor_tick();
+                let status = controller.status();
+                assert_eq!(status.phase, RuntimePhase::Degraded);
+                assert_eq!(status.session_id, ready.session_id);
+                assert_eq!(status.route_check_ms, None);
+                assert_eq!(
+                    status
+                        .proofs
+                        .iter()
+                        .find(|row| row.kind == ProofKind::EngineProcess)
+                        .unwrap()
+                        .state,
+                    ProofState::Passed
+                );
+                assert_eq!(
+                    status
+                        .proofs
+                        .iter()
+                        .find(|row| row.kind == ProofKind::LocalScopeOwnership)
+                        .unwrap()
+                        .state,
+                    ProofState::Failed
+                );
+                assert_eq!(
+                    controller
+                        .lock_state()
+                        .active
+                        .as_ref()
+                        .unwrap()
+                        .consecutive_probe_failures,
+                    failure
+                );
+                // One-second status polling cannot shorten the normal proof cadence.
+                controller.monitor_tick();
+                assert_eq!(
+                    controller
+                        .lock_state()
+                        .active
+                        .as_ref()
+                        .unwrap()
+                        .consecutive_probe_failures,
+                    failure
+                );
+                make_retry_due(&controller);
+                controller.reconnect_tick();
+                assert_eq!(restarts.load(Ordering::SeqCst), usize::from(failure == 6));
+            }
+            assert_eq!(controller.status().phase, RuntimePhase::Degraded);
+            controller.services.prober = Arc::new(FakeProber(false));
+            controller.monitor_tick();
+            assert_eq!(controller.status().phase, RuntimePhase::Degraded);
+            controller.services.prober = Arc::new(FakeProber(true));
+            make_probe_due(&controller);
+            controller.monitor_tick();
+            assert_eq!(controller.status().phase, RuntimePhase::TunReady);
+            assert_eq!(controller.status().session_id, ready.session_id);
+            controller.stop().unwrap();
+            controller.reconnect_tick();
+            assert_eq!(restarts.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn brief_tun_capture_status_loss_recovers_without_core_restart() {
+        let (controller, stops, alive) = controller_with_tun(true, true, false);
+        let node = import_node(&controller);
+        let ready = controller
+            .start_tun(&node, tun_routing(DefaultRoute::Vpn))
+            .unwrap();
+        let (restarts, unavailable) =
+            install_capture_failure_child(&controller, alive, stops, true, None);
+        make_probe_due(&controller);
+        controller.monitor_tick();
+        make_retry_due(&controller);
+        controller.reconnect_tick();
+        assert_eq!(controller.status().phase, RuntimePhase::Degraded);
+        unavailable.store(false, Ordering::SeqCst);
+        controller.monitor_tick();
+        assert_eq!(controller.status().phase, RuntimePhase::Degraded);
+        make_probe_due(&controller);
+        controller.monitor_tick();
+        assert_eq!(controller.status().phase, RuntimePhase::TunReady);
+        assert_eq!(controller.status().session_id, ready.session_id);
+        assert_eq!(
+            controller
+                .lock_state()
+                .active
+                .as_ref()
+                .unwrap()
+                .consecutive_probe_failures,
+            0
+        );
+        assert_eq!(restarts.load(Ordering::SeqCst), 0);
+        controller.stop().unwrap();
+    }
+
+    #[test]
+    fn capture_restart_refusal_pauses_and_cleanup_conflict_retains_recovery_evidence() {
+        for stage in ["tun_preflight", "session_recovery"] {
+            let (controller, stops, alive) = controller_with_tun(true, true, false);
+            let node = import_node(&controller);
+            let ready = controller
+                .start_tun(&node, tun_routing(DefaultRoute::Vpn))
+                .unwrap();
+            let (restarts, _) =
+                install_capture_failure_child(&controller, alive, stops.clone(), true, Some(stage));
+            for _ in 0..6 {
+                make_probe_due(&controller);
+                controller.monitor_tick();
+            }
+            make_retry_due(&controller);
+            controller.reconnect_tick();
+            let status = controller.status();
+            let expected = if stage == "session_recovery" {
+                RuntimePhase::RecoveryRequired
+            } else {
+                RuntimePhase::Degraded
+            };
+            assert_eq!(status.phase, expected);
+            assert_eq!(status.session_id, ready.session_id);
+            assert!(status.connection_requested);
+            assert!(status.reconnect_paused);
+            assert!(controller.lock_state().active.is_some());
+            assert_eq!(stops.load(Ordering::SeqCst), 0);
+            make_probe_due(&controller);
+            controller.monitor_tick();
+            make_retry_due(&controller);
+            controller.reconnect_tick();
+            assert_eq!(controller.status().phase, expected);
+            assert_eq!(restarts.load(Ordering::SeqCst), 1);
+            controller.stop().unwrap();
+            assert_eq!(stops.load(Ordering::SeqCst), 1);
+            assert!(!controller.status().connection_requested);
+            controller.reconnect_tick();
+            assert_eq!(restarts.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]
