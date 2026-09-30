@@ -838,7 +838,7 @@ mod windows {
         let mut target_index = 0;
         let mut initial = true;
         loop {
-            match start_engine_session(&invocation, &start, target_index) {
+            match start_engine_session(&invocation, &start, target_index, initial) {
                 Ok(mut running) => {
                     let mut command = None;
                     let result = with_tun_cleanup(
@@ -1007,17 +1007,9 @@ mod windows {
         invocation: &HelperInvocation,
         request: &StartRequest,
         target_index: u16,
+        initial: bool,
     ) -> Result<RunningSession, RuntimeError> {
-        let route_context = preflight_route_context(&request.upstream)?;
-        let choice = upstream_choice(&request.upstream);
-        if request.preflight_sha256
-            != preflight_digest(&request.config_sha256, &route_context, &choice)
-        {
-            return Err(RuntimeError::new(
-                "tun_preflight",
-                "network routes changed while TUN permission was being granted; retry the connection",
-            ));
-        }
+        validate_start_preflight(request, initial, preflight_route_context)?;
         if !find_tun_adapter_luids()?.is_empty() {
             return Err(RuntimeError::new(
                 "tun_preflight",
@@ -1118,6 +1110,29 @@ mod windows {
                 upstream: request.upstream.clone(),
             },
         })
+    }
+
+    fn validate_start_preflight(
+        request: &StartRequest,
+        initial: bool,
+        inspect: impl FnOnce(&TunUpstreamIdentity) -> Result<String, RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        // Every attempt must validate the current sealed adapter, DNS and path.
+        // The original digest only binds the first launch across the UAC prompt.
+        // An authenticated owned restart follows verified cleanup and may see
+        // changed route metrics after sleep without changing its authority.
+        let route_context = inspect(&request.upstream)?;
+        let choice = upstream_choice(&request.upstream);
+        if initial
+            && request.preflight_sha256
+                != preflight_digest(&request.config_sha256, &route_context, &choice)
+        {
+            return Err(RuntimeError::new(
+                "tun_preflight",
+                "network routes changed while TUN permission was being granted; retry the connection",
+            ));
+        }
+        Ok(())
     }
 
     // The only restart customization is choosing one already validated target.
@@ -2873,22 +2888,36 @@ mod windows {
 
     fn preflight_route_context(upstream: &TunUpstreamIdentity) -> Result<String, RuntimeError> {
         let adapters = adapter_states()?;
-        let mut routes = route_states()?;
-        if foreign_full_tunnel(&adapters, &routes).is_some() {
+        let routes = route_states()?;
+        preflight_route_context_from(upstream, &adapters, &routes, || {
+            best_route_luid_v4([1, 1, 1, 1])
+        })
+    }
+
+    fn preflight_route_context_from(
+        upstream: &TunUpstreamIdentity,
+        adapters: &[AdapterState],
+        routes: &[RouteState],
+        best_route: impl FnOnce() -> Result<u64, RuntimeError>,
+    ) -> Result<String, RuntimeError> {
+        if foreign_full_tunnel(adapters, routes).is_some() {
             return Err(RuntimeError::new(
                 "tun_preflight",
                 "another full-tunnel VPN is active; turn it off before starting RouteDeck TUN",
             ));
         }
-        if exact_upstream_adapter(&adapters, upstream, true).is_none()
-            || best_route_luid_v4([1, 1, 1, 1])? != upstream.interface_luid
+        if exact_upstream_adapter(adapters, upstream, true).is_none()
+            || best_route()? != upstream.interface_luid
         {
             return Err(RuntimeError::new(
                 "tun_preflight",
                 "the selected physical upstream changed before TUN startup",
             ));
         }
-        routes.retain(|route| route.prefix_len <= 1);
+        let mut routes = routes
+            .iter()
+            .filter(|route| route.prefix_len <= 1)
+            .collect::<Vec<_>>();
         routes.sort_by_key(|route| {
             (
                 route.family,
@@ -5136,6 +5165,138 @@ mod windows {
                 prefix_len: 0,
                 metric,
             }
+        }
+
+        fn start_fixture(upstream: TunUpstreamIdentity, route_context: &str) -> StartRequest {
+            let config_sha256 = "01".repeat(32);
+            StartRequest {
+                request_id: 2,
+                config_handle_id: 1,
+                config_len: 2,
+                preflight_sha256: preflight_digest(
+                    &config_sha256,
+                    route_context,
+                    &upstream_choice(&upstream),
+                ),
+                config_sha256,
+                upstream,
+            }
+        }
+
+        #[test]
+        fn initial_uac_snapshot_is_strict_but_owned_restart_accepts_fresh_valid_route_metrics() {
+            let ethernet = adapter(7, "Ethernet", IF_TYPE_ETHERNET_CSMACD, 6);
+            let upstream = physical_upstream_from(std::slice::from_ref(&ethernet), 7).unwrap();
+            let routes = vec![default_route(7, AF_INET, 25)];
+            let context = preflight_route_context_from(
+                &upstream,
+                std::slice::from_ref(&ethernet),
+                &routes,
+                || Ok(7),
+            )
+            .unwrap();
+            let request = start_fixture(upstream, &context);
+            validate_start_preflight(&request, true, |_| Ok(context.clone())).unwrap();
+            let refreshed = vec![default_route(7, AF_INET, 40)];
+            let inspect = |upstream: &TunUpstreamIdentity| {
+                preflight_route_context_from(
+                    upstream,
+                    std::slice::from_ref(&ethernet),
+                    &refreshed,
+                    || Ok(7),
+                )
+            };
+            assert_ne!(inspect(&request.upstream).unwrap(), context);
+            assert_eq!(
+                validate_start_preflight(&request, true, inspect)
+                    .unwrap_err()
+                    .stage(),
+                "tun_preflight"
+            );
+            validate_start_preflight(&request, false, inspect).unwrap();
+        }
+
+        #[test]
+        fn every_restart_revalidates_sealed_adapter_dns_best_path_and_foreign_tunnels() {
+            let mut ethernet = adapter(7, "Ethernet", IF_TYPE_ETHERNET_CSMACD, 6);
+            ethernet.ipv4_dns_servers = vec!["192.0.2.53".parse().unwrap()];
+            let upstream = physical_upstream_from(std::slice::from_ref(&ethernet), 7).unwrap();
+            let routes = vec![default_route(7, AF_INET, 25)];
+            let context = preflight_route_context_from(
+                &upstream,
+                std::slice::from_ref(&ethernet),
+                &routes,
+                || Ok(7),
+            )
+            .unwrap();
+            let request = start_fixture(upstream, &context);
+            for change in [
+                "down",
+                "alias",
+                "index",
+                "luid",
+                "dns",
+                "best-route",
+                "foreign-tunnel",
+                "route-unavailable",
+            ] {
+                let mut adapters = vec![ethernet.clone()];
+                let mut routes = routes.clone();
+                let mut best = Ok(7);
+                match change {
+                    "down" => adapters[0].oper_status = 2,
+                    "alias" => adapters[0].friendly_name = "Other Ethernet".into(),
+                    "index" => adapters[0].if_index = 8,
+                    "luid" => adapters[0].luid = 8,
+                    "dns" => adapters[0].ipv4_dns_servers = vec!["192.0.2.54".parse().unwrap()],
+                    "best-route" => best = Ok(8),
+                    "foreign-tunnel" => {
+                        adapters.push(adapter(9, "Foreign VPN", IF_TYPE_TUNNEL, 0));
+                        routes.push(default_route(9, AF_INET, 1));
+                    }
+                    "route-unavailable" => {
+                        best = Err(RuntimeError::new(
+                            "tun_preflight",
+                            "fixture path unavailable",
+                        ))
+                    }
+                    _ => unreachable!(),
+                }
+                for initial in [true, false] {
+                    let result = validate_start_preflight(&request, initial, |upstream| {
+                        preflight_route_context_from(upstream, &adapters, &routes, || best.clone())
+                    });
+                    assert_eq!(
+                        result.unwrap_err().stage(),
+                        "tun_preflight",
+                        "{change}, initial={initial}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn cleanup_conflict_prevents_owned_restart_preflight_and_preserves_journal() {
+            let (mut child, mut journal) = cleanup_fixtures();
+            journal.luid = Some(7);
+            let cleanup = with_tun_cleanup(
+                &mut child,
+                &mut journal,
+                CleanupWhen::Always,
+                |_, _| Ok(()),
+                |_| CleanupState::Conflict,
+            );
+            let ethernet = adapter(7, "Ethernet", IF_TYPE_ETHERNET_CSMACD, 6);
+            let upstream = physical_upstream_from(&[ethernet], 7).unwrap();
+            let request = start_fixture(upstream, "fixture");
+            let result = cleanup.and_then(|_| {
+                validate_start_preflight(&request, false, |_| {
+                    panic!("restart preflight must not run before verified cleanup")
+                })
+            });
+            assert_eq!(result.unwrap_err().stage(), "session_recovery");
+            assert!(journal.retained);
+            assert_eq!(*child.events.lock().unwrap(), ["stop", "conflict"]);
         }
 
         #[test]
