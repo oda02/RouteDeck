@@ -669,6 +669,16 @@ try {
   await page.getByRole("progressbar", { name: "Загрузка обновления" }).waitFor();
   assert.equal(await page.getByRole("progressbar", { name: "Загрузка обновления" }).getAttribute("value"), "50");
   await page.screenshot({ path: ".cache/ux-qa/portable-update-downloading.png" });
+  await page.evaluate(() => { window.__routeDeckFixture.portableUpdate = { phase: "error", downloaded: 0, total: 0, version: "0.2.0", error: "portable_update_unsafe_location" }; });
+  await page.clock.runFor(1200);
+  await page.getByText("Права папки не подходят для встроенного обновления. Распакуйте полный выпуск из GitHub в новую личную папку внутри папки пользователя. Настройки сохранятся.", { exact: true }).waitFor();
+  assert.equal(await page.getByRole("button", { name: "Обновить и перезапустить", exact: true }).count(), 0);
+  await page.getByRole("button", { name: "Скачать на GitHub", exact: true }).waitFor();
+  await checkFrame();
+  scenarios++;
+  await page.evaluate(() => { window.__routeDeckFixture.portableUpdate = { phase: "downloading", downloaded: 50, total: 100, version: "0.2.0", error: null }; });
+  await page.getByRole("button", { name: "Повторить загрузку", exact: true }).click();
+  await page.getByRole("progressbar", { name: "Загрузка обновления", exact: true }).waitFor();
   await nav("Главная"); if (await page.getByRole("button", { name: "Подключить", exact: true }).count()) await page.getByRole("button", { name: "Подключить", exact: true }).click(); await connected();
   const updaterStarts = await page.evaluate(() => window.__routeDeckFixture.calls.filter((c) => /^(start|stop)_/.test(c.command)).length);
   await nav("Настройки"); await page.evaluate(() => { window.__routeDeckFixture.portableUpdate = { phase: "ready", downloaded: 100, total: 100, version: "0.2.0", error: null }; });

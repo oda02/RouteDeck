@@ -4,7 +4,11 @@
 
 Download `RouteDeck-<version>-windows-x64.zip` from
 [GitHub Releases](https://github.com/oda02/RouteDeck/releases/latest), extract the
-whole archive, and launch `routedeck.exe`. The full portable includes the pinned
+whole archive into a new empty personal folder, and launch `routedeck.exe`.
+Built-in updates require folder and file permissions that prevent other users
+from modifying the bundle. Versions 0.1.3/0.1.4 need a one-time manual ZIP update
+to 0.1.5 because of a Windows working-directory sharing bug.
+The full portable includes the pinned
 sing-box/Cronet and Xray runtimes; no separate engine setup is required. The other
 source-code assets on the release page are optional downloads for source inspection.
 Keep `engine` and `xray` beside the application. See

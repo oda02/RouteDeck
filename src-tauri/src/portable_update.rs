@@ -18,6 +18,7 @@ const EXPANDED_LIMIT: u64 = 1024 * 1024 * 1024;
 const MARKER: &str = "ROUTEDECK-UPDATE-INCOMPLETE.txt";
 const REPAIR: &str = "RouteDeck update was interrupted. Close RouteDeck, download the complete portable ZIP from https://github.com/oda02/RouteDeck/releases/latest and extract it into a NEW empty folder. User settings remain in Windows application data. Do not launch this incomplete folder.\n";
 const ERROR: &str = "portable_update_failed";
+const UNSAFE_LOCATION: &str = "portable_update_unsafe_location";
 type Result<T> = std::result::Result<T, &'static str>;
 
 mod manifest;
@@ -31,8 +32,6 @@ struct DirectoryLease {
 enum LeafLease {
     Rename,
     Namespace,
-    #[cfg(windows)]
-    Observe,
 }
 fn metadata_safe(path: &Path) -> Result<fs::Metadata> {
     let m = fs::symlink_metadata(path).map_err(|_| ERROR)?;
@@ -54,10 +53,6 @@ impl DirectoryLease {
     }
     fn pin_namespace(path: &Path) -> Result<Self> {
         Self::open(path, LeafLease::Namespace)
-    }
-    #[cfg(windows)]
-    fn observe(path: &Path) -> Result<Self> {
-        Self::open(path, LeafLease::Observe)
     }
     fn open(path: &Path, kind: LeafLease) -> Result<Self> {
         if !path.is_absolute() {
@@ -86,11 +81,7 @@ impl DirectoryLease {
                     } else {
                         0x20080
                     })
-                    .share_mode(if ancestor == path && !matches!(kind, LeafLease::Observe) {
-                        3
-                    } else {
-                        7
-                    })
+                    .share_mode(if ancestor == path { 3 } else { 7 })
                     .custom_flags(0x02200000)
                     .open(ancestor)
                     .map_err(|_| ERROR)?;
@@ -198,7 +189,24 @@ struct VerifiedTree {
     files: Vec<File>,
 }
 fn verify_tree(root: &Path, manifest: &UpdateManifest, extras: &[&str]) -> Result<VerifiedTree> {
-    let mut directories = vec![DirectoryLease::acquire(root)?];
+    verify_tree_with_lease(root, manifest, extras, DirectoryLease::pin_namespace(root)?)
+}
+fn verify_tree_for_rename(
+    root: &Path,
+    manifest: &UpdateManifest,
+    extras: &[&str],
+) -> Result<VerifiedTree> {
+    // DELETE is needed only for an actual move, after the GUI has exited. A
+    // running process's working-directory handle denies DELETE sharing.
+    verify_tree_with_lease(root, manifest, extras, DirectoryLease::acquire(root)?)
+}
+fn verify_tree_with_lease(
+    root: &Path,
+    manifest: &UpdateManifest,
+    extras: &[&str],
+    root_lease: DirectoryLease,
+) -> Result<VerifiedTree> {
+    let mut directories = vec![root_lease];
     #[cfg(windows)]
     windows::verify_private_directory(&directories[0], false)?;
     let mut actual = BTreeSet::new();
@@ -223,7 +231,7 @@ fn verify_tree(root: &Path, manifest: &UpdateManifest, extras: &[&str]) -> Resul
         }
     }
     for parent in parents {
-        let lease = DirectoryLease::acquire(&parent)?;
+        let lease = DirectoryLease::pin_namespace(&parent)?;
         #[cfg(windows)]
         windows::verify_private_directory(&lease, false)?;
         directories.push(lease);
@@ -259,7 +267,7 @@ fn extract_bundle(archive: &Path, target: &Path, manifest: &UpdateManifest) -> R
         return Err(ERROR);
     }
     private_directory(target)?;
-    let _lease = DirectoryLease::acquire(target)?;
+    let _lease = DirectoryLease::pin_namespace(target)?;
     let mut seen = BTreeSet::new();
     let mut directory_names = BTreeSet::new();
     let mut directory_leases = Vec::new();
@@ -301,7 +309,7 @@ fn extract_bundle(archive: &Path, target: &Path, manifest: &UpdateManifest) -> R
         for parent in parents {
             if directory_names.insert(parent.to_path_buf()) {
                 private_directory(parent)?;
-                directory_leases.push(DirectoryLease::acquire(parent)?);
+                directory_leases.push(DirectoryLease::pin_namespace(parent)?);
             }
         }
         let mut out = OpenOptions::new()
@@ -451,13 +459,13 @@ impl PortableUpdater {
         if !self.stage_root.try_exists().map_err(|_| ERROR)? {
             private_directory(&self.stage_root)?;
         }
-        let _root = DirectoryLease::acquire(&self.stage_root)?;
+        let _root = DirectoryLease::pin_namespace(&self.stage_root)?;
         #[cfg(windows)]
         windows::verify_private_directory(&_root, true)?;
         let token = random_token()?;
         let stage = self.stage_root.join(token);
         private_directory(&stage)?;
-        let _stage = DirectoryLease::acquire(&stage)?;
+        let _stage = DirectoryLease::pin_namespace(&stage)?;
         #[cfg(windows)]
         windows::verify_private_directory(&_stage, true)?;
         durable_new(&stage.join("current.json"), &current_body)?;
@@ -520,7 +528,7 @@ impl PortableUpdater {
     pub fn prepare_install(&self) -> Result<PreparedInstall> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let ready = state.ready.as_ref().ok_or(ERROR)?;
-        let _stage = DirectoryLease::acquire(&ready.stage)?;
+        let _stage = DirectoryLease::pin_namespace(&ready.stage)?;
         let current = verify_tree(&ready.target, &ready.current, &[])?;
         verify_tree(&ready.stage.join("payload"), &ready.next, &[])?;
         let own = ready
@@ -686,8 +694,8 @@ fn replace_bundle(
     // Deny deletion of the namespace, but do not request DELETE on the target
     // parent: the kernel's rename-target open can conflict with that access.
     let _parent = DirectoryLease::pin_namespace(parent)?;
-    let _stage = DirectoryLease::acquire(stage)?;
-    let mut old = verify_tree(target, current, &[])?;
+    let _stage = DirectoryLease::pin_namespace(stage)?;
+    let mut old = verify_tree_for_rename(target, current, &[])?;
     let mut payload = verify_tree(&stage.join("payload"), next, &[])?;
     let incoming = parent.join(format!(".RouteDeck-incoming-{token}"));
     let previous = parent.join(format!(".RouteDeck-previous-{token}"));
@@ -695,7 +703,7 @@ fn replace_bundle(
         return Err(ERROR);
     }
     private_directory(&incoming)?;
-    let incoming_root = DirectoryLease::acquire(&incoming)?;
+    let incoming_root = DirectoryLease::pin_namespace(&incoming)?;
     let mut incoming_dirs = Vec::new();
     let mut created_dirs = BTreeSet::new();
     for (file, source) in next.files.iter().zip(payload.files.iter_mut()) {
@@ -710,7 +718,7 @@ fn replace_bundle(
         for dir in dirs {
             if created_dirs.insert(dir.to_path_buf()) {
                 private_directory(dir)?;
-                incoming_dirs.push(DirectoryLease::acquire(dir)?);
+                incoming_dirs.push(DirectoryLease::pin_namespace(dir)?);
             }
         }
         // Use the already verified/locked file handle, never reopen its path.
@@ -731,7 +739,7 @@ fn replace_bundle(
     // after verification without retained handles to all directories/files.
     drop(incoming_dirs);
     drop(incoming_root);
-    let mut new = verify_tree(&incoming, next, &[])?;
+    let mut new = verify_tree_for_rename(&incoming, next, &[])?;
     durable_new(&incoming.join(MARKER), REPAIR.as_bytes())?;
     durable_new(&target.join(MARKER), REPAIR.as_bytes())?;
     checkpoint(1)?;
@@ -827,9 +835,9 @@ mod tests {
         io::Cursor,
         sync::atomic::{AtomicUsize, Ordering},
     };
-    struct Fixture(PathBuf);
+    pub(super) struct Fixture(pub(super) PathBuf);
     impl Fixture {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             static ID: AtomicUsize = AtomicUsize::new(0);
             let p = std::env::temp_dir().join(format!(
                 "RouteDeck-update-fixture-{}-{}",
@@ -887,7 +895,7 @@ mod tests {
         }
         zip.finish().unwrap().into_inner()
     }
-    fn manifest() -> (UpdateManifest, Vec<u8>) {
+    pub(super) fn manifest() -> (UpdateManifest, Vec<u8>) {
         let files = files();
         let bytes = archive(
             &files
@@ -911,7 +919,7 @@ mod tests {
         };
         (m, bytes)
     }
-    fn populate(path: &Path, m: &UpdateManifest) {
+    pub(super) fn populate(path: &Path, m: &UpdateManifest) {
         private_directory(path).unwrap();
         let mut dirs = BTreeSet::new();
         for f in &m.files {
@@ -1249,6 +1257,68 @@ mod tests {
         ] {
             assert!(!windows::local_absolute_path(Path::new(path)), "{path}");
         }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn working_directory_handles_allow_verification_but_delay_rename_authority() {
+        use std::os::windows::fs::OpenOptionsExt;
+        fn working_directory(path: &Path) -> File {
+            // Windows cwd handles deny DELETE sharing. Model that contract
+            // without changing this test process's global working directory.
+            OpenOptions::new()
+                .access_mode(0x100020) // SYNCHRONIZE | FILE_TRAVERSE
+                .share_mode(3)
+                .custom_flags(0x02200000)
+                .open(path)
+                .unwrap()
+        }
+        let fixture = Fixture::new();
+        let (next, _) = manifest();
+        let mut current = next.clone();
+        current.version = "1.1.0".into();
+        let target = fixture.0.join("app");
+        populate(&target, &current);
+        let cwd = working_directory(&target);
+        // Regression: the former preparation path requested DELETE here.
+        assert!(DirectoryLease::acquire(&target).is_err());
+        assert!(verify_tree_for_rename(&target, &current, &[]).is_err());
+        let verified = verify_tree(&target, &current, &[]).unwrap();
+        drop(cwd);
+        assert!(fs::rename(&target, fixture.0.join("foreign-move")).is_err());
+        assert!(OpenOptions::new()
+            .write(true)
+            .share_mode(7)
+            .open(target.join("routedeck.exe"))
+            .is_err());
+        drop(verified);
+        let rename_tree = verify_tree_for_rename(&target, &current, &[]).unwrap();
+        assert!(OpenOptions::new()
+            .access_mode(0x100020)
+            .share_mode(3)
+            .custom_flags(0x02200000)
+            .open(&target)
+            .is_err());
+        drop(rename_tree);
+
+        let stage = fixture.0.join("stage");
+        private_directory(&stage).unwrap();
+        populate(&stage.join("payload"), &next);
+        // The prepared lease must allow the updater's cwd to open after it.
+        let prepared_stage = DirectoryLease::pin_namespace(&stage).unwrap();
+        let stage_cwd = working_directory(&stage);
+        drop(prepared_stage);
+        // Replacement still runs with the updater cwd held in this stage.
+        replace_bundle(
+            &stage,
+            &target,
+            &next,
+            &current,
+            &"d".repeat(32),
+            |_| Ok(()),
+        )
+        .unwrap();
+        verify_tree(&target, &next, &[]).unwrap();
+        drop(stage_cwd);
     }
     #[cfg(windows)]
     #[test]

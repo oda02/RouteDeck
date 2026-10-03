@@ -34,6 +34,14 @@ GitHub Releases page.
   directories have a protected current-user/SYSTEM/admin ACL. Installed root,
   child directories and files reject untrusted write/delete/ACL permissions.
   This is not a defense against compromised same-user or administrator accounts.
+- Preparation and staging hold namespace leases without DELETE access, allowing
+  the GUI and updater to retain their Windows working-directory handles while
+  still denying foreign rename/deletion. Only the exact old/incoming roots obtain
+  DELETE authority during replacement after the GUI exits, before tree validation.
+  That same verified handle performs the move. The 0.1.3/0.1.4 DELETE-sharing bug
+  requires a one-time manual full-ZIP bootstrap to 0.1.5. ACL policy refusals now
+  return a finite unsafe-location code with personal-folder recovery guidance;
+  permissions are never changed automatically.
 - The GUI embeds the exact trusted current updater digest. Its copy outside the
   application directory remains locked before launching. IPC accepts no URLs,
   paths, executables or commands. The updater accepts only parent PID/creation and
