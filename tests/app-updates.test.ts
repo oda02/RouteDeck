@@ -4,13 +4,28 @@ import { AppUpdateMonitor, parseAppUpdateInfo, parsePortableUpdateState, type Ap
 
 test("portable progress parser accepts only bounded typed progress and redacted errors", () => {
   assert.equal(parsePortableUpdateState({ phase: "ready", downloaded: 100, total: 100, version: "1.2.0", error: null }).phase, "ready");
+  assert.equal(parsePortableUpdateState({ phase: "error", downloaded: 0, total: 0, version: "1.2.0", error: "portable_update_unsafe_location" }).error, "portable_update_unsafe_location");
   for (const input of [
     { phase: "ready", downloaded: 1, total: 2, version: "1.2.0", error: null },
     { phase: "downloading", downloaded: 3, total: 2, version: "1.2.0", error: null },
     { phase: "downloading", downloaded: 0, total: 1024 ** 3, version: "1.2.0", error: null },
     { phase: "error", downloaded: 0, total: 0, version: null, error: "secret or local path" },
     { phase: "ready", downloaded: 2, total: 2, version: "1.2.0", error: null, path: "caller-controlled" },
+    { phase: "error", downloaded: 0, total: 0, version: "1.2.0", error: "portable_update_unsafe_location", path: "caller-controlled" },
   ]) assert.throws(() => parsePortableUpdateState(input));
+});
+
+test("background ACL refusal keeps the finite location error and stops polling", async () => {
+  let timers = 0;
+  const scheduler: UpdateScheduler = { setInterval: () => ++timers, clearInterval: () => { timers--; } };
+  const client: AppUpdateClient = { available: () => true, getVersion: async () => "1.0.0", check: async () => ({ currentVersion: "1.0.0", latestVersion: "1.2.0", status: "available", releaseUrl }), openReleases: async () => null, stage: async () => null,
+    portableStatus: async () => ({ phase: "error", downloaded: 0, total: 0, version: "1.2.0", error: "portable_update_unsafe_location" }) };
+  const monitor = new AppUpdateMonitor(client, scheduler, false);
+  await monitor.check(); await monitor.download();
+  assert.equal(monitor.getSnapshot().portable.error, "portable_update_unsafe_location");
+  assert.equal(monitor.getSnapshot().portable.phase, "error");
+  assert.equal(timers, 0);
+  monitor.dispose();
 });
 
 test("signed update stages in background, progress reaches ready, install failure can retry", async () => {

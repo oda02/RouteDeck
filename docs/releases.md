@@ -81,6 +81,16 @@ helper, updater, `engine` and `xray` files; do not mix versions.
 
 **0.1.3 is the first signed updater-capable release.** Users of 0.1.2 and earlier
 must download the complete ZIP and extract it into a new folder once.
+The 0.1.3 and 0.1.4 preparation code requests a DELETE directory handle that
+conflicts with the running process's working-directory handle. Install 0.1.5
+manually once using the complete ZIP in a new empty personal folder; those older
+binaries cannot receive this repair through their own preparation path.
+Built-in updates require a local portable tree owned by the current user or
+Administrators, without untrusted write/delete/ACL grants on its folders and files.
+Extract inside the user's personal folder and check its permissions rather than
+assuming every drive, Downloads/Desktop location or app-data folder is private.
+Unsafe permissions produce a fixed recovery message; RouteDeck never changes the
+existing folder's ACL or relocates it automatically.
 Preferences/subscriptions remain in Windows user data. Changed or extra bundle
 files require a manual full-ZIP update in a new folder. Previous/staging folders
 retain manual repair evidence and consume disk space; automatic rollback and

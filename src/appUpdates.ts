@@ -31,7 +31,7 @@ export function parseAppUpdateInfo(value: unknown): AppUpdateInfo {
   return { currentVersion, latestVersion, status: input.status as AppUpdateInfo["status"], releaseUrl: releaseUrl as string | null };
 }
 
-const UPDATE_ERRORS = ["portable_update_failed", "portable_update_manual", "portable_update_repair", "portable_update_foreign_files", "portable_update_disconnect_first", "portable_update_teardown_failed", "portable_update_unavailable"] as const;
+const UPDATE_ERRORS = ["portable_update_failed", "portable_update_manual", "portable_update_repair", "portable_update_foreign_files", "portable_update_unsafe_location", "portable_update_disconnect_first", "portable_update_teardown_failed", "portable_update_unavailable"] as const;
 function updateError(value: unknown): string { return typeof value === "string" && UPDATE_ERRORS.includes(value as typeof UPDATE_ERRORS[number]) ? value : "portable_update_failed"; }
 export function parsePortableUpdateState(value: unknown): PortableUpdateState {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid update response");

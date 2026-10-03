@@ -739,7 +739,10 @@ fn apply_protected_acl(path: &Path, descriptor_sddl: &str) -> Result<(), Runtime
 }
 
 #[cfg(all(windows, test))]
-fn apply_protected_dacl_for_test(path: &Path, descriptor_sddl: &str) -> Result<(), RuntimeError> {
+pub(crate) fn apply_protected_dacl_for_test(
+    path: &Path,
+    descriptor_sddl: &str,
+) -> Result<(), RuntimeError> {
     apply_protected_acl_inner(path, descriptor_sddl, false)
 }
 

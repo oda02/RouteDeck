@@ -74,7 +74,7 @@ fn stage_root() -> Result<PathBuf> {
     let root = PathBuf::from(local)
         .join("app.routedeck.desktop")
         .join("updates");
-    DirectoryLease::acquire(&root)?;
+    DirectoryLease::pin_namespace(&root)?;
     Ok(root)
 }
 pub(super) fn launch(prepared: PreparedInstall) -> Result<()> {
@@ -177,7 +177,7 @@ pub(super) fn run() -> Result<()> {
     if executable != stage.join("routedeck-updater.exe") {
         return Err(ERROR);
     }
-    let _stage = DirectoryLease::observe(&stage)?;
+    let _stage = DirectoryLease::pin_namespace(&stage)?;
     let handle = unsafe {
         OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
@@ -466,14 +466,15 @@ fn verify_object_acl(file: &File, require_protected: bool) -> Result<()> {
                 && (require_protected
                     || unsafe { EqualSid(owner, administrators.as_mut_ptr().cast()) } == 0))
         {
-            return Err(ERROR);
+            return Err(UNSAFE_LOCATION);
         }
         let mut control = 0;
         let mut revision = 0;
-        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
-            || (require_protected && control & SE_DACL_PROTECTED == 0)
-        {
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
             return Err(ERROR);
+        }
+        if require_protected && control & SE_DACL_PROTECTED == 0 {
+            return Err(UNSAFE_LOCATION);
         }
         let mut info: ACL_SIZE_INFORMATION = unsafe { zeroed() };
         if unsafe {
@@ -494,7 +495,7 @@ fn verify_object_acl(file: &File, require_protected: bool) -> Result<()> {
             }
             let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
             if allowed.Header.AceType != 0 {
-                return Err(ERROR);
+                return Err(UNSAFE_LOCATION);
             }
             let sid = (&allowed.SidStart as *const u32).cast_mut().cast();
             let trusted = unsafe {
@@ -505,7 +506,7 @@ fn verify_object_acl(file: &File, require_protected: bool) -> Result<()> {
             // Untrusted principals may read an installed folder, never mutate it.
             const WRITE_OR_DELETE: u32 = 0x40000000 | 0x10000000 | 0x000d0156;
             if !trusted && (require_protected || allowed.Mask & WRITE_OR_DELETE != 0) {
-                return Err(ERROR);
+                return Err(UNSAFE_LOCATION);
             }
         }
         Ok(())
@@ -514,4 +515,81 @@ fn verify_object_acl(file: &File, require_protected: bool) -> Result<()> {
         LocalFree(descriptor);
     };
     result
+}
+
+#[cfg(test)]
+mod acl_tests {
+    use super::super::tests::{manifest, populate, Fixture};
+    use super::*;
+
+    fn fixture_acl(path: &Path, extra: &str) {
+        use windows_sys::Win32::{
+            Foundation::LocalFree, Security::Authorization::ConvertSidToStringSidW,
+        };
+        let user = crate::engine_runtime::current_user_sid().unwrap();
+        let mut text = ptr::null_mut();
+        assert_ne!(
+            unsafe { ConvertSidToStringSidW(user.as_ptr().cast_mut().cast(), &mut text) },
+            0
+        );
+        let mut length = 0;
+        while unsafe { *text.add(length) } != 0 {
+            length += 1;
+        }
+        let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) }).unwrap();
+        unsafe {
+            LocalFree(text.cast());
+        }
+        // Only disposable synthetic fixtures receive these deliberately hostile ACLs.
+        crate::engine_runtime::apply_protected_dacl_for_test(
+            path,
+            &format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA){extra}"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn shared_writable_and_unsupported_installed_acls_have_finite_refusal() {
+        for extra in [
+            "(A;;0x1301bf;;;AU)", // Authenticated Users Modify, observed failure
+            "(A;;GW;;;AU)",
+            "(A;;SD;;;AU)",
+            "(A;;WD;;;AU)",
+            "(A;;WO;;;AU)",
+            "(A;OIIO;GW;;;AU)", // Inheritance policy remains conservative.
+            "(D;;WD;;;AU)",     // Unsupported ACE kinds remain refused.
+        ] {
+            let fixture = Fixture::new();
+            let (m, _) = manifest();
+            let target = fixture.0.join("app");
+            populate(&target, &m);
+            fixture_acl(&target, extra);
+            assert_eq!(verify_tree(&target, &m, &[]).err(), Some(UNSAFE_LOCATION));
+            assert!(!target.join(MARKER).exists());
+            assert_eq!(
+                fs::read(target.join("routedeck.exe")).unwrap(),
+                b"synthetic fixture only routedeck.exe"
+            );
+        }
+        let fixture = Fixture::new();
+        let (m, _) = manifest();
+        let target = fixture.0.join("app");
+        populate(&target, &m);
+        fixture_acl(&target, "(A;;FR;;;AU)");
+        verify_tree(&target, &m, &[]).unwrap();
+        let root = DirectoryLease::pin_namespace(&target).unwrap();
+        assert_eq!(verify_private_directory(&root, true), Err(UNSAFE_LOCATION));
+    }
+
+    #[test]
+    fn unsafe_child_directory_or_file_is_refused_after_safe_root() {
+        for relative in ["engine", "routedeck.exe"] {
+            let fixture = Fixture::new();
+            let (m, _) = manifest();
+            let target = fixture.0.join("app");
+            populate(&target, &m);
+            fixture_acl(&target.join(relative), "(A;;GW;;;AU)");
+            assert_eq!(verify_tree(&target, &m, &[]).err(), Some(UNSAFE_LOCATION));
+        }
+    }
 }
