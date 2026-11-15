@@ -2,14 +2,19 @@
 
 ## Current workflow
 
-- Every branch push and pull request runs Windows CI. A newer push cancels an
-  older run for the same ref. CI does not create GitHub releases.
-- CI verifies synchronized versions, deterministic frontend/native tests, all
-  native targets, isolated browser scenarios, production frontend boundaries, GUI/helper provenance and ZIP
-  packaging. Dependency installation uses lock files and disables npm lifecycle
-  scripts. Reviewed VPN engines are acquired only in an explicit packaging step,
-  verified against committed size/SHA-256 pins, and never run by CI.
-  The pinned Playwright Chromium browser is acquired in an explicit test step.
+- Pull requests and pushes to `main` run Windows CI. Updating an open PR
+  cancels its older CI run. A push to a feature branch is checked through its
+  PR. Use **CI → Run workflow** to check a branch manually.
+- The required `build / windows` check validates versions and runs deterministic
+  frontend/native tests, all-target checks, isolated browser scenarios, and
+  packaging, provenance and publishing fixtures. It also validates the production
+  frontend bundle. Dependency installation uses lock files and disables npm
+  lifecycle scripts. Playwright acquires the pinned Chromium in its own step.
+- Pushes to `main` also build and package the complete portable distribution.
+  To test real packaging before a merge, choose the branch in **Run workflow**
+  and enable **Also build the full portable distribution**. The packaging steps
+  verify reviewed VPN engines against committed size/SHA-256 pins, collect the
+  notices and corresponding sources, and package the engines without executing them.
 - The Windows artifact is `RouteDeck-<version>-windows-x64.zip` with `SHA256SUMS.txt`.
   CI artifacts expire after one day; published release assets remain available.
   They contain the controller and its exact
@@ -18,9 +23,14 @@
   `docs/portable-full-release.txt`. Corresponding runtime source archives and an
   inventory are published alongside it. Source downloads are optional for users
   who only want to run the application.
-- A pushed `vX.Y.Z` tag runs the same build and publishes a stable GitHub Release
-  only after it succeeds. `vX.Y.Z-alpha.N`, `-beta.N`, and `-rc.N` publish GitHub
-  prereleases and do not become the stable latest release. The first public full
+- A pushed `vX.Y.Z` tag uses the unexpired portable artifact from a successful
+  push-triggered CI run on `main` for that exact commit. If that run is still
+  in progress, Release waits up to 30 minutes. If the artifact is unavailable,
+  Release runs the full build for the tag. Both paths check the source commit
+  and version inside the ZIP before signing or publishing. If a selected
+  artifact disappears before download, rerun all Release jobs to select again.
+  `vX.Y.Z-alpha.N`, `-beta.N`, and `-rc.N` publish GitHub prereleases and do
+  not become the stable latest release. The first public full
   portable is prepared as 0.1.1; the earlier 0.1.0 controller-only workflow was
   cancelled before publication. Its existing tag is preserved.
 - A tag must exactly match the versions in npm, Cargo and Tauri. Existing releases
@@ -41,9 +51,10 @@ git commit -m "Release 0.2.0-beta.1"
 git push
 ```
 
-The tool changes only the application version in five files, including both lock
-files; it does not resolve dependencies. Merge the reviewed change into `main` and
-wait for green CI. To publish that exact commit:
+The tool updates the application version in five files, including both lock
+files, without resolving dependencies. Merge the reviewed change into `main`.
+To publish that exact commit, push the version tag. Release can wait for the
+same commit's portable artifact while CI finishes.
 
 ```powershell
 git switch main
