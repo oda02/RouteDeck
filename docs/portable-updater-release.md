@@ -16,12 +16,15 @@
 2. `package-controller.ps1` проверяет хеши и embedded pins, собирает полный ZIP
    из явного списка файлов и повторно проверяет скопированные байты.
    `write-update-manifest.ps1` создаёт bounded дескриптор полного стабильного ZIP.
-3. Только tag workflow `release.yml` в `oda02/RouteDeck` получает секрет
+3. Перед подписью workflow проверяет версию и SHA коммита в манифесте внутри ZIP.
+   Готовый артефакт повторно используется только из успешного запуска CI по
+   пушу того же коммита в `main`. Резервная сборка запускается для самого тега.
+4. Только tag workflow `release.yml` в `oda02/RouteDeck` получает секрет
    `ROUTEDECK_UPDATE_SIGNING_KEY` в одном шаге подписи. PR/build jobs его не
    получают. Секрет — PKCS8 PEM Ed25519; не передавайте его через аргументы,
    временные файлы, логи или артефакты. Скрипт проверяет соответствие публичному
    ключу клиента и использует [встроенный crypto Node](https://nodejs.org/docs/latest-v24.x/api/crypto.html#cryptosignalgorithm-data-key-callback), без новых npm-зависимостей.
-4. Publisher повторно проверяет подпись, SHA-256 ZIP и каждый файл, точный набор
+5. Publisher повторно проверяет подпись, SHA-256 ZIP и каждый файл, точный набор
    release assets и checksums, затем вызывает `gh release create --verify-tag`.
    Существующий выпуск и файлы не перезаписываются. Запусков `gh` и выпуска
    из fixture-тестов нет: они полностью подменены.
