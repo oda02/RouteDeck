@@ -9,8 +9,8 @@ Built-in updates require folder and file permissions that prevent other users
 from modifying the bundle. Versions 0.1.3/0.1.4 need a one-time manual ZIP update
 to 0.1.5 because of a Windows working-directory sharing bug.
 The full portable includes the pinned
-sing-box/Cronet and Xray runtimes; no separate engine setup is required. The other
-source-code assets on the release page are optional downloads for source inspection.
+sing-box/Cronet and Xray runtimes; no separate engine setup is required.
+`SOURCE-CODE.txt` in the ZIP points to the corresponding runtime sources.
 Keep `engine` and `xray` beside the application. See
 [portable instructions](docs/portable-full-release.txt) for updating an existing copy.
 

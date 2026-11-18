@@ -32,6 +32,6 @@ sing-box, Cronet и Xray уже включены. Сохраните струк�
 
 LICENSES AND SOURCE
 Upstream runtime license files are preserved beside each engine. Controller
-and engine third-party notices are included. SOURCE-CODE.txt identifies the
-corresponding source materials available with this same GitHub release.
-SHA256SUMS.txt checks download integrity; it is not an independent signature.
+and engine third-party notices are included. SOURCE-CODE.txt links to the
+corresponding source materials for this version on GitHub.
+The GitHub release notes publish the SHA-256 checksum of the portable ZIP.

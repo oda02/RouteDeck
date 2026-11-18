@@ -20,7 +20,10 @@ Run `node scripts/collect-engine-distribution.mjs <outputDir>`. The explicit pac
 - checksum-verified source ZIPs, notice texts, and build-info provenance for every linked Go dependency embedded in the two reviewed executables;
 - `engine-distribution-inventory.json`, binding every file to its size and SHA-256 and binding the set to both runtime-lock byte hashes.
 
-Publish all source assets beside the portable ZIP on the same GitHub release. `SOURCE-CODE.txt` repeats that location for recipients of a detached ZIP.
+Publish the corresponding source assets and inventory on a public companion
+release under `sources-v<version>` before publishing the portable ZIP. The app
+release notes link to that exact source release next to the portable download.
+`SOURCE-CODE.txt` provides the same link to recipients of a detached ZIP.
 
 sing-box and cronet-go identify as GPL-3.0-or-later. NaiveProxy and Chromium use BSD-style licensing and require preserved notices. Xray-core uses MPL-2.0 and its exact source tree is included. Ordinary unmodified general-purpose compiler or build-tool source is not added merely because it built an upstream binary.
 
