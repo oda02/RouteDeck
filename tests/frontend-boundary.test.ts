@@ -25,13 +25,23 @@ async function withPreferenceStorage(body: (storage: Map<string, string>, faults
   finally { if (previous) Object.defineProperty(globalThis, "window", previous); else Reflect.deleteProperty(globalThis, "window"); }
 }
 
+const savedUrlFixture = "https://provider.invalid/subscription?token=original-fixture";
+
 async function lifecycleFixture(connected = true, protocol = "vless") {
   const calls: Array<{ command: string; arguments_?: Record<string, unknown> }> = [];
   let revision = 0;
   const sourceId = "a".repeat(32);
   let nodes = ["a", "b", "c"].map((id) => ({ id, displayName: `Server ${id}`, protocol, insecureTls: false,
     sourceId: id === "c" ? "b".repeat(32) : sourceId, sourceName: id === "c" ? "Other" : "Subscription", sourceKind: "subscription", sourceRefreshable: true, sourceUpdatedAtMs: 100 }));
-  const hooks: { stop?: () => Promise<unknown>; start?: () => Promise<unknown>; refresh?: () => Promise<unknown>; switch?: (nodeId: string) => Promise<unknown> } = {};
+  let savedUrl = savedUrlFixture;
+  const hooks: {
+    stop?: () => Promise<unknown>;
+    start?: () => Promise<unknown>;
+    refresh?: () => Promise<unknown>;
+    switch?: (nodeId: string) => Promise<unknown>;
+    readSubscription?: () => Promise<unknown>;
+    editSubscription?: () => Promise<unknown>;
+  } = {};
   const status = (phase: RuntimeStatusDto["phase"], nodeId = "a") => ({ ...runtimeStatus(++revision, phase), ...(phase === "disconnected" ? {} : { nodeId }) });
   const transport: TauriTransport = {
     listen: async () => () => undefined,
@@ -46,6 +56,14 @@ async function lifecycleFixture(connected = true, protocol = "vless") {
         if (hooks.refresh) return hooks.refresh();
         nodes = nodes.map((node) => node.sourceId === sourceId ? { ...node, sourceUpdatedAtMs: 200 } : node);
         return { imported: 2, nodeIds: ["a", "b"] };
+      }
+      if (command === "get_subscription_url") return hooks.readSubscription ? hooks.readSubscription() : savedUrl;
+      if (command === "edit_subscription") {
+        if (hooks.editSubscription) return hooks.editSubscription();
+        const name = arguments_?.name as string;
+        nodes = nodes.map((node) => node.sourceId === arguments_?.sourceId ? { ...node, sourceName: name } : node);
+        if (typeof arguments_?.url === "string") savedUrl = arguments_.url;
+        return null;
       }
       if (command === "remove_source") { nodes = nodes.filter((node) => node.sourceId !== arguments_?.sourceId); return null; }
       if (command === "retry_session_recovery") return status("disconnected");
@@ -71,6 +89,7 @@ import {
   parseDiagnostics,
   parseRunningApplications,
   parseRuntimeStatus,
+  parseSavedSubscriptionUrl,
   parseUnitResponse,
   type RuntimeStatusDto,
 } from "../src/tauriContract.ts";
@@ -1712,6 +1731,80 @@ test("replacement subscription URL is passed only to typed IPC and never retaine
   assert.doesNotMatch(JSON.stringify(f.controller.getSnapshot()), /private-fixture|fixture\.invalid/);
   assert.doesNotMatch(f.controller.getSanitizedReport(), /private-fixture|fixture\.invalid/);
   f.controller.dispose();
+});
+
+test("saved subscription URL responses preserve the URL and reject malformed values without echoing them", () => {
+  assert.equal(parseSavedSubscriptionUrl(null), null);
+  assert.equal(parseSavedSubscriptionUrl(savedUrlFixture), savedUrlFixture);
+  const prefix = "https://provider.invalid/";
+  const maximum = `${prefix}${"x".repeat(4096 - prefix.length)}`;
+  assert.equal(parseSavedSubscriptionUrl(maximum), maximum);
+  for (const value of [undefined, { url: savedUrlFixture }, "", "http://provider.invalid/", "https://", "https://user:secret@provider.invalid/", "https://provider.invalid/#secret", `${maximum}é`]) {
+    assert.throws(() => parseSavedSubscriptionUrl(value), (error: unknown) => {
+      assert.ok(error instanceof ContractViolation);
+      assert.doesNotMatch(error.message, /provider\.invalid|secret|original-fixture/);
+      return true;
+    });
+  }
+});
+
+test("reading and editing a connected subscription use typed IPC without changing the session or exposing URLs in public state", async () => {
+  await withPreferenceStorage(async (storage) => {
+    const f = await lifecycleFixture();
+    const before = f.controller.getSnapshot();
+    const publishedSnapshots: string[] = [];
+    f.controller.subscribe(() => publishedSnapshots.push(JSON.stringify(f.controller.getSnapshot())));
+    const replacementUrl = "https://new-provider.invalid/subscription?token=replacement-fixture";
+    try {
+      assert.equal(await f.controller.getSubscriptionUrl(f.sourceId), savedUrlFixture);
+      await f.controller.editSubscription(f.sourceId, "Renamed subscription");
+      assert.equal(await f.controller.getSubscriptionUrl(f.sourceId), savedUrlFixture);
+      await f.controller.editSubscription(f.sourceId, "Renamed subscription", replacementUrl);
+      assert.equal(await f.controller.getSubscriptionUrl(f.sourceId), replacementUrl);
+      assert.deepEqual(f.calls, [
+        { command: "get_subscription_url", arguments_: { sourceId: f.sourceId } },
+        { command: "edit_subscription", arguments_: { sourceId: f.sourceId, name: "Renamed subscription" } },
+        { command: "confirmed_nodes", arguments_: undefined },
+        { command: "get_subscription_url", arguments_: { sourceId: f.sourceId } },
+        { command: "edit_subscription", arguments_: { sourceId: f.sourceId, name: "Renamed subscription", url: replacementUrl } },
+        { command: "confirmed_nodes", arguments_: undefined },
+        { command: "get_subscription_url", arguments_: { sourceId: f.sourceId } },
+      ]);
+      const after = f.controller.getSnapshot();
+      assert.equal(after.phase, "connected");
+      assert.equal(after.activeServerId, before.activeServerId);
+      assert.equal(after.selectedServerId, before.selectedServerId);
+      assert.equal(before.servers.find((server) => server.id === before.activeServerId)?.latencyMs, 42);
+      assert.deepEqual(after.servers, before.servers.map((server) => server.sourceId === f.sourceId ? { ...server, source: "Renamed subscription" } : server));
+      for (const output of [...publishedSnapshots, JSON.stringify(after), f.controller.getSanitizedReport(), ...storage.values()]) {
+        assert.doesNotMatch(output, /provider\.invalid|original-fixture|replacement-fixture/);
+      }
+    } finally { f.controller.dispose(); }
+  });
+});
+
+test("malformed subscription read and edit replies fail closed without publishing secrets", async () => {
+  for (const operation of ["read", "edit"] as const) {
+    const f = await lifecycleFixture();
+    const reply = async () => ({ url: savedUrlFixture });
+    f.hooks.readSubscription = reply;
+    f.hooks.editSubscription = reply;
+    try {
+      await assert.rejects(
+        operation === "read" ? f.controller.getSubscriptionUrl(f.sourceId) : f.controller.editSubscription(f.sourceId, "Renamed subscription"),
+        (error: unknown) => {
+          assert.ok(error instanceof RouteDeckError);
+          assert.equal(error.code, "backend-response-invalid");
+          assert.doesNotMatch(JSON.stringify(toPublicActionError(error)), /provider\.invalid|original-fixture/);
+          return true;
+        },
+      );
+      assert.equal(f.controller.getSnapshot().backendAvailable, false);
+      assert.deepEqual(f.calls.map((call) => call.command), [operation === "read" ? "get_subscription_url" : "edit_subscription"]);
+      assert.doesNotMatch(JSON.stringify(f.controller.getSnapshot()), /provider\.invalid|original-fixture/);
+      assert.doesNotMatch(f.controller.getSanitizedReport(), /provider\.invalid|original-fixture/);
+    } finally { f.controller.dispose(); }
+  }
 });
 
 test("incomplete source refresh uses localized copy and keeps the prior library", async () => {

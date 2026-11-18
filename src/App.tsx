@@ -3,11 +3,13 @@ import {
   useDeferredValue,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   useSyncExternalStore,
   type ReactNode,
+  type CSSProperties,
 } from "react";
 import { createPortal } from "react-dom";
 import { controller } from "./controller";
@@ -29,6 +31,7 @@ import {
   ImportIcon,
   InfoIcon,
   LoaderIcon,
+  MoreIcon,
   PlusIcon,
   RefreshIcon,
   RoutingIcon,
@@ -59,7 +62,7 @@ import {
   type TrafficRule,
 } from "./model";
 
-type DialogKind = "import" | "refresh-source" | "remove-source" | "reset" | "latency-info" | "clear-stale-proxy" | null;
+type DialogKind = "import" | "refresh-source" | "edit-source" | "remove-source" | "reset" | "latency-info" | "clear-stale-proxy" | null;
 type ImportKind = "manual" | "subscription";
 type ToastKind = "success" | "info" | "warning";
 type ToastState = { message: string; kind: ToastKind };
@@ -145,7 +148,12 @@ function StatusBadge({ phase }: { phase: ConnectionPhase }) {
 
 function Navigation({ active, onNavigate, variant }: { active: Destination; onNavigate: (destination: Destination) => void; variant: "rail" | "bottom" }) {
   return (
-    <nav className={`navigation navigation-${variant}`} aria-label="Основная навигация">
+    <nav
+      className={`navigation navigation-${variant}`}
+      aria-label="Основная навигация"
+      style={variant === "bottom" ? { "--active-index": navigation.findIndex((item) => item.id === active) } as CSSProperties : undefined}
+    >
+      {variant === "bottom" ? <span className="navigation-marker" aria-hidden="true"><span key={active} /></span> : null}
       {navigation.map((item, index) => {
         const Icon = item.icon;
         const selected = item.id === active;
@@ -156,6 +164,7 @@ function Navigation({ active, onNavigate, variant }: { active: Destination; onNa
             type="button"
             aria-current={selected ? "page" : undefined}
             aria-label={`${item.label}, Alt+${index + 1}`}
+            aria-keyshortcuts={`Alt+${index + 1}`}
             title={`${item.label} · Alt+${index + 1}`}
             onClick={() => onNavigate(item.id)}
           >
@@ -257,9 +266,12 @@ function SegmentedControl<T extends string>({ label, value, options, onChange, d
   disabled?: boolean;
 }) {
   const groupName = useId();
+  const selectedIndex = options.findIndex((option) => option.value === value);
   return (
-    <fieldset className="segmented-control" aria-label={label} data-count={options.length}>
+    <fieldset className="segmented-control" aria-label={label} disabled={disabled} data-count={options.length}
+      style={{ "--segment-count": options.length, "--segment-index": selectedIndex } as CSSProperties}>
       <legend className="sr-only">{label}</legend>
+      {selectedIndex >= 0 ? <span className="segmented-marker" aria-hidden="true" /> : null}
       {options.map((option) => (
         <label key={option.value} data-selected={value === option.value} data-disabled={disabled || option.disabled || undefined}>
           <input
@@ -293,30 +305,36 @@ function HomePage({ snapshot, libraryBusy, headingRef, onNavigate, onModeChange,
 }) {
   const server = snapshot.servers.find((item) => item.id === snapshot.selectedServerId);
   const activeServer = snapshot.servers.find((item) => item.id === snapshot.activeServerId);
-  const pending = (Boolean(snapshot.switching) && !libraryBusy) || pendingPhases.includes(snapshot.phase);
+  const switching = Boolean(snapshot.switching) && !libraryBusy;
+  const pending = switching || pendingPhases.includes(snapshot.phase);
   const connected = snapshot.phase === "connected" && !pending;
   const active = Boolean(snapshot.connectionRequested) || Boolean(snapshot.activeServerId) || ["connected", "degraded", "blocked-by-conflict"].includes(snapshot.phase);
   const mode = snapshot.activeMode ?? snapshot.mode;
   const liveLatency = connected && activeServer?.latencyState === "ready" ? activeServer.latencyMs : undefined;
-  const status = pending ? "Переключаемся" : snapshot.connectionRequested && snapshot.phase !== "connected" && snapshot.phase !== "recovery-required" ? snapshot.reconnectPaused ? "Нужно ваше действие" : "Восстанавливаем соединение" : phaseLabels[snapshot.phase];
-  const boundaryNotice = !snapshot.backendAvailable && !snapshot.isDemo;
   const recoveryRequired = snapshot.phase === "recovery-required";
+  const status = switching && !pendingPhases.includes(snapshot.phase) ? "Переключаемся" : pending ? phaseLabels[snapshot.phase] : snapshot.connectionRequested && snapshot.phase !== "connected" && snapshot.phase !== "recovery-required" ? snapshot.reconnectPaused ? "Нужно ваше действие" : "Восстанавливаем соединение" : phaseLabels[snapshot.phase];
+  const statusDetail = pending ? switching ? "Применяем выбранное подключение" : null : recoveryRequired ? "Новое подключение заблокировано до восстановления" : connected ? `${mode === "tun" ? "TUN" : "Системный прокси"} · маршрут проверен` : active ? "Соединение требует внимания" : snapshot.phase === "failed" ? "Соединение не установлено" : "Готов к подключению";
+  const boundaryNotice = !snapshot.backendAvailable && !snapshot.isDemo;
   return (
     <div className="page home-page">
       <h1 className="sr-only" ref={headingRef} tabIndex={-1}>Главная</h1>
       <ActionFailureNotice failure={recoveryRequired ? null : actionFailure} page="home" onClear={onClearFailure} />
       {recoveryRequired && snapshot.notice ? <OpaqueNotice notice={actionFailure?.page === "home" ? { ...snapshot.notice, title: actionFailure.notice.title, body: actionFailure.notice.body } : snapshot.notice} secondaryAction={{ label: "Диагностика", onClick: () => onNavigate("diagnostics") }} /> : null}
       <section className="connection-hero" data-state={connected ? "connected" : pending ? "pending" : snapshot.phase === "failed" ? "failed" : "idle"} aria-label="Подключение">
-        <div className="hero-topline"><span className="eyebrow">ВАШЕ ПОДКЛЮЧЕНИЕ</span><span className="connection-live-dot" aria-hidden="true" /></div>
         <div className="hero-status-row">
-          <span className="hero-symbol">{pending ? <LoaderIcon size={32} /> : <ShieldIcon size={32} />}</span>
-          <div className="hero-status-copy"><h2 aria-live="polite">{status}</h2><p>{pending ? phaseLabels[snapshot.phase] : recoveryRequired ? "Новое подключение заблокировано до восстановления" : connected ? `${mode === "tun" ? "TUN" : "Системный прокси"} · маршрут проверен` : active ? "Соединение требует внимания" : snapshot.phase === "failed" ? "Соединение не установлено" : "Готов к подключению"}</p></div>
+          <div className="hero-status-copy"><p className="eyebrow">Подключение</p><h2>{status}</h2>{statusDetail ? <p>{statusDetail}</p> : null}</div>
+          <span className="hero-symbol" aria-hidden="true">{pending ? <LoaderIcon size={30} /> : <ShieldIcon size={30} />}</span>
         </div>
-        <div className="connection-current">
-          <span>{activeServer ? "Сейчас используется" : "Сервер для подключения"}</span>
-          <strong>{activeServer?.name ?? server?.name ?? "Добавьте первый сервер"}</strong>
-          <span>{activeServer?.source ?? server?.source ?? "Подписка или отдельная ссылка"}</span>
-        </div>
+        {activeServer && activeServer.id !== server?.id ? <div className="connection-current">
+          <span>Сейчас используется</span>
+          <strong>{activeServer.name}</strong>
+          <span>{activeServer.source}</span>
+        </div> : null}
+        <button className="selection-card server-choice" type="button" onClick={() => onNavigate("servers")}>
+          <span className="selection-leading"><ServersIcon size={20} /></span>
+          <span className="selection-copy"><span className="selection-label">{pending ? "Переключаем на" : "Выбранный сервер"}</span><strong>{server?.name ?? "Выбрать сервер"}</strong><span>{server ? `${server.protocol} · ${server.source}` : "Добавить или выбрать из библиотеки"}</span></span>
+          <ChevronRightIcon size={20} />
+        </button>
         <button className={`primary-button connection-button${active || pending ? " disconnect-button" : ""}`} type="button"
           disabled={boundaryNotice || (!server && !active && !pending && !recoveryRequired) || snapshot.phase === "disconnecting" || (recoveryRequired && pending)}
           onClick={recoveryRequired ? onRetry : active || pending ? onDisconnect : onConnect}>
@@ -332,15 +350,10 @@ function HomePage({ snapshot, libraryBusy, headingRef, onNavigate, onModeChange,
           <span>{connected ? liveLatency === undefined ? "Ожидаем замер" : "Обновляется автоматически" : "Замер после подключения"}</span>
         </div>
       </section>
-      <button className="selection-card server-choice" type="button" onClick={() => onNavigate("servers")}>
-        <span className="selection-leading"><ServersIcon size={20} /></span>
-        <span className="selection-copy"><span className="selection-label">{pending ? "Переключаем на" : "Выбранный сервер"}</span><strong>{server?.name ?? "Выбрать сервер"}</strong><span>{server ? `${server.protocol} · ${server.source}` : "Добавить или выбрать из библиотеки"}</span></span>
-        <ChevronRightIcon size={20} />
-      </button>
       <section className="mode-section" aria-labelledby="connection-mode-title">
-        <div className="section-heading compact-heading"><h2 id="connection-mode-title">Режим подключения</h2><span className="field-help">Автопереключение</span></div>
+        <div className="section-heading compact-heading"><h2 id="connection-mode-title">Режим подключения</h2></div>
         <SegmentedControl label="Режим подключения" value={snapshot.mode} options={[{ value: "proxy", label: "Системный прокси" }, { value: "tun", label: "TUN" }]} onChange={onModeChange} disabled={boundaryNotice} />
-        <p className="mode-explanation">{snapshot.mode === "tun" ? "Трафик устройства через TUN. Windows запросит права при подключении." : "Для приложений с поддержкой прокси Windows. UDP и системный DNS не перехватываются."}</p>
+        <p className="mode-explanation" key={snapshot.mode}>{snapshot.mode === "tun" ? "Трафик устройства через TUN. Windows запросит права при подключении." : "Для приложений с поддержкой прокси Windows. UDP и системный DNS не перехватываются."}</p>
       </section>
       {snapshot.notice && !recoveryRequired && actionFailure?.page !== "home" ? <OpaqueNotice notice={snapshot.notice} onClose={boundaryNotice ? undefined : controller.dismissNotice} primaryAction={boundaryNotice ? undefined : { label: "Повторить", onClick: onRetry }} secondaryAction={{ label: "Диагностика", onClick: () => onNavigate("diagnostics") }} /> : null}
       <button className="summary-card routing-shortcut" type="button" onClick={() => onNavigate("routing")}><RoutingIcon size={19} /><span className="selection-copy"><strong>Правила маршрутизации</strong><span>{snapshot.routing.defaultRoute === "vpn" ? "По умолчанию через VPN" : "По умолчанию напрямую"} · исключений: {snapshot.routing.apps.filter((app) => app.route !== "inherit" && app.route !== snapshot.routing.defaultRoute).length}</span></span><ChevronRightIcon size={18} /></button>
@@ -348,7 +361,7 @@ function HomePage({ snapshot, libraryBusy, headingRef, onNavigate, onModeChange,
   );
 }
 
-function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onSelect, picking, onBack, onRefresh, onRemove, sourceBusy, actionFailure, onClearFailure }: {
+function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onSelect, picking, onBack, onRefresh, onEdit, onRemove, sourceBusy, actionFailure, onClearFailure }: {
   snapshot: ControllerSnapshot;
   headingRef: React.RefObject<HTMLHeadingElement | null>;
   search: string;
@@ -358,6 +371,7 @@ function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onSelec
   picking: boolean;
   onBack: () => void;
   onRefresh: (server: Server) => void;
+  onEdit: (server: Server) => void;
   onRemove: (server: Server) => void;
   sourceBusy: boolean;
   actionFailure: ActionFailure | null;
@@ -370,6 +384,52 @@ function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onSelec
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
   const [visibleCounts, setVisibleCounts] = useState<Record<string, number>>({});
   const groupIdPrefix = useId();
+  const selectedMark = useRef<HTMLSpanElement>(null);
+  const previousMark = useRef<HTMLSpanElement | null>(null);
+  const selectionTravel = useRef<{ animation: Animation; group: HTMLElement } | null>(null);
+
+  useLayoutEffect(() => {
+    const mark = selectedMark.current;
+    const previous = previousMark.current;
+    previousMark.current = mark;
+    const row = mark?.parentElement;
+    const previousRow = previous?.parentElement;
+    const group = row?.parentElement;
+    const origin = previous?.getBoundingClientRect();
+    const travel = selectionTravel.current;
+    if (travel) {
+      travel.animation.cancel();
+      delete travel.group.dataset.selectionTravel;
+      selectionTravel.current = null;
+    }
+    if (!mark || !row || !previousRow || !origin || !group || row === previousRow
+      || group !== previousRow.parentElement || group.parentElement?.dataset.expanded !== "true"
+      || window.matchMedia("(prefers-reduced-motion: reduce), (forced-colors: active)").matches) return;
+
+    const viewport = group.closest(".app-main")?.getBoundingClientRect();
+    const dock = group.closest(".app-shell")?.querySelector(".navigation-bottom")?.getBoundingClientRect();
+    const from = previousRow.getBoundingClientRect();
+    const to = row.getBoundingClientRect();
+    if (!viewport || !from.height || !to.height || !origin.height) return;
+    const bottom = dock?.height ? Math.min(viewport.bottom, dock.top) : viewport.bottom;
+    // A short move is legible only when both rows are in view.
+    if (Math.min(from.top, to.top) < viewport.top || Math.max(from.bottom, to.bottom) > bottom
+      || Math.abs(from.top - to.top) > 2.5 * Math.max(from.height, to.height)) return;
+
+    const offsetY = (origin.top - to.top) * row.offsetHeight / to.height;
+    group.dataset.selectionTravel = "true";
+    const animation = mark.animate([
+      { transform: `translateY(${offsetY}px) scaleY(${origin.height / to.height})` },
+      { transform: "none" },
+    ], { duration: 210, easing: "cubic-bezier(.2, .8, .2, 1)" });
+    selectionTravel.current = { animation, group };
+    animation.onfinish = () => {
+      if (selectionTravel.current?.animation !== animation) return;
+      delete group.dataset.selectionTravel;
+      selectionTravel.current = null;
+    };
+  }, [snapshot.selectedServerId, search]);
+
   useEffect(() => {
     setCollapsedGroups(new Set());
     setVisibleCounts({});
@@ -386,16 +446,16 @@ function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onSelec
   }, [filtered]);
 
   return (
-    <div className="page">
+    <div className="page servers-page">
       <div className="page-title-row">
-        <div><p className="overline">{picking ? "Выбор подключения" : "Моя библиотека"}</p><h1 ref={headingRef} tabIndex={-1}>{picking ? "Выбрать сервер" : "Серверы"}</h1></div>
+        <h1 ref={headingRef} tabIndex={-1}>{picking ? "Выбрать сервер" : "Серверы"}</h1>
         <span className="count-badge">{snapshot.servers.length}</span>
       </div>
       {picking ? <button type="button" className="text-button picker-back" onClick={onBack}>← Назад к подключению</button> : null}
       <ActionFailureNotice failure={actionFailure} page="servers" onClear={onClearFailure} />
       <div className="server-add-actions">
         <button className="primary-button" type="button" disabled={sourceBusy} onClick={() => onImport("manual")}><PlusIcon size={20} />Добавить сервер</button>
-        <button className="secondary-button" type="button" disabled={sourceBusy} onClick={() => onImport("subscription")}><ImportIcon size={20} />Подписка</button>
+        <button className="secondary-button" type="button" disabled={sourceBusy} onClick={() => onImport("subscription")}><ImportIcon size={20} />Добавить подписку</button>
       </div>
       <div className="toolbar">
         <label className="search-field">
@@ -404,55 +464,62 @@ function ServersPage({ snapshot, headingRef, search, onSearch, onImport, onSelec
           <input value={search} type="search" placeholder="Имя, протокол или группа" onChange={(event) => onSearch(event.target.value)} />
         </label>
       </div>
-      <div className="subscription-meta">
+      {search || snapshot.switching || sourceBusy || picking ? <div className="subscription-meta">
         <span>{filtered.length} из {snapshot.servers.length} серверов</span>
-        <span>{snapshot.switching ? "Переключение…" : sourceBusy ? "Обновление библиотеки…" : picking ? "После выбора вернёмся на главную" : "Выбор применяется автоматически"}</span>
-      </div>
+        {snapshot.switching || sourceBusy || picking ? <span>{snapshot.switching ? "Переключение…" : sourceBusy ? "Обновление библиотеки…" : "После выбора вернёмся на главную"}</span> : null}
+      </div> : null}
       {snapshot.activeMode === "tun" ? <details className="routing-scope"><summary>Как меняется сервер в TUN</summary><p>Новые соединения пойдут через выбранный сервер после проверки. Уже открытые продолжат работать через прежний сервер, пока он доступен. TUN не перезапускается. Обновлённые или добавленные серверы загружаются при следующем подключении.</p></details> : null}
       <div className="server-list" role="radiogroup" aria-label="Выбор сервера">
         {filtered.length ? groups.map(([groupId, group], index) => {
           const expanded = !collapsedGroups.has(groupId);
           const visibleCount = Object.hasOwn(visibleCounts, groupId) ? visibleCounts[groupId] : 100;
           const panelId = `${groupIdPrefix}-${index}`;
+          const source = group.servers[0];
+          const sourceLabel = group.kind === "manual" ? "Добавлено вручную" : source.sourceRefreshable ? "Подписка по ссылке" : "Подписка без ссылки";
+          const updated = source.sourceUpdatedAtMs ? new Date(source.sourceUpdatedAtMs).toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" }) : null;
           return <section className="server-group" key={groupId}>
             <div className="source-heading"><h2><button className="server-group-toggle" type="button" aria-expanded={expanded} aria-controls={panelId} onClick={() => setCollapsedGroups((current) => {
               const next = new Set(current);
               if (next.has(groupId)) next.delete(groupId); else next.add(groupId);
               return next;
             })}>
-              <ChevronRightIcon size={18} />
-              <span className="server-group-copy"><strong>{group.name}</strong><span>{group.kind === "manual" ? "Добавлено вручную" : group.servers[0].sourceUpdatedAtMs ? `Обновлено ${new Date(group.servers[0].sourceUpdatedAtMs).toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" })}` : "Подписка"}</span></span>
+              <span className="section-icon">{group.kind === "manual" ? <ServersIcon size={18} /> : <ImportIcon size={18} />}</span>
+              <span className="server-group-copy"><strong>{group.name}</strong><span>{sourceLabel}{group.kind === "subscription" && updated ? ` · ${updated}` : ""}</span></span>
               <span className="count-badge">{group.servers.length}</span>
+              <ChevronRightIcon size={16} />
             </button></h2>
-            {group.servers[0].sourceId ? <div className="source-actions">
-              {group.kind === "subscription" ? <button className="icon-button" type="button" disabled={sourceBusy} aria-label={`Обновить подписку ${group.name}`} title="Обновить подписку" onClick={() => onRefresh(group.servers[0])}><RefreshIcon size={18} /></button> : null}
-              <button className="icon-button" type="button" disabled={sourceBusy} aria-label={`Удалить группу ${group.name}`} title="Удалить группу" onClick={() => onRemove(group.servers[0])}><TrashIcon size={18} /></button>
+            {source.sourceId ? <div className="source-actions">
+              {group.kind === "subscription" ? <>
+                <button className="icon-button" type="button" disabled={sourceBusy} aria-label={`Обновить подписку ${group.name}`} title="Обновить подписку" onClick={() => onRefresh(source)}><RefreshIcon size={18} /></button>
+                <button className="icon-button" type="button" disabled={sourceBusy} aria-haspopup="dialog" aria-label={`Действия подписки ${group.name}`} title="Действия подписки" onClick={() => onEdit(source)}><MoreIcon size={19} /></button>
+              </> : <button className="icon-button" type="button" disabled={sourceBusy} aria-label={`Удалить группу ${group.name}`} title="Удалить группу" onClick={() => onRemove(source)}><TrashIcon size={18} /></button>}
             </div> : null}</div>
-            <div id={panelId} className="server-group-rows" hidden={!expanded}>
-            {group.servers.slice(0, visibleCount).map((server) => {
-          const selected = server.id === snapshot.selectedServerId;
-          const latency = server.latencyState === "pending" ? "Проверка…" : server.latencyState === "timeout" ? "Тайм-аут" : server.latencyState === "unavailable" ? "—" : `${server.latencyMs} мс`;
-          return (
-            <label
-              className="server-row"
-              data-selected={selected}
-              key={server.id}
-            >
-              <input className="control-input" type="radio" name="selected-server" value={server.id} checked={selected} onClick={() => { if (selected) onSelect(server.id); }} onChange={() => onSelect(server.id)} />
-              <span className="radio-indicator" aria-hidden="true"><span /></span>
-              <span className="protocol-mark" aria-hidden="true">{server.protocol.slice(0, 1)}</span>
-              <span className="server-copy">
-                <strong title={server.name}>{server.name}</strong>
-                <span>{server.protocol}{server.protocol === "Naive" ? snapshot.routing.naiveUdpOverTcp ? " · UoT v2 включён" : " · TCP без UDP" : ""}{server.id === snapshot.activeServerId ? " · Активен" : ""}</span>
-              </span>
-              <span className="latency" data-state={server.latencyState}>
-                <strong>{latency}</strong>
-                <span title="Отклик Google через выбранный VPN на установленном соединении">{server.latencyMs !== undefined && server.latencyState === "ready" ? "Google" : "не измерено"}</span>
-              </span>
-            </label>
-          );
-            })}
-            {group.servers.length > visibleCount ? <button className="secondary-button" type="button" onClick={() => setVisibleCounts((current) => ({ ...current, [groupId]: visibleCount + 100 }))}>Показать ещё · осталось {group.servers.length - visibleCount}</button> : null}
+            <div id={panelId} className="server-group-panel" data-expanded={expanded} inert={!expanded}>
+              <div className="server-group-rows">
+                {group.servers.slice(0, visibleCount).map((server) => {
+                  const selected = server.id === snapshot.selectedServerId;
+                  const unavailable = server.latencyState === "unavailable";
+                  const latency = server.latencyState === "pending" ? "Проверка…" : server.latencyState === "timeout" ? "Тайм-аут" : unavailable ? "—" : `${server.latencyMs} мс`;
+                  return (
+                    <label className="server-row" data-selected={selected} key={server.id}>
+                      <span className="server-row-highlight" ref={selected ? selectedMark : undefined} aria-hidden="true" />
+                      <input className="control-input" type="radio" name="selected-server" value={server.id} checked={selected} onClick={() => { if (selected) onSelect(server.id); }} onChange={() => onSelect(server.id)} />
+                      <span className="protocol-mark" data-protocol={server.protocol} aria-hidden="true">{server.protocol.slice(0, 1)}</span>
+                      <span className="server-copy">
+                        <strong title={server.name}>{server.name}</strong>
+                        <span>{server.protocol}{server.protocol === "Naive" ? snapshot.routing.naiveUdpOverTcp ? " · UoT v2 включён" : " · TCP без UDP" : ""}{server.id === snapshot.activeServerId ? " · Активен" : ""}</span>
+                      </span>
+                      <span className="latency" data-state={server.latencyState}>
+                        <strong aria-hidden={unavailable || undefined}>{latency}</strong>
+                        {unavailable ? <span className="sr-only">Отклик не измерен</span> : null}
+                        {server.latencyMs !== undefined && server.latencyState === "ready" ? <span title="Отклик Google через выбранный VPN на установленном соединении">Google</span> : null}
+                      </span>
+                      <span className="radio-indicator" aria-hidden="true"><span /></span>
+                    </label>
+                  );
+                })}
+                {group.servers.length > visibleCount ? <button className="secondary-button" type="button" onClick={() => setVisibleCounts((current) => ({ ...current, [groupId]: visibleCount + 100 }))}>Показать ещё · осталось {group.servers.length - visibleCount}</button> : null}
+              </div>
             </div>
           </section>;
         }) : <div className="empty-state"><ServersIcon size={24} /><strong>{snapshot.servers.length ? "Ничего не найдено" : "Добавьте первый сервер"}</strong><span>{snapshot.servers.length ? "Попробуйте другое имя, протокол или группу." : "Вставьте ссылку сервера или добавьте подписку от провайдера."}</span></div>}
@@ -592,17 +659,18 @@ function RoutingPage({ snapshot, headingRef, draft, onDraftChange, saveState }: 
           {saveState.error ? <p role="alert">{saveState.error}</p> : null}
         </div>
       </div>
-      <section className="card routing-apply-bar" aria-label="Применение правил">
+      <section className="card route-default">
+        <span className="section-icon"><RoutingIcon size={20} /></span>
+        <label htmlFor="default-route"><strong>Остальной трафик</strong><small>Приложения ниже — исключения</small></label>
+        <ThemedSelect id="default-route" label="Остальной трафик" value={draft.defaultRoute} onChange={(value) => onDraftChange({ ...draft, defaultRoute: value as RoutingConfig["defaultRoute"] })}
+          options={[{ value: "vpn", label: "Через VPN" }, { value: "direct", label: "Напрямую" }]} />
+      </section>
+      <section className="card routing-apply-bar" data-pending={saveState.pending} aria-label="Применение правил">
         <p>{saveState.pending ? "Черновик правил" : "Все изменения применяются вместе"}<small>Активное соединение переподключится один раз.</small></p>
         <div className="routing-apply-actions">
           <button className="secondary-button" type="button" aria-label="Отменить изменения" disabled={!saveState.pending || saveState.running} onClick={saveState.discard}>Отменить</button>
           <button className="primary-button" type="button" disabled={!saveState.pending || saveState.running} aria-busy={saveState.running} onClick={() => { void saveState.apply(); }}>{saveState.running ? "Применяем…" : saveState.error ? "Повторить применение" : "Применить правила"}</button>
         </div>
-      </section>
-      <section className="card route-default">
-        <label htmlFor="default-route"><strong>Остальной трафик</strong><small>Приложения ниже — исключения</small></label>
-        <ThemedSelect id="default-route" label="Остальной трафик" value={draft.defaultRoute} onChange={(value) => onDraftChange({ ...draft, defaultRoute: value as RoutingConfig["defaultRoute"] })}
-          options={[{ value: "vpn", label: "Через VPN" }, { value: "direct", label: "Напрямую" }]} />
       </section>
 
       <details className="routing-scope"><summary>{snapshot.mode === "tun" ? "TUN · трафик Windows" : "Системный прокси · ограниченный охват"}</summary><p>{snapshot.mode === "tun" ? "Правила охватывают трафик Windows." : "Только TCP приложений, использующих прокси Windows. Для остальных приложений и UDP нужен TUN."} Для сохранения изменений нажмите «Применить правила». До применения действуют сохранённые правила. Черновик сохраняется при переходе между страницами; при закрытии приложения он сбрасывается.</p></details>
@@ -739,14 +807,10 @@ function SettingsPage({ headingRef, draft, onDraftChange, onReset, saveState, re
     <div className="page settings-page">
       <div className="page-title-row"><h1 ref={headingRef} tabIndex={-1}>Настройки</h1><SaveState state={saveState} /></div>
       <ActionFailureNotice failure={actionFailure} page="settings" onClear={onClearFailure} />
-      <section className="card settings-group lean-settings">
-        <h2>Интерфейс</h2>
-        <label className="field-row"><span><strong>Тема</strong></span><ThemedSelect label="Тема" value={draft.theme} onChange={(value) => onDraftChange({ ...draft, theme: value as SettingsConfig["theme"] })} options={[{ value: "dark", label: "Тёмная" }, { value: "light", label: "Светлая" }, { value: "system", label: "Как в Windows" }]} /></label>
-      </section>
-      <section className="card settings-group lean-settings">
-        <h2>Подписки</h2>
-        <label className="field-row"><span><strong>Автообновление</strong></span><ThemedSelect label="Автообновление подписок" value={String(draft.subscriptionRefreshHours)} onChange={(value) => onDraftChange({ ...draft, subscriptionRefreshHours: Number(value) as SettingsConfig["subscriptionRefreshHours"] })} options={[{ value: "0", label: "Выключено" }, { value: "6", label: "Раз в 6 часов" }, { value: "24", label: "Раз в сутки" }]} /></label>
-        <p className="settings-explanation">Работает, пока RouteDeck открыт и отключён. Во время подключения обновление откладывается, чтобы не прерывать сеанс. Вручную обновить можно в списке серверов.</p>
+      <section className="card settings-group lean-settings preference-panel" aria-label="Интерфейс и подписки">
+        <div className="preference-row"><span className="section-icon"><SettingsIcon size={19} /></span><div><h2>Интерфейс</h2><p>Тема</p></div><ThemedSelect label="Тема" value={draft.theme} onChange={(value) => onDraftChange({ ...draft, theme: value as SettingsConfig["theme"] })} options={[{ value: "dark", label: "Тёмная" }, { value: "light", label: "Светлая" }, { value: "system", label: "Как в Windows" }]} /></div>
+        <div className="preference-row"><span className="section-icon"><RefreshIcon size={18} /></span><div><h2>Подписки</h2><p>Автообновление</p></div><ThemedSelect label="Автообновление подписок" value={String(draft.subscriptionRefreshHours)} onChange={(value) => onDraftChange({ ...draft, subscriptionRefreshHours: Number(value) as SettingsConfig["subscriptionRefreshHours"] })} options={[{ value: "0", label: "Выключено" }, { value: "6", label: "Раз в 6 часов" }, { value: "24", label: "Раз в сутки" }]} /></div>
+        <p className="settings-explanation">Автообновление работает, пока RouteDeck открыт и отключён. Вручную обновить подписку можно на вкладке «Серверы».</p>
       </section>
       <section className="card settings-group lean-settings update-settings" aria-labelledby="app-updates-title">
         <div className="settings-card-heading"><div><h2 id="app-updates-title">Обновления RouteDeck</h2>{update.currentVersion ? <small>Версия {update.currentVersion}</small> : null}</div><button className="secondary-button compact-action" type="button" disabled={update.status === "checking" || update.status === "unavailable"} aria-busy={update.status === "checking"} onClick={() => { void appUpdateMonitor.check(false); }}>{update.status === "checking" ? <LoaderIcon size={17} /> : <RefreshIcon size={17} />}{update.status === "error" ? "Повторить" : "Проверить"}</button></div>
@@ -819,11 +883,14 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
     unavailable: ["Не удалось проверить", "Windows не вернула достоверное состояние системного прокси."],
   }[proxy.state];
   return (
-    <div className="page">
-      <div className="page-title-row"><div><p className="overline">Состояние приложения</p><h1 ref={headingRef} tabIndex={-1}>Диагностика</h1></div>{snapshot.diagnostics.snapshotReceivedAt ? <span className="quiet-badge">Обновлено {snapshot.diagnostics.snapshotReceivedAt}</span> : null}</div>
+    <div className="page diagnostics-page">
+      <div className="page-title-row"><h1 ref={headingRef} tabIndex={-1}>Диагностика</h1></div>
       <ActionFailureNotice failure={actionFailure} page="diagnostics" onClear={onClearFailure} />
-      <p className="field-help">Здесь показано последнее состояние подключения. Обновление не запускает новое сетевое подключение.</p>
-      <button className="primary-button" type="button" disabled={checking || snapshot.diagnostics.running} aria-busy={checking || snapshot.diagnostics.running} onClick={run}>{checking || snapshot.diagnostics.running ? <LoaderIcon size={20} /> : <ActivityIcon size={20} />}{checking || snapshot.diagnostics.running ? "Обновляем…" : "Обновить состояние"}</button>
+      <section className="card diagnostics-overview">
+        <div className="diagnostics-heading"><span className="section-icon"><ActivityIcon size={20} /></span><div><h2>Состояние подключения</h2>{snapshot.diagnostics.snapshotReceivedAt ? <p className="field-help">Обновлено {snapshot.diagnostics.snapshotReceivedAt}</p> : null}</div></div>
+        <p className="field-help">Обновление не запускает новое сетевое подключение.</p>
+        <button className="secondary-button" type="button" disabled={checking || snapshot.diagnostics.running} aria-busy={checking || snapshot.diagnostics.running} onClick={run}>{checking || snapshot.diagnostics.running ? <LoaderIcon size={18} /> : <RefreshIcon size={18} />}{checking || snapshot.diagnostics.running ? "Обновляем…" : "Обновить состояние"}</button>
+      </section>
       {snapshot.environment.otherVpnDetected ? <OpaqueNotice notice={externalNotice} primaryAction={{ label: "Обновить", onClick: run }} /> : null}
       <section className="card system-proxy-card" aria-labelledby="system-proxy-title">
         <div className="system-proxy-card__heading"><div><p className="overline">Windows</p><h2 id="system-proxy-title">Системный прокси</h2></div><span className="quiet-badge" data-state={proxy.state}>{proxyPresentation[0]}</span></div>
@@ -832,7 +899,6 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
         {proxy.state === "stale" && proxy.cleanupToken ? <button className="danger-button compact-action" type="button" disabled={checking || snapshot.diagnostics.running || Boolean(snapshot.switching) || !(snapshot.phase === "disconnected" || (snapshot.phase === "connected" && snapshot.activeMode === "tun"))} onClick={onClearStaleProxy}>Отключить неработающий прокси</button> : null}
       </section>
       <ProofCard proofs={snapshot.diagnostics.steps} title="Проверки" />
-      {snapshot.diagnostics.snapshotReceivedAt ? <p className="diagnostic-duration">Состояние обновлено в {snapshot.diagnostics.snapshotReceivedAt}; время отдельных этапов отображается только при наличии данных.</p> : null}
       <button className="secondary-button full-width" type="button" disabled={copying} aria-busy={copying} onClick={copyReport}>{copying ? <LoaderIcon size={19} /> : <CopyIcon size={19} />}{copying ? "Копируем…" : "Копировать отчёт"}</button>
       <details className="card log-viewer"><summary>Технический журнал</summary><div className="details-body"><p className="field-help">Личные данные удаляются из отчёта автоматически.</p><pre>{snapshot.diagnostics.sanitizedLog.join("\n")}</pre></div></details>
     </div>
@@ -921,6 +987,119 @@ function Dialog({ title, description, focusKey, onClose, busy = false, closeDisa
   );
 }
 
+function SubscriptionEditor({ sourceId, name, hasUrl, onClose, onSaved, onRemove }: {
+  sourceId: string;
+  name: string;
+  hasUrl: boolean;
+  onClose: () => void;
+  onSaved: () => void;
+  onRemove: () => void;
+}) {
+  const nameRef = useRef<HTMLInputElement>(null);
+  const urlRef = useRef<HTMLInputElement>(null);
+  const [urlChanged, setUrlChanged] = useState(false);
+  const [visible, setVisible] = useState(false);
+  const [loadingUrl, setLoadingUrl] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState("");
+
+  const clearUrl = () => {
+    if (urlRef.current) urlRef.current.value = "";
+  };
+  const close = () => { clearUrl(); onClose(); };
+
+  const toggleUrl = async () => {
+    const input = urlRef.current;
+    if (!input) return;
+    setCopied(false);
+    setError("");
+    if (visible) {
+      if (!urlChanged) clearUrl();
+      setVisible(false);
+      return;
+    }
+    if (urlChanged) {
+      setVisible(true);
+      return;
+    }
+    setLoadingUrl(true);
+    try {
+      const url = await controller.getSubscriptionUrl(sourceId);
+      if (urlRef.current !== input) return;
+      if (url === null) setError("У подписки ещё нет сохранённой ссылки.");
+      else {
+        input.value = url;
+        setVisible(true);
+      }
+    } catch (failure) {
+      if (urlRef.current === input) setError(toPublicActionError(failure).message);
+    } finally {
+      if (urlRef.current === input) setLoadingUrl(false);
+    }
+  };
+
+  const copyUrl = async () => {
+    const input = urlRef.current;
+    if (!visible || !input?.value) return;
+    setError("");
+    try {
+      await navigator.clipboard.writeText(input.value);
+      if (urlRef.current === input && input.type === "text") setCopied(true);
+    } catch (failure) {
+      if (urlRef.current === input) setError(toPublicActionError(failure).message);
+    }
+  };
+
+  const save = async () => {
+    if (saving || loadingUrl) return;
+    const name = nameRef.current?.value.trim();
+    const input = urlRef.current;
+    if (!name) {
+      setError("Укажите название подписки.");
+      return;
+    }
+    if (!input) return;
+    setSaving(true);
+    setError("");
+    try {
+      await controller.editSubscription(sourceId, name, urlChanged ? input.value.trim() || undefined : undefined);
+      clearUrl();
+      onSaved();
+    } catch (failure) {
+      setError(toPublicActionError(failure).message);
+      setSaving(false);
+    }
+  };
+
+  return <Dialog className="subscription-editor-dialog" title="Настройки подписки"
+    onClose={close} busy={saving} closeDisabled={saving}
+    actions={<><button className="secondary-button" type="button" disabled={saving} onClick={close}>Отмена</button><button className="primary-button dialog-primary" type="submit" form="subscription-editor" disabled={saving || loadingUrl}>{saving ? "Сохраняем…" : "Сохранить"}</button></>}>
+    <form className="subscription-editor" id="subscription-editor" onSubmit={(event) => { event.preventDefault(); void save(); }}>
+      <div className="dialog-field">
+        <label htmlFor="edit-subscription-name">Название подписки</label>
+        <input id="edit-subscription-name" ref={nameRef} defaultValue={name} autoComplete="off" maxLength={80} required data-autofocus disabled={saving} onInput={() => setError("")} />
+      </div>
+      <div className="dialog-field">
+        <label htmlFor="edit-subscription-url">Ссылка на подписку</label>
+        <input id="edit-subscription-url" ref={urlRef} type={visible ? "text" : "password"} inputMode="url" autoComplete="off" spellCheck={false}
+          maxLength={4096} placeholder={hasUrl ? "Ссылка сохранена" : "Вставьте HTTPS-ссылку"} disabled={saving || loadingUrl}
+          aria-describedby="edit-subscription-help"
+          onInput={() => { setUrlChanged(true); setCopied(false); setError(""); }} />
+        <div className="subscription-link-actions">
+          {hasUrl || urlChanged ? <button className="text-button" type="button" disabled={saving || loadingUrl} onClick={() => { void toggleUrl(); }}>{loadingUrl ? "Читаем ссылку…" : visible ? "Скрыть ссылку" : "Показать ссылку"}</button> : null}
+          {visible ? <button className="text-button" type="button" disabled={saving} onClick={() => { void copyUrl(); }}><CopyIcon size={17} />Скопировать ссылку</button> : null}
+        </div>
+        <p id="edit-subscription-help" className="field-help">Пустое поле сохраняет прежнюю ссылку. Новая ссылка применяется при следующем обновлении подписки.</p>
+      </div>
+      {saving ? <p role="status" tabIndex={-1} data-dialog-busy-focus>Сохраняем подписку…</p> : null}
+      {copied ? <p role="status" className="field-help">Ссылка скопирована</p> : null}
+      {error ? <p role="alert" className="field-error">{error}</p> : null}
+    </form>
+    <div className="subscription-editor-tools"><button className="text-button" type="button" disabled={saving} onClick={() => { clearUrl(); onRemove(); }}><TrashIcon size={17} />Удалить подписку…</button></div>
+  </Dialog>;
+}
+
 function Toast({ toast, onClose, onPausedChange }: { toast: ToastState; onClose: () => void; onPausedChange: (paused: boolean) => void }) {
   const [hovered, setHovered] = useState(false);
   const [focusWithin, setFocusWithin] = useState(false);
@@ -947,7 +1126,7 @@ function Toast({ toast, onClose, onPausedChange }: { toast: ToastState; onClose:
 export default function App() {
   const snapshot = useController();
   const appUpdate = useAppUpdates();
-  const [activePage, setActivePage] = useState<Destination>("home");
+  const [{ activePage, pageOffset }, setPage] = useState<{ activePage: Destination; pageOffset: number }>({ activePage: "home", pageOffset: 0 });
   const [dialog, setDialog] = useState<DialogKind>(null);
   const [returnAfterPick, setReturnAfterPick] = useState(false);
   const [sourceAction, setSourceAction] = useState<Server | null>(null);
@@ -1072,8 +1251,16 @@ export default function App() {
     if (mainRef.current) scrollPositions.current[activePage] = mainRef.current.scrollTop;
     setToast(null);
     setReturnAfterPick(false);
-    setActivePage(destination);
+    setPage((current) => current.activePage === destination ? current : {
+      activePage: destination,
+      pageOffset: destinations.indexOf(destination) > destinations.indexOf(current.activePage) ? 14 : -14,
+    });
   }, [activePage]);
+
+  const finishPageEntrance = () => {
+    const slot = mainRef.current?.querySelector(".page-slot:not([hidden])");
+    for (const animation of slot?.getAnimations() ?? []) animation.finish();
+  };
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
@@ -1294,15 +1481,17 @@ export default function App() {
       ) : null}
       <div className="workspace">
         <Navigation active={activePage} onNavigate={navigate} variant="rail" />
-        <main className="app-main" ref={mainRef}>
+        <main className="app-main" ref={mainRef} style={{ "--page-slide-from": `${pageOffset}px` } as CSSProperties}
+          onClickCapture={finishPageEntrance} onKeyDownCapture={finishPageEntrance}>
           <div className="page-slot" hidden={activePage !== "servers"}>
             <ServersPage snapshot={snapshot} headingRef={serversHeadingRef} search={search} onSearch={setSearch}
               onImport={(kind) => { invalidateImport(); clearSubscriptionUrl(); setImportError(""); setImportKind(kind); setDialog("import"); }}
               onSelect={selectServer} picking={returnAfterPick} onBack={() => navigate("home")}
-              onRefresh={requestSourceRefresh} onRemove={(server) => { setSourceAction(server); setSourceError(""); setDialog("remove-source"); }} sourceBusy={sourceBusy}
+              onRefresh={requestSourceRefresh} onEdit={(server) => { setSourceAction(server); setDialog("edit-source"); }}
+              onRemove={(server) => { setSourceAction(server); setSourceError(""); setDialog("remove-source"); }} sourceBusy={sourceBusy}
               actionFailure={actionFailure} onClearFailure={() => setActionFailure(null)} />
           </div>
-          {activePage !== "servers" ? <div className="page-slot">{renderPage()}</div> : null}
+          {activePage !== "servers" ? <div className="page-slot" key={activePage}>{renderPage()}</div> : null}
         </main>
       </div>
       <Navigation active={activePage} onNavigate={navigate} variant="bottom" />
@@ -1356,6 +1545,12 @@ export default function App() {
             {snapshot.phase !== "disconnected" && snapshot.phase !== "failed" ? <p className="persistent-hint"><InfoIcon size={17} />Перед добавлением отключите соединение RouteDeck.</p> : null}
           </form>
         </Dialog>
+      ) : null}
+
+      {dialog === "edit-source" && sourceAction?.sourceId ? (
+        <SubscriptionEditor key={sourceAction.sourceId} sourceId={sourceAction.sourceId} name={sourceAction.source} hasUrl={Boolean(sourceAction.sourceRefreshable)}
+          onClose={closeDialog} onSaved={() => { closeDialog(); showToast("Подписка сохранена"); }}
+          onRemove={() => { setSourceError(""); setDialog("remove-source"); }} />
       ) : null}
 
       {dialog === "refresh-source" && sourceAction ? (

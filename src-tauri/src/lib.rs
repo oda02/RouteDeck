@@ -59,6 +59,8 @@ pub fn run(
             commands::preview_import_url,
             commands::discard_import_preview,
             commands::confirm_import,
+            commands::get_subscription_url,
+            commands::edit_subscription,
             commands::refresh_source,
             commands::remove_source,
             commands::start_local_proxy,

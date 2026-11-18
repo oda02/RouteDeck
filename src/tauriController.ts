@@ -29,6 +29,7 @@ import {
   parsePublicError,
   parseRunningApplications,
   parseRuntimeStatus,
+  parseSavedSubscriptionUrl,
   parseUnitResponse,
   type ImportPreviewDto,
   type ConfirmedNodeDto,
@@ -901,6 +902,34 @@ export class TauriController implements RouteDeckController {
       try { await this.reloadSources(sourceId, false, confirmed.nodeIds); }
       catch (error) { this.wantsConnection = false; throw error; }
       if (affectsActive) await this.reconcileConnection();
+    });
+  };
+
+  getSubscriptionUrl = async (sourceId: string): Promise<string | null> => {
+    const transport = await this.requireTransport();
+    let raw: unknown;
+    try { raw = await transport.invoke("get_subscription_url", { sourceId }); }
+    catch (error) { throw this.invokeError(error); }
+    try { return parseSavedSubscriptionUrl(raw); }
+    catch { this.failBoundary("backend-response-invalid"); throw new RouteDeckError("backend-response-invalid"); }
+  };
+
+  editSubscription = async (sourceId: string, name: string, url?: string): Promise<void> => {
+    await this.enqueue(async () => {
+      const transport = await this.requireTransport();
+      let raw: unknown;
+      try {
+        const pending = transport.invoke("edit_subscription", { sourceId, name, ...(url === undefined ? {} : { url }) });
+        url = undefined;
+        raw = await pending;
+      } catch (error) {
+        url = undefined;
+        throw this.invokeError(error);
+      }
+      try { parseUnitResponse(raw); }
+      catch { this.failBoundary("backend-response-invalid"); throw new RouteDeckError("backend-response-invalid"); }
+      const ids = this.snapshot.servers.filter((server) => server.sourceId === sourceId).map((server) => server.id);
+      await this.reloadSources(sourceId, false, ids);
     });
   };
 

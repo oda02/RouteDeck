@@ -34,12 +34,14 @@ motion rather than external fonts or full-page animation libraries.
   handlers and keyboard editing remain available. Packaged launches have no console.
 
 - Style: quiet, technical minimalism; dark-first with an accessible light mapping.
-- Shape: restrained 6/10/14 px radii. No pill containers around every element.
+- Shape: 6/12/16 px radii for small details, controls and cards. Use larger corner
+  radii for the connection panel and compact navigation dock.
 - Icons: one outline SVG family (Lucide), 1.75 px stroke, 18/20/24 px glyph tokens.
   No emoji, raster UI icons, or icon-only navigation.
-- Surfaces are opaque. Blur is permitted only for a modal scrim, never behind text.
+- Use opaque surfaces for content, notices and dialogs. The compact navigation dock
+  can use backdrop blur with an opaque fallback for reduced transparency and forced colors.
 - Color is never the sole status cue: pair it with a label and icon.
-- Avoid decorative glows, gradients, glassmorphism, and animated background effects.
+- Avoid decorative glows and animated background effects.
 
 ## Semantic color tokens
 
@@ -133,7 +135,7 @@ at least 4.5:1, large text and non-text control boundaries at least 3:1.
 
 ## Radius, elevation, and layers
 
-- `--radius-sm: 6px`; `--radius-md: 10px`; `--radius-lg: 14px`.
+- `--radius-sm: 6px`; `--radius-md: 12px`; `--radius-lg: 16px`.
 - `--shadow-popover: 0 12px 32px rgb(0 0 0 / 0.36)` (dark) and 0.18 (light).
 - `--z-content: 0`, `--z-sticky: 10`, `--z-popover: 20`,
   `--z-dialog: 40`, `--z-toast: 50`.
@@ -142,8 +144,9 @@ at least 4.5:1, large text and non-text control boundaries at least 3:1.
 ## Motion
 
 - `--motion-fast: 120ms`; `--motion-normal: 180ms`; `--motion-slow: 240ms`.
-- Use `cubic-bezier(.2,.8,.2,1)` for entrances and state changes; opacity and transform
-  only. Never animate layout dimensions or the entire route with an overlay.
+- Use `cubic-bezier(.2,.8,.2,1)` for entrances and state changes. The incoming page
+  fades briefly. The dock selection compresses, travels and expands. Server groups expand and collapse
+  in place, with collapsed controls immediately removed from keyboard navigation.
 - Press feedback must appear within 100 ms and must not shift layout bounds.
 - Continuous animation is restricted to an active progress spinner.
 - Under `prefers-reduced-motion: reduce`, remove transforms and use effectively instant
@@ -190,4 +193,5 @@ at least 4.5:1, large text and non-text control boundaries at least 3:1.
 - No controls below 44 x 44 px, horizontal page scrolling, clipped dialogs, or fixed
   footers covering content.
 - No remote font dependency, GSAP/page overlay transition, decorative motion, or glow.
-- No raw subscription secrets in the UI, clipboard action, or diagnostic export.
+- Keep subscription links out of the library view and diagnostic exports. The subscription
+  editor reveals or copies a saved link only after an explicit action.

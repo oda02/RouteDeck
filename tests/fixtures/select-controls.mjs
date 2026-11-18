@@ -64,6 +64,12 @@ export async function verifySelectControls(browser, base, fixtureModule) {
     await route.click(); await nav("Настройки");
     await popup.waitFor({ state: "hidden" });
 
+    await page.setViewportSize({ width: 360, height: 560 });
+    const themeSelect = page.getByRole("combobox", { name: "Тема", exact: true });
+    await chooseSelect(page, themeSelect, "system");
+    assert.equal(await themeSelect.locator("span").evaluate((label) => label.scrollWidth <= label.clientWidth), true, "system theme label must fit at minimum window size");
+    await page.setViewportSize({ width: 440, height: 760 });
+
     for (const theme of ["dark", "light"]) {
       await nav("Настройки");
       await chooseSelect(page, page.getByRole("combobox", { name: "Тема", exact: true }), theme);

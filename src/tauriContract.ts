@@ -568,6 +568,16 @@ export function parseUnitResponse(value: unknown): void {
   if (value !== null) throw new ContractViolation();
 }
 
+export function parseSavedSubscriptionUrl(value: unknown): string | null {
+  if (value === null) return null;
+  if (typeof value !== "string" || new TextEncoder().encode(value).length > 4096) throw new ContractViolation();
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || !url.hostname || url.username || url.password || url.hash) throw new ContractViolation();
+  } catch { throw new ContractViolation(); }
+  return value;
+}
+
 /** Accepts only strictly newer snapshots, preventing the initial invoke result from overwriting an event. */
 export class RuntimeRevisionGate {
   private revision = -1;
