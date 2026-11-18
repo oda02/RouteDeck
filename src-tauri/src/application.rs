@@ -1220,6 +1220,79 @@ impl ApplicationController {
         })
     }
 
+    pub fn get_subscription_url(&self, source_id: &str) -> Result<Option<String>, PublicError> {
+        validate_source_id(source_id)?;
+        let state = self.lock_state();
+        let source = state
+            .sources
+            .iter()
+            .find(|source| source.id == source_id)
+            .ok_or_else(|| source_import_error("subscription.source_missing"))?;
+        if source.kind != SourceKind::Subscription {
+            return Err(source_import_error("subscription.source_invalid"));
+        }
+        Ok(source.url.clone())
+    }
+
+    pub fn edit_subscription(
+        &self,
+        source_id: &str,
+        name: &str,
+        url: Option<&str>,
+    ) -> Result<(), PublicError> {
+        validate_source_id(source_id)?;
+        let mut state = self.lock_state();
+        let index = state
+            .sources
+            .iter()
+            .position(|source| source.id == source_id)
+            .ok_or_else(|| source_import_error("subscription.source_missing"))?;
+        let source = &state.sources[index];
+        if source.kind != SourceKind::Subscription {
+            return Err(source_import_error("subscription.source_invalid"));
+        }
+
+        let name = name.trim();
+        if !valid_source_name(name)
+            || state.nodes.values().any(|stored| {
+                stored.source_id == source_id
+                    && Redactor::from_nodes(std::slice::from_ref(&stored.node)).redact(name) != name
+            })
+        {
+            return Err(source_import_error("import.source_name.invalid"));
+        }
+        if let Some(url) = url {
+            crate::subscription_fetch::validate_url(url)
+                .map_err(public_subscription_fetch_error)?;
+        }
+        if source.name == name && url.is_none_or(|url| source.url.as_deref() == Some(url)) {
+            return Ok(());
+        }
+
+        let mut sources = state.sources.clone();
+        let replacement = &mut sources[index];
+        replacement.name = name.to_owned();
+        if let Some(url) = url {
+            replacement.url = Some(url.to_owned());
+        }
+        // Invalidate an in-flight refresh even if another edit reverts the metadata.
+        replacement.revision = replacement
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| source_import_error("subscription.source_changed"))?;
+        if let Some(store) = &self.subscription_store {
+            store.save(&sources).map_err(|_| source_storage_error())?;
+        }
+
+        for node in state.nodes.values_mut() {
+            if node.source_id == source_id {
+                node.source_name = name.to_owned();
+            }
+        }
+        state.sources = sources;
+        Ok(())
+    }
+
     pub fn refresh_source(
         &self,
         source_id: &str,
@@ -6306,6 +6379,178 @@ mod tests {
         assert_eq!(nodes[0].source_id.as_deref(), Some(source_id.as_str()));
     }
 
+    #[test]
+    fn subscription_edit_persists_metadata_without_changing_active_nodes_or_fetching() {
+        const ORIGINAL_URL: &str = "https://provider.test/private-fixture-token";
+        const REPLACEMENT_URL: &str = "https://replacement.test/list?token=fixture%2Frotation";
+        let (mut controller, fetcher, source_id) = refresh_fixture(NODE);
+        let other_id = import_node(&controller);
+        let path = controller.session_root.with_extension("subscription.json");
+        controller.subscription_store = Some(SubscriptionStore::new(path.clone()));
+        let before = controller.confirmed_nodes();
+        let node_id = &before[0].id;
+        let (original_sources, config_identity) = {
+            let state = controller.lock_state();
+            (
+                state.sources.clone(),
+                state.nodes[node_id].config_identity.clone(),
+            )
+        };
+        controller
+            .start_local_proxy(node_id, DefaultRoute::Vpn)
+            .unwrap();
+        let status = serde_json::to_value(controller.status()).unwrap();
+
+        assert_eq!(
+            controller
+                .get_subscription_url(&source_id)
+                .unwrap()
+                .as_deref(),
+            Some(ORIGINAL_URL)
+        );
+        controller
+            .edit_subscription(&source_id, " Новый план ", None)
+            .unwrap();
+        assert_eq!(
+            controller
+                .get_subscription_url(&source_id)
+                .unwrap()
+                .as_deref(),
+            Some(ORIGINAL_URL)
+        );
+        controller
+            .edit_subscription(&source_id, "Новый план", Some(REPLACEMENT_URL))
+            .unwrap();
+        controller
+            .edit_subscription(&source_id, "Новый план", Some(REPLACEMENT_URL))
+            .unwrap();
+        assert_eq!(
+            controller
+                .get_subscription_url(&source_id)
+                .unwrap()
+                .as_deref(),
+            Some(REPLACEMENT_URL)
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(serde_json::to_value(controller.status()).unwrap(), status);
+        {
+            let state = controller.lock_state();
+            let mut expected = original_sources.clone();
+            expected[0].name = "Новый план".into();
+            expected[0].url = Some(REPLACEMENT_URL.into());
+            expected[0].revision += 2;
+            assert_eq!(state.sources, expected);
+            assert_eq!(state.nodes[node_id].config_identity, config_identity);
+        }
+        let after = controller.confirmed_nodes();
+        assert_eq!(&after[0].id, node_id);
+        assert_eq!(after[0].source_name.as_deref(), Some("Новый план"));
+        assert_eq!(
+            after[0].source_updated_at_ms,
+            before[0].source_updated_at_ms
+        );
+        assert_eq!(after[1].id, other_id);
+        for public in [
+            serde_json::to_string(&after).unwrap(),
+            serde_json::to_string(&controller.diagnostics()).unwrap(),
+        ] {
+            assert!(!public.contains(ORIGINAL_URL));
+            assert!(!public.contains(REPLACEMENT_URL));
+        }
+        controller.stop().unwrap();
+        let restored = controller_at(controller.session_root.clone());
+        assert_eq!(
+            serde_json::to_value(restored.confirmed_nodes()).unwrap(),
+            serde_json::to_value(after).unwrap()
+        );
+        assert_eq!(
+            restored
+                .get_subscription_url(&source_id)
+                .unwrap()
+                .as_deref(),
+            Some(REPLACEMENT_URL)
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn subscription_edit_rejects_hostile_arguments_without_disclosing_secrets() {
+        let (controller, fetcher, source_id) = refresh_fixture(NODE);
+        import_node(&controller);
+        let before = controller.lock_state().sources.clone();
+        let manual_id = &before[1].id;
+        for id in [
+            "../private-secret",
+            "ffffffffffffffffffffffffffffffff",
+            manual_id,
+        ] {
+            let error = controller.get_subscription_url(id).unwrap_err();
+            assert!(!serde_json::to_string(&error)
+                .unwrap()
+                .contains("private-secret"));
+            assert!(controller
+                .edit_subscription(id, "Новый план", None)
+                .is_err());
+        }
+        for name in [
+            " ",
+            "https://provider.test/private-secret",
+            "fixture-secret",
+            "bad\nname",
+            &"x".repeat(81),
+        ] {
+            let error = controller
+                .edit_subscription(&source_id, name, None)
+                .unwrap_err();
+            assert_eq!(error.message, "import.source_name.invalid");
+            assert!(!serde_json::to_string(&error).unwrap().contains("secret"));
+        }
+        for url in [
+            "",
+            "http://provider.test/private-secret",
+            "https://localhost/private-secret",
+            "https://user:private-secret@provider.test/",
+            "https://provider.test/#private-secret",
+            &format!("https://provider.test/{}", "a".repeat(4096)),
+        ] {
+            let error = controller
+                .edit_subscription(&source_id, "Новый план", Some(url))
+                .unwrap_err();
+            assert!(!serde_json::to_string(&error)
+                .unwrap()
+                .contains("private-secret"));
+        }
+        assert_eq!(controller.lock_state().sources, before);
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn subscription_edit_invalidates_an_inflight_refresh_even_after_metadata_is_reverted() {
+        let (mut controller, _, source_id) = refresh_fixture(NODE);
+        let original = controller.lock_state().sources[0].clone();
+        let ready = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        controller.services.subscription_fetcher = Arc::new(BlockingSubscriptionFetcher {
+            ready: ready.clone(),
+            release: release.clone(),
+        });
+        let controller = Arc::new(controller);
+        let worker_controller = controller.clone();
+        let worker_id = source_id.clone();
+        let refresh = thread::spawn(move || worker_controller.refresh_source(&worker_id, None));
+        ready.wait();
+        let change = controller.edit_subscription(&source_id, "Новый план", None);
+        let revert = controller.edit_subscription(&source_id, &original.name, None);
+        release.wait();
+        change.unwrap();
+        revert.unwrap();
+        assert_eq!(
+            refresh.join().unwrap().unwrap_err().message,
+            "subscription.source_changed"
+        );
+        assert_eq!(controller.lock_state().sources[0].revision, 2);
+    }
+
     struct ExactUrlSubscriptionFetcher {
         expected_url: &'static str,
         calls: AtomicUsize,
@@ -6446,6 +6691,30 @@ mod tests {
     }
 
     #[test]
+    fn subscription_edit_can_add_a_legacy_url_before_the_first_refresh() {
+        const FIXTURE_URL: &str = "https://provider.test/legacy?token=fixture-only";
+        let (controller, _, source_id) = refresh_fixture(NODE);
+        let node_id = controller.confirmed_nodes()[0].id.clone();
+        {
+            let mut state = controller.lock_state();
+            state.sources[0].url = None;
+            state.sources[0].updated_at_ms = None;
+        }
+        assert_eq!(controller.get_subscription_url(&source_id).unwrap(), None);
+        controller
+            .edit_subscription(&source_id, "Новый план", None)
+            .unwrap();
+        assert_eq!(controller.get_subscription_url(&source_id).unwrap(), None);
+        controller
+            .edit_subscription(&source_id, "Новый план", Some(FIXTURE_URL))
+            .unwrap();
+        let after = controller.confirmed_nodes();
+        assert_eq!(after[0].source_refreshable, Some(true));
+        assert_eq!(after[0].source_updated_at_ms, None);
+        assert_eq!(after[0].id, node_id);
+    }
+
+    #[test]
     fn refresh_reorders_and_rotates_credentials_without_changing_existing_ids_after_restart() {
         let second = NODE.replace("example.test", "second.test");
         let (mut controller, fetcher, source_id) = refresh_fixture(&format!("{NODE}\n{second}"));
@@ -6562,13 +6831,14 @@ mod tests {
     }
 
     #[test]
-    fn refresh_and_remove_save_failure_leave_memory_and_disk_unchanged() {
+    fn source_save_failure_leaves_memory_and_disk_unchanged() {
         let (mut controller, fetcher, source_id) = refresh_fixture(NODE);
         let path = controller.session_root.with_extension("subscription.json");
         let store = SubscriptionStore::new(path.clone());
         store.save(&controller.lock_state().sources).unwrap();
         let disk_before = std::fs::read(&path).unwrap();
         let before = serde_json::to_value(controller.confirmed_nodes()).unwrap();
+        let sources_before = controller.lock_state().sources.clone();
         let blocked = controller.session_root.with_extension("blocked");
         std::fs::create_dir(&blocked).unwrap();
         controller.subscription_store = Some(SubscriptionStore::new(blocked.clone()));
@@ -6581,6 +6851,18 @@ mod tests {
             PublicErrorStage::SessionStorage
         );
         assert!(controller.remove_source(&source_id).is_err());
+        assert_eq!(
+            controller
+                .edit_subscription(
+                    &source_id,
+                    "Новый план",
+                    Some("https://replacement.test/list")
+                )
+                .unwrap_err()
+                .message,
+            "subscription.save_failed"
+        );
+        assert_eq!(controller.lock_state().sources, sources_before);
         assert_eq!(
             serde_json::to_value(controller.confirmed_nodes()).unwrap(),
             before

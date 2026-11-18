@@ -5,6 +5,8 @@ fn main() {
         "preview_import_url",
         "discard_import_preview",
         "confirm_import",
+        "get_subscription_url",
+        "edit_subscription",
         "refresh_source",
         "remove_source",
         "start_local_proxy",

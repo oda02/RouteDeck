@@ -6,8 +6,10 @@ const group = "a".repeat(32);
 const manual = "b".repeat(32);
 const legacy = "c".repeat(32);
 const previousUpdate = Date.now() - 25 * 60 * 60 * 1000;
+const subscriptionUrls = new Map([[group, "https://provider.invalid/subscription?token=editor-fixture"]]);
 const fixture = {
   applicationCount: 20, applicationVersion: "2026.09.26", applicationsDelay: 0, failApplications: false,
+  subscriptionUrlDelay: 0,
   calls: [], failRefresh: false, failStop: false, failProxyCleanup: false, failUpdateCheck: false, failOpenReleases: false, proxyCleanupDelay: 0, startDelay: 40, refreshDelay: 0,
   failUpdateDownload: true, failUpdateInstall: false, portableUpdate: { phase: "downloading", downloaded: 50, total: 100, version: "0.2.0", error: null },
   updateResponse: { currentVersion: "0.1.0", latestVersion: "0.1.0", status: "upToDate", releaseUrl: null },
@@ -92,12 +94,28 @@ const transport = {
       if (fixture.refreshDelay) await new Promise((resolve) => setTimeout(resolve, fixture.refreshDelay));
       await sleep(60);
       if (fixture.failRefresh) throw { code: "subscription_fetch_failed", stage: "subscription_fetch", message: "subscription.fetch_failed" };
+      if (args.url) subscriptionUrls.set(args.sourceId, args.url);
       const updatedAtMs = Date.now();
       fixture.nodes = fixture.nodes.map((node) => node.sourceId === args.sourceId ? { ...node, sourceRefreshable: true, sourceUpdatedAtMs: updatedAtMs } : node);
       const ids = fixture.nodes.filter((node) => node.sourceId === args.sourceId).map((node) => node.id);
       return { imported: ids.length, nodeIds: ids };
     }
-    if (command === "remove_source") { fixture.nodes = fixture.nodes.filter((node) => node.sourceId !== args.sourceId); return null; }
+    if (command === "get_subscription_url") {
+      const saved = subscriptionUrls.get(args.sourceId) ?? null;
+      if (fixture.subscriptionUrlDelay) await sleep(fixture.subscriptionUrlDelay);
+      return saved;
+    }
+    if (command === "edit_subscription") {
+      if (args.url !== undefined && !args.url.startsWith("https://")) throw { code: "subscription_url_invalid", stage: "subscription_url", message: "subscription.url.invalid" };
+      if (args.url !== undefined) subscriptionUrls.set(args.sourceId, args.url);
+      fixture.nodes = fixture.nodes.map((node) => node.sourceId === args.sourceId ? { ...node, sourceName: args.name, sourceRefreshable: subscriptionUrls.has(args.sourceId) } : node);
+      return null;
+    }
+    if (command === "remove_source") {
+      subscriptionUrls.delete(args.sourceId);
+      fixture.nodes = fixture.nodes.filter((node) => node.sourceId !== args.sourceId);
+      return null;
+    }
     if (command === "preview_import_content" || command === "preview_import_url") {
       previewKind = command === "preview_import_url" ? "subscription" : "manual";
       await sleep(40);

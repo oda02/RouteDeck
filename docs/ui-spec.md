@@ -75,9 +75,12 @@ Persistent compact copy before first TUN activation:
   optional overflow button. Global status is text plus icon, not a colored dot alone.
 - Main: the only page scroll container. It has 16 px compact gutters, 20 px wide
   gutters, and enough bottom inset to clear fixed navigation/action bars.
-- Compact navigation: opaque 60 px bottom bar, five equal 44 px minimum targets with
-  Lucide icon and short label: Главная, Серверы, Правила, Настройки, Статус.
-- Wide navigation: 176 px left rail with the same icons and full labels. Current page
+- Compact navigation: rounded dock inset from the window edges. Its translucent
+  surface floats above the scrolling content, with an opaque fallback. Five equal
+  targets pair a Lucide icon with a label: Главная, Серверы, Правила, Настройки, Статус.
+  A tinted selection compresses as it travels and expands at its destination.
+  Forced colors use a system outline.
+- Wide navigation: inset left rail in a 176 px column with the same icons and full labels. Current page
   uses `aria-current="page"`, stronger text, icon, and a 3 px accent indicator.
 - Save the scroll position per destination and restore it when navigating back.
 
@@ -638,6 +641,7 @@ available for diagnosis but are secondary.
 - [ ] Compact, short, wide, 200% text, reduced-motion, and forced-colors cases pass.
 - [ ] No emoji/UI raster icons, remote fonts, page-overlay animation, or decorative glow.
 - [ ] Server latency includes state and timestamp and never substitutes local interception.
-- [ ] Secrets are redacted before display/copy; raw exception strings are not primary UI.
+- [ ] Exported diagnostics and error messages redact secrets. A saved subscription URL
+  is revealed or copied only in its editor after an explicit action.
 - [ ] Navigation state, focus, and scroll position survive resize and route changes.
 - [ ] User-facing claims match actual backend proof, including coexistence with another VPN.

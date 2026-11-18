@@ -71,6 +71,8 @@ class BackendUnavailableController implements RouteDeckController {
   dismissNotice = () => undefined;
   refreshServers = async () => this.unavailable();
   refreshSource = async () => this.unavailable();
+  getSubscriptionUrl = async () => this.unavailable();
+  editSubscription = async () => this.unavailable();
   removeSource = async () => this.unavailable();
   previewSubscription = async () => this.unavailable();
   cancelImportPreview = () => undefined;

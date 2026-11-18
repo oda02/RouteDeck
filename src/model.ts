@@ -236,6 +236,8 @@ export interface RouteDeckController {
   dismissNotice: () => void;
   refreshServers: () => Promise<void>;
   refreshSource: (sourceId: string, url?: string, background?: boolean) => Promise<void>;
+  getSubscriptionUrl: (sourceId: string) => Promise<string | null>;
+  editSubscription: (sourceId: string, name: string, url?: string) => Promise<void>;
   removeSource: (sourceId: string) => Promise<void>;
   previewSubscription: (source: SubscriptionImportSource) => Promise<SubscriptionPreview>;
   cancelImportPreview: () => void;

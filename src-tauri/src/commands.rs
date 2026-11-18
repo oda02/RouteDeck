@@ -95,6 +95,29 @@ pub async fn confirm_import(
 }
 
 #[tauri::command]
+pub fn get_subscription_url(
+    controller: State<'_, Arc<ApplicationController>>,
+    source_id: String,
+) -> Result<Option<String>, PublicError> {
+    controller.get_subscription_url(&source_id)
+}
+
+#[tauri::command]
+pub async fn edit_subscription(
+    controller: State<'_, Arc<ApplicationController>>,
+    source_id: String,
+    name: String,
+    url: Option<String>,
+) -> Result<(), PublicError> {
+    let controller = Arc::clone(controller.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        controller.edit_subscription(&source_id, &name, url.as_deref())
+    })
+    .await
+    .map_err(command_join_error)?
+}
+
+#[tauri::command]
 pub async fn refresh_source(
     controller: State<'_, Arc<ApplicationController>>,
     source_id: String,

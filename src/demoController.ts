@@ -1,5 +1,6 @@
 import { defaultTrafficRules, RouteDeckError } from "./model";
 import { effectiveRoutingKey, effectiveTunKey, validatedRouting } from "./tauriController";
+import { parseSavedSubscriptionUrl } from "./tauriContract";
 import type {
   AppNotice,
   ConnectionMode,
@@ -170,6 +171,7 @@ class DevelopmentDemoController implements RouteDeckController {
     sourceRefreshable: server.protocol !== "Naive", sourceUpdatedAtMs: Date.now(),
   })) };
   private readonly listeners = new Set<() => void>();
+  private readonly subscriptionUrls = new Map<string, string>();
   private operation = 0;
   private lifecycleTail: Promise<void> = Promise.resolve();
   private wantsConnection = false;
@@ -347,14 +349,36 @@ class DevelopmentDemoController implements RouteDeckController {
     });
   };
 
-  refreshSource = async (sourceId: string, _url?: string, background = false) => {
+  refreshSource = async (sourceId: string, url?: string, background = false) => {
     await this.enqueue(async () => {
       if (background && (this.wantsConnection || this.snapshot.phase !== "disconnected" || !this.snapshot.servers.some((server) => server.sourceId === sourceId && server.sourceRefreshable))) return;
       const active = this.snapshot.servers.find((server) => server.id === this.snapshot.activeServerId)?.sourceId === sourceId;
       if (active) await this.stopDemo();
       await wait(420);
-      this.publish({ servers: this.snapshot.servers.map((server) => server.sourceId === sourceId ? { ...server, sourceUpdatedAtMs: Date.now() } : server) });
+      if (url) this.subscriptionUrls.set(sourceId, url);
+      this.publish({ servers: this.snapshot.servers.map((server) => server.sourceId === sourceId ? { ...server, sourceRefreshable: Boolean(url) || server.sourceRefreshable, sourceUpdatedAtMs: Date.now() } : server) });
       if (active) await this.reconcile();
+    });
+  };
+
+  getSubscriptionUrl = async (sourceId: string): Promise<string | null> => {
+    const source = this.snapshot.servers.find((server) => server.sourceId === sourceId && server.sourceKind === "subscription");
+    if (!source) throw new RouteDeckError("source-changed");
+    return source.sourceRefreshable ? this.subscriptionUrls.get(sourceId) ?? "https://provider.example/subscription" : null;
+  };
+
+  editSubscription = async (sourceId: string, name: string, url?: string): Promise<void> => {
+    await this.enqueue(async () => {
+      if (!this.snapshot.servers.some((server) => server.sourceId === sourceId && server.sourceKind === "subscription")) throw new RouteDeckError("source-changed");
+      if (!name.trim() || name.length > 80) throw new RouteDeckError("invalid-source-name");
+      if (url !== undefined) {
+        try { parseSavedSubscriptionUrl(url); }
+        catch { throw new RouteDeckError("invalid-subscription-url"); }
+        this.subscriptionUrls.set(sourceId, url);
+      }
+      this.publish({ servers: this.snapshot.servers.map((server) => server.sourceId === sourceId
+        ? { ...server, source: name.trim(), sourceRefreshable: url !== undefined || server.sourceRefreshable }
+        : server) });
     });
   };
 
@@ -365,6 +389,7 @@ class DevelopmentDemoController implements RouteDeckController {
         await this.stopDemo();
       }
       const servers = this.snapshot.servers.filter((server) => server.sourceId !== sourceId);
+      this.subscriptionUrls.delete(sourceId);
       this.publish({ servers, selectedServerId: servers.some((server) => server.id === this.snapshot.selectedServerId) ? this.snapshot.selectedServerId : servers[0]?.id ?? "" });
     });
   };
@@ -466,6 +491,7 @@ class DevelopmentDemoController implements RouteDeckController {
   resetLocalState = async () => {
     ++this.operation;
     await wait(220);
+    this.subscriptionUrls.clear();
     this.publish({
       phase: "disconnected",
       mode: "proxy",

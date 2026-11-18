@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-subscription-url"
+description = "Enables the get_subscription_url command without any pre-configured scope."
+commands.allow = ["get_subscription_url"]
+
+[[permission]]
+identifier = "deny-get-subscription-url"
+description = "Denies the get_subscription_url command without any pre-configured scope."
+commands.deny = ["get_subscription_url"]

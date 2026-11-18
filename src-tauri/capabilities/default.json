@@ -9,6 +9,8 @@
     "allow-preview-import-url",
     "allow-discard-import-preview",
     "allow-confirm-import",
+    "allow-get-subscription-url",
+    "allow-edit-subscription",
     "allow-refresh-source",
     "allow-remove-source",
     "allow-start-local-proxy",
