@@ -88,17 +88,56 @@ foreach ($entry in $expected.GetEnumerator()) {
   if (-not $actual.ContainsKey($entry.Key) -or $actual[$entry.Key] -cne $entry.Value) { throw 'Release asset checksum mismatch' }
 }
 $notes = Join-Path $artifacts 'release-notes.md'
-$downloadLink = "https://github.com/oda02/RouteDeck/releases/download/$tag/$archiveName"
-$releaseText = "Скачать приложение: [$archiveName]($downloadLink)`n`n" + @'
-Portable для Windows x64: распакуйте весь архив и запустите routedeck.exe. sing-box, Cronet и Xray уже включены; устанавливать движки отдельно не нужно.
+$sourceTag = "sources-$tag"
+$releaseBase = "https://github.com/$($env:GH_REPO)/releases"
+$downloadLink = "$releaseBase/download/$tag/$archiveName"
+$downloadLabel = 'Скачать RouteDeck для Windows x64 · Portable'
+$releaseText = @"
+## [$downloadLabel]($downloadLink)
 
-The separately attached source archives are optional downloads for inspecting the corresponding external source code. They are not needed to run RouteDeck.
+Распакуйте весь ZIP и запустите ``routedeck.exe``. sing-box, Cronet и Xray уже входят в архив.
 
-`SHA256SUMS.txt` detects accidental corruption. Stable full portable releases also include the detached Ed25519-signed update descriptor. Existing unsigned versions need a first manual update to a signed portable release. Prereleases remain manual downloads. Installation requires verified tunnel teardown and an explicit restart.
-'@
+<details>
+<summary>Лицензии, исходный код и SHA-256</summary>
+
+Тексты лицензий входят в ZIP. [Исходный код компонентов этой версии]($releaseBase/tag/$sourceTag) доступен отдельным выпуском.
+
+SHA-256 portable ZIP — ``$($expected[$archiveName])``
+
+</details>
+"@
 [IO.File]::WriteAllText($notes, $releaseText, [Text.UTF8Encoding]::new($false))
-$assets = @($archive,$inventoryPath) + @($sourceAssets) + $updateAssets + @($sums)
+$commit = & git -C $repo rev-parse --verify HEAD
+if ($LASTEXITCODE -ne 0 -or $commit -cnotmatch '^[0-9a-f]{40}$') { throw 'Could not resolve the release source commit' }
+$previousTag = & gh release list --repo $env:GH_REPO --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // empty'
+if ($LASTEXITCODE -ne 0) { throw 'Could not determine the previous stable release' }
+$sourceFiles = @($inventoryPath) + @($sourceAssets)
+$sourceNotes = "Исходный код компонентов, входящих в [RouteDeck $version]($releaseBase/tag/$tag). Контрольные суммы файлов указаны в engine-distribution-inventory.json."
+$sourceArguments = @('release','create',$sourceTag) + $sourceFiles + @('--repo',$env:GH_REPO,'--target',$commit,'--title',"RouteDeck $version · Исходный код компонентов",'--notes',$sourceNotes,'--prerelease','--latest=false')
+& gh @sourceArguments
+if ($LASTEXITCODE -ne 0) {
+  # A retry can proceed only if the complete companion was already published.
+  $remoteJson = & gh api "repos/$($env:GH_REPO)/releases/tags/$sourceTag"
+  if ($LASTEXITCODE -ne 0) { throw 'Engine source release publication failed' }
+  $remote = $remoteJson | ConvertFrom-Json
+  $remoteNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+  if ($remote.draft -or -not $remote.prerelease -or $remote.tag_name -cne $sourceTag -or
+      @($remote.assets).Count -ne $sourceFiles.Count) {
+    throw 'Existing engine source release does not match this build'
+  }
+  foreach ($asset in $remote.assets) {
+    if ($asset.state -ceq 'uploaded') { [void]$remoteNames.Add("$($asset.name):$($asset.digest)") }
+  }
+  foreach ($path in $sourceFiles) {
+    $name = [IO.Path]::GetFileName($path)
+    if (-not $remoteNames.Contains("${name}:sha256:$($expected[$name])")) { throw 'Existing engine source release does not match this build' }
+  }
+}
+$sourceCommit = & gh api "repos/$($env:GH_REPO)/commits/$sourceTag" --jq .sha
+if ($LASTEXITCODE -ne 0 -or $sourceCommit -cne $commit) { throw 'Engine source tag does not match the release source commit' }
+$assets = @("$archive#$downloadLabel") + $updateAssets
 $arguments = @('release','create',$tag) + $assets + @('--repo',$env:GH_REPO,'--verify-tag','--title',"RouteDeck $version",'--notes-file',$notes,'--generate-notes')
+if ($previousTag -and $previousTag -cne $tag) { $arguments += @('--notes-start-tag',$previousTag) }
 if ($version.Contains('-')) { $arguments += @('--prerelease','--latest=false') } else { $arguments += '--latest' }
 & gh @arguments
 if ($LASTEXITCODE -ne 0) { throw 'Release publication failed; existing assets are preserved' }

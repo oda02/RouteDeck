@@ -15,14 +15,18 @@
   and enable **Also build the full portable distribution**. The packaging steps
   verify reviewed VPN engines against committed size/SHA-256 pins, collect the
   notices and corresponding sources, and package the engines without executing them.
-- The Windows artifact is `RouteDeck-<version>-windows-x64.zip` with `SHA256SUMS.txt`.
+- The Windows CI artifact includes `RouteDeck-<version>-windows-x64.zip` and
+  `SHA256SUMS.txt` for publisher verification.
   CI artifacts expire after one day; published release assets remain available.
   They contain the controller and its exact
   helper and updater, pinned sing-box/Cronet and Xray, dependency notices and runtime pins,
   without user state. Extract the ZIP and run `routedeck.exe`; see
-  `docs/portable-full-release.txt`. Corresponding runtime source archives and an
-  inventory are published alongside it. Source downloads are optional for users
-  who only want to run the application.
+  `docs/portable-full-release.txt`. The GitHub release starts with a direct
+  portable download and lists the ZIP in Assets. Stable releases also attach the
+  two files required by installed updaters. The ZIP digest and a link to the
+  corresponding engine sources are in the expandable release notes. The sources
+  and their digest inventory are published first under `sources-vX.Y.Z` as a
+  companion prerelease, outside the stable update channel.
 - A pushed `vX.Y.Z` tag uses the unexpired portable artifact from a successful
   push-triggered CI run on `main` for that exact commit. If that run is still
   in progress, Release waits up to 30 minutes. If the artifact is unavailable,
@@ -109,7 +113,7 @@ garbage collection are outside this implementation. Incomplete replacements
 refuse to launch and provide a manual repair path.
 
 Only trusted stable tag publishing receives `ROUTEDECK_UPDATE_SIGNING_KEY`; PR
-builds never receive it. `SHA256SUMS.txt` is integrity metadata; the detached
+builds never receive it. The published ZIP checksum is integrity metadata. The detached
 Ed25519 signature authenticates update metadata. See
 [the release-signing workflow](portable-updater-release.md) and
 [implementation/qualification limits](portable-updater.md). No real isolated
