@@ -654,9 +654,18 @@ try {
   await tunError.getByRole("button", { name: "Диагностика", exact: true }).click();
   await page.getByRole("heading", { name: "Туннели, мешающие TUN" }).waitFor();
   await page.getByText("Интерфейс Windows «Fixture VPN» (индекс 4).", { exact: true }).waitFor();
-  await page.getByRole("button", { name: "Открыть сетевые подключения Windows", exact: true }).click();
+  const tunnels = page.getByRole("region", { name: "Туннели, мешающие TUN" });
+  const openAdapters = tunnels.getByRole("button", { name: "Открыть сетевые подключения Windows", exact: true });
+  const launcherError = tunnels.getByRole("alert").filter({ hasText: "control.exe netconnections" });
+  await page.evaluate(() => { window.__routeDeckFixture.failOpenNetworkSettings = true; });
+  await openAdapters.click();
+  await launcherError.waitFor();
+  await page.evaluate(() => { window.__routeDeckFixture.failOpenNetworkSettings = false; });
   await page.getByRole("button", { name: "Открыть настройки прокси Windows", exact: true }).click();
-  assert.deepEqual(await page.evaluate(() => window.__routeDeckFixture.calls.filter(({ command }) => command === "open_network_settings").map(({ page }) => page)), ["adapters", "proxy"]);
+  await launcherError.waitFor();
+  await openAdapters.click();
+  await launcherError.waitFor({ state: "hidden" });
+  assert.deepEqual(await page.evaluate(() => window.__routeDeckFixture.calls.filter(({ command }) => command === "open_network_settings").map(({ page }) => page)), ["adapters", "proxy", "adapters"]);
   assert.equal(await cleanupCount(), 2);
   await page.evaluate(() => {
     const fixture = window.__routeDeckFixture;

@@ -68,7 +68,10 @@ const transport = {
     if (command === "install_app_update") { if (fixture.failUpdateInstall) throw "portable_update_failed"; if (fixture.snapshot().phase !== "disconnected" || fixture.snapshot().connectionRequested) throw "portable_update_disconnect_first"; return null; }
     if (command === "confirmed_nodes") return structuredClone(fixture.nodes);
     if (command === "runtime_diagnostics") return { status: current, lines: ["Fixture diagnostics"], systemProxy: structuredClone(fixture.systemProxy), tunConflicts: fixture.tunConflicts };
-    if (command === "open_network_settings") return null;
+    if (command === "open_network_settings") {
+      if (fixture.failOpenNetworkSettings) throw { code: "command_failed", stage: "command", message: "Fixture launcher failed" };
+      return null;
+    }
     if (command === "clear_stale_system_proxy") {
       if (fixture.proxyCleanupDelay) await sleep(fixture.proxyCleanupDelay);
       if (args?.token !== fixture.systemProxy.cleanupToken) throw { code: "runtime_failure", stage: "system_proxy_restore", message: "stale observation" };

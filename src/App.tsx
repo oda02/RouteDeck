@@ -838,6 +838,31 @@ function SettingsPage({ headingRef, draft, onDraftChange, onReset, saveState, re
   );
 }
 
+function NetworkSettingsButton({ page }: { page: "proxy" | "adapters" }) {
+  const [opening, setOpening] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const adapters = page === "adapters";
+  const open = async () => {
+    setOpening(true);
+    setFailed(false);
+    try { await controller.openNetworkSettings(page); }
+    catch { setFailed(true); }
+    finally { setOpening(false); }
+  };
+  return (
+    <>
+      <button className="secondary-button compact-action" type="button" disabled={opening} aria-busy={opening} onClick={() => { void open(); }}>
+        {adapters ? "Открыть сетевые подключения Windows" : "Открыть настройки прокси Windows"}
+      </button>
+      {failed ? (
+        <p className="field-error" role="alert">
+          {adapters ? <>Не удалось открыть окно. Нажмите <kbd>Win+R</kbd> и выполните <code>control.exe netconnections</code>.</> : "Не удалось открыть настройки прокси Windows."}
+        </p>
+      ) : null}
+    </>
+  );
+}
+
 function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, actionFailure, onClearFailure, onClearStaleProxy }: {
   snapshot: ControllerSnapshot;
   headingRef: React.RefObject<HTMLHeadingElement | null>;
@@ -879,14 +904,6 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
   const { tunConflicts } = snapshot.diagnostics;
   const canDisableProxy = (snapshot.phase === "disconnected" || (snapshot.phase === "failed" && !snapshot.activeMode) || (snapshot.phase === "connected" && snapshot.activeMode === "tun"))
     && !checking && !snapshot.switching && !snapshot.diagnostics.running;
-  const openWindowsPage = (page: "proxy" | "adapters") => {
-    void runAsyncAction({
-      page: "diagnostics",
-      title: "Не удалось открыть настройки Windows",
-      action: () => controller.openNetworkSettings(page),
-      retry: () => openWindowsPage(page),
-    });
-  };
   const proxyPresentation = {
     disabled: ["Отключён", "Прокси Windows не используется."],
     owned: ["Принадлежит RouteDeck", "Системная настройка принадлежит текущему подключению RouteDeck."],
@@ -910,7 +927,7 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
         <p>{proxyPresentation[1]}</p>
         {proxy.endpoint ? <dl className="diagnostic-facts"><div><dt>Адрес в настройках</dt><dd>{proxy.endpoint}</dd></div><div><dt>Слушатель на порту</dt><dd>{proxy.state === "stale" ? "Не найден" : proxy.state === "foreignActive" ? "Обнаружен" : "Не проверялся"}</dd></div></dl> : null}
         {proxy.state === "stale" && proxy.cleanupToken ? <button className="danger-button compact-action" type="button" disabled={!canDisableProxy} onClick={onClearStaleProxy}>Отключить неработающий прокси</button> : null}
-        {proxy.state === "conflict" || proxy.state === "foreignActive" ? <button className="secondary-button compact-action" type="button" onClick={() => openWindowsPage("proxy")}>Открыть настройки прокси Windows</button> : null}
+        {proxy.state === "conflict" || proxy.state === "foreignActive" ? <NetworkSettingsButton page="proxy" /> : null}
       </section>
       <section className="card system-proxy-card" aria-labelledby="tun-conflicts-title">
         <div className="system-proxy-card__heading"><h2 id="tun-conflicts-title">Туннели, мешающие TUN</h2></div>
@@ -918,7 +935,7 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
           <>
             <ul className="tun-conflict-list">{tunConflicts.map((detail, index) => <li key={index}>{detail}</li>)}</ul>
             <p>Отключите VPN в его приложении или через сетевые подключения Windows, затем обновите состояние.</p>
-            <button className="secondary-button compact-action" type="button" onClick={() => openWindowsPage("adapters")}>Открыть сетевые подключения Windows</button>
+            <NetworkSettingsButton page="adapters" />
           </>
         ) : <p>{tunConflicts ? "Конфликтующие маршруты не обнаружены." : snapshot.diagnostics.snapshotReceivedAt ? "Не удалось проверить маршруты Windows." : "Обновите состояние, чтобы проверить маршруты Windows."}</p>}
       </section>

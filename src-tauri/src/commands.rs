@@ -281,44 +281,44 @@ pub enum NetworkSettingsPage {
 pub fn open_network_settings(page: NetworkSettingsPage) -> Result<(), PublicError> {
     #[cfg(windows)]
     {
-        use std::ptr::null;
+        use std::{
+            ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf, process::Command, ptr::null,
+        };
         use windows_sys::Win32::{
             System::SystemInformation::GetSystemDirectoryW,
             UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
         };
 
-        let target = match page {
-            NetworkSettingsPage::Proxy => Some(
-                "ms-settings:network-proxy"
-                    .encode_utf16()
-                    .chain(Some(0))
-                    .collect::<Vec<_>>(),
-            ),
+        let opened = match page {
+            NetworkSettingsPage::Proxy => {
+                let result = unsafe {
+                    ShellExecuteW(
+                        std::ptr::null_mut(),
+                        windows_sys::w!("open"),
+                        windows_sys::w!("ms-settings:network-proxy"),
+                        null(),
+                        null(),
+                        SW_SHOWNORMAL,
+                    )
+                };
+                result as isize > 32
+            }
             NetworkSettingsPage::Adapters => {
-                let mut directory = vec![0; 260];
+                let mut directory = [0; 260];
                 let length = unsafe {
                     GetSystemDirectoryW(directory.as_mut_ptr(), directory.len() as u32)
                 } as usize;
-                (length > 0 && length < directory.len()).then(|| {
-                    directory.truncate(length);
-                    directory.extend("\\ncpa.cpl".encode_utf16().chain(Some(0)));
-                    directory
-                })
+                // Invoke the Control Panel entry directly instead of opening a .cpl file association.
+                length > 0
+                    && length < directory.len()
+                    && Command::new(
+                        PathBuf::from(OsString::from_wide(&directory[..length])).join("control.exe"),
+                    )
+                    .arg("netconnections")
+                    .spawn()
+                    .is_ok()
             }
         };
-        let opened = target.is_some_and(|target| {
-            let result = unsafe {
-                ShellExecuteW(
-                    std::ptr::null_mut(),
-                    windows_sys::w!("open"),
-                    target.as_ptr(),
-                    null(),
-                    null(),
-                    SW_SHOWNORMAL,
-                )
-            };
-            result as isize > 32
-        });
         if opened {
             return Ok(());
         }
