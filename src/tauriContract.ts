@@ -39,6 +39,7 @@ const publicErrorCodes = [
   "active_session_conflict",
   "session_changed",
   "node_not_found",
+  "tun_route_conflict",
   "runtime_failure",
   "command_failed",
   "subscription_url_invalid",
@@ -149,6 +150,7 @@ export interface DiagnosticsDto {
   status: RuntimeStatusDto;
   lines: string[];
   systemProxy: SystemProxyDiagnosticDto;
+  tunConflicts: string[] | null;
 }
 
 export interface SystemProxyDiagnosticDto {
@@ -538,12 +540,20 @@ export function parseConfirmedImport(value: unknown): ConfirmedImportDto {
 
 export function parseDiagnostics(value: unknown): DiagnosticsDto {
   const input = record(value);
-  exactKeys(input, ["status", "lines", "systemProxy"]);
+  exactKeys(input, ["status", "lines", "systemProxy", "tunConflicts"], ["status", "lines", "systemProxy"]);
   if (!Array.isArray(input.lines) || input.lines.length > 256) throw new ContractViolation();
+  const rawConflicts = input.tunConflicts ?? null;
+  if (rawConflicts !== null && (!Array.isArray(rawConflicts) || rawConflicts.length > 32)) throw new ContractViolation();
+  const tunConflicts = rawConflicts === null ? null : rawConflicts.map((item) => {
+    const label = boundedString(item, 2048);
+    if (/[\u0000-\u001f\u007f-\u009f\u2028-\u202e\u2066-\u2069]/.test(label)) throw new ContractViolation();
+    return label;
+  });
   return {
     status: parseRuntimeStatus(input.status),
     lines: input.lines.map((line) => boundedString(line, 8192, true)),
     systemProxy: parseSystemProxyDiagnostic(input.systemProxy),
+    tunConflicts,
   };
 }
 

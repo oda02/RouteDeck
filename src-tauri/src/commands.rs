@@ -270,6 +270,69 @@ pub async fn clear_stale_system_proxy(
         .map_err(command_join_error)?
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NetworkSettingsPage {
+    Proxy,
+    Adapters,
+}
+
+#[tauri::command]
+pub fn open_network_settings(page: NetworkSettingsPage) -> Result<(), PublicError> {
+    #[cfg(windows)]
+    {
+        use std::ptr::null;
+        use windows_sys::Win32::{
+            System::SystemInformation::GetSystemDirectoryW,
+            UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+        };
+
+        let target = match page {
+            NetworkSettingsPage::Proxy => Some(
+                "ms-settings:network-proxy"
+                    .encode_utf16()
+                    .chain(Some(0))
+                    .collect::<Vec<_>>(),
+            ),
+            NetworkSettingsPage::Adapters => {
+                let mut directory = vec![0; 260];
+                let length = unsafe {
+                    GetSystemDirectoryW(directory.as_mut_ptr(), directory.len() as u32)
+                } as usize;
+                (length > 0 && length < directory.len()).then(|| {
+                    directory.truncate(length);
+                    directory.extend("\\ncpa.cpl".encode_utf16().chain(Some(0)));
+                    directory
+                })
+            }
+        };
+        let opened = target.is_some_and(|target| {
+            let result = unsafe {
+                ShellExecuteW(
+                    std::ptr::null_mut(),
+                    windows_sys::w!("open"),
+                    target.as_ptr(),
+                    null(),
+                    null(),
+                    SW_SHOWNORMAL,
+                )
+            };
+            result as isize > 32
+        });
+        if opened {
+            return Ok(());
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = page;
+    Err(PublicError {
+        code: PublicErrorCode::CommandFailed,
+        stage: PublicErrorStage::Command,
+        message: "Could not open Windows network settings".into(),
+        detail: None,
+    })
+}
+
 /// Lists distinct executable images in the current interactive Windows session.
 /// Processes whose image path cannot be queried are deliberately omitted.
 #[tauri::command]

@@ -640,6 +640,34 @@ try {
   assert.equal(await page.getByRole("button", { name: "Отключить неработающий прокси", exact: true }).count(), 0);
   await checkFrame(); scenarios++;
 
+  await page.evaluate(() => {
+    const fixture = window.__routeDeckFixture;
+    fixture.systemProxy = { state: "foreignActive", endpoint: "127.0.0.1:24081", detail: "Fixture listener", cleanupToken: null };
+    fixture.tunConflicts = ["Интерфейс Windows «Fixture VPN» (индекс 4)."];
+  });
+  await nav("Главная");
+  await page.locator('.mode-section label').filter({ hasText: /^TUN$/ }).click();
+  await page.getByRole("button", { name: "Подключить", exact: true }).click();
+  const tunError = page.getByRole("alert").filter({ hasText: "Не удалось запустить TUN" });
+  await tunError.getByRole("button", { name: "Показать подробности", exact: true }).click();
+  await tunError.getByText("Интерфейс Windows «Fixture VPN» (индекс 4).", { exact: true }).waitFor();
+  await tunError.getByRole("button", { name: "Диагностика", exact: true }).click();
+  await page.getByRole("heading", { name: "Туннели, мешающие TUN" }).waitFor();
+  await page.getByText("Интерфейс Windows «Fixture VPN» (индекс 4).", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Открыть сетевые подключения Windows", exact: true }).click();
+  await page.getByRole("button", { name: "Открыть настройки прокси Windows", exact: true }).click();
+  assert.deepEqual(await page.evaluate(() => window.__routeDeckFixture.calls.filter(({ command }) => command === "open_network_settings").map(({ page }) => page)), ["adapters", "proxy"]);
+  assert.equal(await cleanupCount(), 2);
+  await page.evaluate(() => {
+    const fixture = window.__routeDeckFixture;
+    fixture.tunConflicts = [];
+    fixture.systemProxy = { state: "disabled", endpoint: null, detail: "Прокси Windows отключён.", cleanupToken: null };
+  });
+  await nav("Главная");
+  await page.getByRole("button", { name: "Отключить", exact: true }).click();
+  await page.getByRole("button", { name: "Подключить", exact: true }).waitFor();
+  await checkFrame(); scenarios++;
+
   // Stack selection is persisted and handed only to TUN. A live TUN changes
   // through stop/start; the same preference edit leaves System Proxy running.
   await nav("Правила");

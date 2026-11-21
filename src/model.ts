@@ -134,6 +134,7 @@ export interface DiagnosticsState {
   steps: ConnectionProof[];
   sanitizedLog: string[];
   systemProxy: SystemProxyDiagnostic;
+  tunConflicts: string[] | null;
 }
 
 export type SystemProxyDiagnosticState = "disabled" | "owned" | "foreignActive" | "stale" | "conflict" | "unavailable";
@@ -188,6 +189,7 @@ export type RouteDeckErrorCode =
   | "capability-unavailable"
   | "tun-admin-required"
   | "tun-uac-cancelled"
+  | "tun-route-conflict"
   | "runtime-failure"
   | "session-recovery-required"
   | "server-switch-failed"
@@ -247,6 +249,7 @@ export interface RouteDeckController {
   saveSettings: (settings: SettingsConfig) => Promise<void>;
   runDiagnostics: () => Promise<void>;
   clearStaleSystemProxy: (token: string) => Promise<void>;
+  openNetworkSettings: (page: "proxy" | "adapters") => Promise<void>;
   resetLocalState: () => Promise<void>;
   getSanitizedReport: () => string;
   dispose?: () => void;

@@ -46,6 +46,7 @@ import {
 } from "./icons";
 import {
   destinations,
+  RouteDeckError,
   type AppNotice,
   type AppRouteChoice,
   type AppRule,
@@ -66,7 +67,7 @@ type DialogKind = "import" | "refresh-source" | "edit-source" | "remove-source" 
 type ImportKind = "manual" | "subscription";
 type ToastKind = "success" | "info" | "warning";
 type ToastState = { message: string; kind: ToastKind };
-type ActionFailure = { page: Destination; notice: AppNotice; retry?: () => void };
+type ActionFailure = { page: Destination; notice: AppNotice; retry?: () => void; tunRouteConflict?: boolean };
 type AsyncActionOptions<T> = {
   page: Destination;
   title: string;
@@ -218,13 +219,14 @@ function OpaqueNotice({ notice, onClose, primaryAction, secondaryAction }: {
   );
 }
 
-function ActionFailureNotice({ failure, page, onClear }: { failure: ActionFailure | null; page: Destination; onClear: () => void }) {
+function ActionFailureNotice({ failure, page, onClear, onDiagnostics }: { failure: ActionFailure | null; page: Destination; onClear: () => void; onDiagnostics?: () => void }) {
   if (!failure || failure.page !== page) return null;
   return (
     <OpaqueNotice
       notice={failure.notice}
       onClose={onClear}
       primaryAction={failure.retry ? { label: "Повторить", onClick: failure.retry } : undefined}
+      secondaryAction={failure.tunRouteConflict && onDiagnostics ? { label: "Диагностика", onClick: onDiagnostics } : undefined}
     />
   );
 }
@@ -318,7 +320,7 @@ function HomePage({ snapshot, libraryBusy, headingRef, onNavigate, onModeChange,
   return (
     <div className="page home-page">
       <h1 className="sr-only" ref={headingRef} tabIndex={-1}>Главная</h1>
-      <ActionFailureNotice failure={recoveryRequired ? null : actionFailure} page="home" onClear={onClearFailure} />
+      <ActionFailureNotice failure={recoveryRequired ? null : actionFailure} page="home" onClear={onClearFailure} onDiagnostics={() => onNavigate("diagnostics")} />
       {recoveryRequired && snapshot.notice ? <OpaqueNotice notice={actionFailure?.page === "home" ? { ...snapshot.notice, title: actionFailure.notice.title, body: actionFailure.notice.body } : snapshot.notice} secondaryAction={{ label: "Диагностика", onClick: () => onNavigate("diagnostics") }} /> : null}
       <section className="connection-hero" data-state={connected ? "connected" : pending ? "pending" : snapshot.phase === "failed" ? "failed" : "idle"} aria-label="Подключение">
         <div className="hero-status-row">
@@ -874,10 +876,21 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
     redactedDetail: "Локальные прокси могут работать на разных портах, но эффективный системный прокси Windows только один.",
   };
   const proxy = snapshot.diagnostics.systemProxy;
+  const { tunConflicts } = snapshot.diagnostics;
+  const canDisableProxy = (snapshot.phase === "disconnected" || (snapshot.phase === "failed" && !snapshot.activeMode) || (snapshot.phase === "connected" && snapshot.activeMode === "tun"))
+    && !checking && !snapshot.switching && !snapshot.diagnostics.running;
+  const openWindowsPage = (page: "proxy" | "adapters") => {
+    void runAsyncAction({
+      page: "diagnostics",
+      title: "Не удалось открыть настройки Windows",
+      action: () => controller.openNetworkSettings(page),
+      retry: () => openWindowsPage(page),
+    });
+  };
   const proxyPresentation = {
     disabled: ["Отключён", "Прокси Windows не используется."],
     owned: ["Принадлежит RouteDeck", "Системная настройка принадлежит текущему подключению RouteDeck."],
-    foreignActive: ["Используется другой программой", "По сохранённому адресу есть локальный слушатель. RouteDeck не будет менять эти настройки."],
+    foreignActive: ["Найден локальный слушатель", "На порту, указанном в настройках прокси Windows, есть локальный слушатель."],
     stale: ["Не отвечает", "Прокси Windows указывает на локальный порт, на котором нет работающего слушателя."],
     conflict: ["Требует проверки", "Настройки неоднозначны или не совпадают с сохранённым состоянием. Автоматическая очистка недоступна."],
     unavailable: ["Не удалось проверить", "Windows не вернула достоверное состояние системного прокси."],
@@ -895,8 +908,19 @@ function DiagnosticsPage({ snapshot, headingRef, onToast, runAsyncAction, action
       <section className="card system-proxy-card" aria-labelledby="system-proxy-title">
         <div className="system-proxy-card__heading"><div><p className="overline">Windows</p><h2 id="system-proxy-title">Системный прокси</h2></div><span className="quiet-badge" data-state={proxy.state}>{proxyPresentation[0]}</span></div>
         <p>{proxyPresentation[1]}</p>
-        {proxy.endpoint ? <dl className="diagnostic-facts"><div><dt>Адрес</dt><dd>{proxy.endpoint}</dd></div><div><dt>Локальный слушатель</dt><dd>{proxy.state === "stale" ? "Не найден" : proxy.state === "foreignActive" ? "Обнаружен" : "Не проверялся"}</dd></div></dl> : null}
-        {proxy.state === "stale" && proxy.cleanupToken ? <button className="danger-button compact-action" type="button" disabled={checking || snapshot.diagnostics.running || Boolean(snapshot.switching) || !(snapshot.phase === "disconnected" || (snapshot.phase === "connected" && snapshot.activeMode === "tun"))} onClick={onClearStaleProxy}>Отключить неработающий прокси</button> : null}
+        {proxy.endpoint ? <dl className="diagnostic-facts"><div><dt>Адрес в настройках</dt><dd>{proxy.endpoint}</dd></div><div><dt>Слушатель на порту</dt><dd>{proxy.state === "stale" ? "Не найден" : proxy.state === "foreignActive" ? "Обнаружен" : "Не проверялся"}</dd></div></dl> : null}
+        {proxy.state === "stale" && proxy.cleanupToken ? <button className="danger-button compact-action" type="button" disabled={!canDisableProxy} onClick={onClearStaleProxy}>Отключить неработающий прокси</button> : null}
+        {proxy.state === "conflict" || proxy.state === "foreignActive" ? <button className="secondary-button compact-action" type="button" onClick={() => openWindowsPage("proxy")}>Открыть настройки прокси Windows</button> : null}
+      </section>
+      <section className="card system-proxy-card" aria-labelledby="tun-conflicts-title">
+        <div className="system-proxy-card__heading"><h2 id="tun-conflicts-title">Туннели, мешающие TUN</h2></div>
+        {tunConflicts?.length ? (
+          <>
+            <ul className="tun-conflict-list">{tunConflicts.map((detail, index) => <li key={index}>{detail}</li>)}</ul>
+            <p>Отключите VPN в его приложении или через сетевые подключения Windows, затем обновите состояние.</p>
+            <button className="secondary-button compact-action" type="button" onClick={() => openWindowsPage("adapters")}>Открыть сетевые подключения Windows</button>
+          </>
+        ) : <p>{tunConflicts ? "Конфликтующие маршруты не обнаружены." : snapshot.diagnostics.snapshotReceivedAt ? "Не удалось проверить маршруты Windows." : "Обновите состояние, чтобы проверить маршруты Windows."}</p>}
       </section>
       <ProofCard proofs={snapshot.diagnostics.steps} title="Проверки" />
       <button className="secondary-button full-width" type="button" disabled={copying} aria-busy={copying} onClick={copyReport}>{copying ? <LoaderIcon size={19} /> : <CopyIcon size={19} />}{copying ? "Копируем…" : "Копировать отчёт"}</button>
@@ -1232,6 +1256,7 @@ export default function App() {
         setActionFailure({
           page,
           retry,
+          tunRouteConflict: error instanceof RouteDeckError && error.code === "tun-route-conflict",
           notice: {
             id: `action-${page}`,
             kind: "error",
@@ -1318,6 +1343,9 @@ export default function App() {
   const openServerPicker = (destination: Destination) => {
     navigate(destination);
     if (destination === "servers") setReturnAfterPick(true);
+    if (destination === "diagnostics" && !snapshot.diagnostics.running) {
+      void runAsyncAction({ page: "diagnostics", title: "Не удалось обновить состояние", action: controller.runDiagnostics });
+    }
   };
 
   const selectServer = (serverId: string) => {
@@ -1584,7 +1612,7 @@ export default function App() {
       {dialog === "clear-stale-proxy" && proxyCleanupToken ? (
         <Dialog title="Отключить неработающий прокси?" description="RouteDeck ещё раз проверит сохранённое состояние перед изменением." onClose={closeDialog} busy={proxyCleanupBusy} closeDisabled={proxyCleanupBusy}
           actions={<><button className="secondary-button" type="button" data-autofocus disabled={proxyCleanupBusy} onClick={closeDialog}>Отмена</button><button className="danger-button" type="button" disabled={proxyCleanupBusy} onClick={confirmProxyCleanup}>{proxyCleanupBusy ? <LoaderIcon size={19} /> : null}{proxyCleanupBusy ? "Отключаем…" : "Отключить прокси"}</button></>}>
-          <p className="dialog-copy">Сохранённая настройка системного прокси Windows будет отключена. RouteDeck не завершает работающие процессы VPN или прокси-программ.</p>
+          <p className="dialog-copy">Ручная настройка прокси Windows для {snapshot.diagnostics.systemProxy.endpoint} будет отключена. Процессы VPN и прокси-программы продолжат работу.</p>
           {proxyCleanupBusy ? <p role="status" aria-live="polite" tabIndex={-1} data-dialog-busy-focus><LoaderIcon size={17} />Проверяем состояние и отключаем прокси…</p> : null}
         </Dialog>
       ) : null}

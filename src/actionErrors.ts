@@ -2,7 +2,7 @@ import { RouteDeckError } from "./model.ts";
 
 export type PublicActionError = { message: string; redactedDetail?: string };
 
-/** Maps finite internal codes to localized copy without exposing backend detail. */
+/** Maps finite internal codes to localized copy and keeps technical detail separate. */
 export function toPublicActionError(error: unknown): PublicActionError {
   if (error instanceof RouteDeckError) {
     switch (error.code) {
@@ -20,6 +20,11 @@ export function toPublicActionError(error: unknown): PublicActionError {
         return { message: "Не удалось запросить права Windows для TUN. Перезапустите RouteDeck и попробуйте снова." };
       case "tun-uac-cancelled":
         return { message: "Запрос прав Windows отменён. Нажмите «Подключить» ещё раз и подтвердите стандартное окно Windows." };
+      case "tun-route-conflict":
+        return {
+          message: "Маршруты через VPN-адаптер в Windows мешают запуску TUN. Посмотрите, какой интерфейс обнаружил RouteDeck, отключите соответствующий VPN и нажмите «Повторить».",
+          redactedDetail: error.redactedDetail,
+        };
       case "server-switch-failed":
         return { message: "Не удалось сменить сервер. TUN не перезапускался. Выберите другой сервер или откройте диагностику.", redactedDetail: error.redactedDetail };
       case "server-switch-not-prepared":

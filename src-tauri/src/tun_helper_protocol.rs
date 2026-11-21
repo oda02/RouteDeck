@@ -5,7 +5,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 4;
+pub(crate) const PROTOCOL_VERSION: u16 = 5;
 pub(crate) const MAX_FRAME_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
@@ -122,6 +122,7 @@ pub(crate) enum HelperFailureCode {
     ConfigRejected,
     EngineRejected,
     PreflightConflict,
+    RouteConflict,
     CaptureInvalid,
     StartFailed,
     StopFailed,
@@ -497,7 +498,7 @@ mod tests {
             ("config", serde_json::json!({})),
             ("executable", serde_json::json!("arbitrary.exe")),
             ("target_index", serde_json::json!(65536)),
-            ("protocol_version", serde_json::json!(3)),
+            ("protocol_version", serde_json::json!(4)),
         ] {
             let mut raw = value.clone();
             raw[key] = hostile;
@@ -506,6 +507,18 @@ mod tests {
             framed.extend(payload);
             assert!(read_frame(&mut Cursor::new(framed)).is_err());
         }
+    }
+
+    #[test]
+    fn route_conflict_has_a_distinct_helper_failure_code_on_the_wire() {
+        let frame = Frame::Failure {
+            request_id: 2,
+            code: HelperFailureCode::RouteConflict,
+            safe_detail: None,
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &frame).unwrap();
+        assert_eq!(read_frame(&mut Cursor::new(bytes)).unwrap(), frame);
     }
 
     #[test]

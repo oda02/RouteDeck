@@ -829,6 +829,7 @@ h2 {
   padding-top: 7px;
   border-top: 1px solid currentColor;
   opacity: .88;
+  overflow-wrap: anywhere;
 }
 
 .notice-actions {
@@ -1480,6 +1481,8 @@ select,
 .diagnostic-facts > div { min-width: 0; padding: 10px 12px; border-radius: 10px; background: var(--bg-hover); }
 .diagnostic-facts dt { color: var(--text-secondary); font-size: .78rem; }
 .diagnostic-facts dd { margin: 3px 0 0; overflow-wrap: anywhere; }
+.tun-conflict-list { margin: 0; padding-inline-start: 1.25rem; overflow-wrap: anywhere; }
+.tun-conflict-list li + li { margin-top: 6px; }
 
 @media (max-width: 520px) {
   .system-proxy-card__heading { flex-wrap: wrap; }
