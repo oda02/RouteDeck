@@ -158,6 +158,7 @@ const initialSnapshot: ControllerSnapshot = {
       "Секреты и адрес подписки удалены из отчёта.",
     ],
     systemProxy: { state: "stale", endpoint: "127.0.0.1:10808", detail: "Прокси Windows включён, но локальный порт не отвечает.", cleanupToken: "d".repeat(64) },
+    tunConflicts: [],
   },
   subscriptionName: "DEMO provider",
   subscriptionUpdatedAt: "12 мин назад",
@@ -487,6 +488,8 @@ class DevelopmentDemoController implements RouteDeckController {
     await wait(220);
     this.publish({ diagnostics: { ...this.snapshot.diagnostics, snapshotReceivedAt: now(), systemProxy: { state: "disabled", endpoint: null, detail: "Прокси Windows отключён.", cleanupToken: null } } });
   };
+
+  openNetworkSettings = async () => { throw new RouteDeckError("capability-unavailable"); };
 
   resetLocalState = async () => {
     ++this.operation;

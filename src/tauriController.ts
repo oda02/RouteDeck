@@ -1,4 +1,5 @@
 import { defaultTrafficRules, RouteDeckError } from "./model.ts";
+import { toPublicActionError } from "./actionErrors.ts";
 import type {
   AppNotice,
   ConnectionMode,
@@ -203,6 +204,7 @@ const initialTauriSnapshot = (): ControllerSnapshot => ({
     steps: emptyProofs(),
     sanitizedLog: [],
     systemProxy: { state: "unavailable", endpoint: null, detail: "Состояние ещё не проверено.", cleanupToken: null },
+    tunConflicts: null,
   },
   subscriptionName: "Подписка не импортирована",
   subscriptionUpdatedAt: "—",
@@ -394,7 +396,9 @@ function runtimeNotice(status: RuntimeStatusDto): AppNotice | undefined {
       id: `runtime-${status.error.code}`,
       kind: "error",
       title: "Подключение требует внимания",
-      body: "RouteDeck не смог завершить операцию. Повторите попытку или откройте диагностику.",
+      body: status.error.code === "tun_route_conflict"
+        ? toPublicActionError(routeDeckErrorFromBackend(status.error)).message
+        : "RouteDeck не смог завершить операцию. Повторите попытку или откройте диагностику.",
       redactedDetail: status.error.detail,
     };
   }
@@ -473,6 +477,8 @@ function routeDeckErrorFromBackend(error: PublicErrorDto): RouteDeckError {
       return new RouteDeckError("stale-subscription-preview");
     case "node_not_found":
       return new RouteDeckError("node-not-selected");
+    case "tun_route_conflict":
+      return new RouteDeckError("tun-route-conflict", error.detail);
     case "subscription_url_invalid":
       return new RouteDeckError("invalid-subscription-url");
     case "subscription_policy_blocked":
@@ -1160,6 +1166,7 @@ export class TauriController implements RouteDeckController {
           steps: projectRuntimeProofs(diagnostics.status),
           sanitizedLog: diagnostics.lines,
           systemProxy: diagnostics.systemProxy,
+          tunConflicts: diagnostics.tunConflicts,
         },
       });
     } catch (error) {
@@ -1201,6 +1208,7 @@ export class TauriController implements RouteDeckController {
         steps: projectRuntimeProofs(diagnostics.status),
         sanitizedLog: diagnostics.lines,
         systemProxy: diagnostics.systemProxy,
+        tunConflicts: diagnostics.tunConflicts,
       } });
     } finally {
       this.proxyCleanupPending = false;
@@ -1208,6 +1216,19 @@ export class TauriController implements RouteDeckController {
       if (this.snapshot.diagnostics.systemProxy.cleanupToken === token) {
         this.publish({ diagnostics: { ...this.snapshot.diagnostics, systemProxy: { ...this.snapshot.diagnostics.systemProxy, cleanupToken: null } } });
       }
+    }
+  };
+
+  openNetworkSettings = async (page: "proxy" | "adapters"): Promise<void> => {
+    const transport = await this.requireTransport();
+    try {
+      parseUnitResponse(await transport.invoke("open_network_settings", { page }));
+    } catch (error) {
+      if (error instanceof ContractViolation) {
+        this.failBoundary("backend-response-invalid");
+        throw new RouteDeckError("backend-response-invalid");
+      }
+      throw this.invokeError(error);
     }
   };
 

@@ -1,3 +1,5 @@
+pub(crate) const TUN_ROUTE_CONFLICT_STAGE: &str = "tun_route_conflict";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TunUpstreamIdentity {
     pub(crate) interface_luid: u64,
@@ -74,7 +76,7 @@ mod windows {
         },
     };
 
-    use super::TunUpstreamIdentity;
+    use super::{TunUpstreamIdentity, TUN_ROUTE_CONFLICT_STAGE};
     use crate::{
         engine_runtime::{
             random_hex, DiagnosticBuffer, EngineLauncher, ManagedChild, RuntimeError,
@@ -296,6 +298,11 @@ mod windows {
                 request_id: 2,
                 stopped: false,
             }),
+            Frame::Failure {
+                request_id: 2,
+                code: HelperFailureCode::RouteConflict,
+                ..
+            } => Err(route_conflict_from_helper()),
             Frame::Failure {
                 request_id: 2,
                 code,
@@ -694,6 +701,11 @@ mod windows {
                     self.engine_created = engine_created;
                     Ok(())
                 }
+                Frame::Failure {
+                    request_id: response_id,
+                    code: HelperFailureCode::RouteConflict,
+                    ..
+                } if response_id == request_id => Err(route_conflict_from_helper()),
                 Frame::Failure {
                     request_id: response_id,
                     code,
@@ -2610,6 +2622,7 @@ mod windows {
     struct AdapterState {
         luid: u64,
         if_index: u32,
+        ipv6_if_index: u32,
         friendly_name: String,
         description: String,
         if_type: u32,
@@ -2668,6 +2681,7 @@ mod windows {
                 output.push(AdapterState {
                     luid: unsafe { adapter.Luid.Value },
                     if_index: unsafe { adapter.Anonymous1.Anonymous.IfIndex },
+                    ipv6_if_index: adapter.Ipv6IfIndex,
                     friendly_name: wide_ptr_string(adapter.FriendlyName).unwrap_or_default(),
                     description: wide_ptr_string(adapter.Description).unwrap_or_default(),
                     if_type: adapter.IfType,
@@ -2763,15 +2777,15 @@ mod windows {
             .any(|marker| signal.contains(marker))
     }
 
-    fn foreign_full_tunnel<'a>(
+    fn foreign_full_tunnels<'a>(
         adapters: &'a [AdapterState],
-        routes: &[RouteState],
-    ) -> Option<&'a AdapterState> {
+        routes: &'a [RouteState],
+    ) -> impl Iterator<Item = &'a AdapterState> {
         let v4_left = [1_u8, 1, 1, 1];
         let v4_right = [200_u8, 1, 1, 1];
         let v6_left = [0x20_u8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let v6_right = [0xa0_u8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-        adapters.iter().find(|adapter| {
+        adapters.iter().filter(move |adapter| {
             if adapter.friendly_name == TUN_INTERFACE_NAME || !looks_like_foreign_tunnel(adapter) {
                 return false;
             }
@@ -2785,14 +2799,82 @@ mod windows {
         })
     }
 
+    fn describe_tun_adapter(adapter: &AdapterState) -> String {
+        let display_label = |value: &str| {
+            let value = value.trim();
+            if value.is_empty()
+                || value.chars().count() > 256
+                || value.chars().any(|character| {
+                    character.is_control()
+                        || matches!(character, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+                })
+            {
+                return None;
+            }
+            Some(value.to_owned())
+        };
+        let alias = display_label(&adapter.friendly_name);
+        let description = display_label(&adapter.description);
+        let index = if adapter.if_index == 0 {
+            adapter.ipv6_if_index
+        } else {
+            adapter.if_index
+        };
+        let index_suffix = if index == 0 {
+            String::new()
+        } else {
+            format!(" (индекс {index})")
+        };
+        match (alias, description) {
+            (Some(alias), Some(description)) if alias != description => {
+                format!("Интерфейс Windows «{alias}»{index_suffix}. Описание: {description}.")
+            }
+            (Some(label), _) | (_, Some(label)) => {
+                format!("Интерфейс Windows «{label}»{index_suffix}.")
+            }
+            (None, None) if index == 0 => "Имя интерфейса Windows недоступно.".into(),
+            (None, None) => format!("Индекс интерфейса Windows: {index}."),
+        }
+    }
+
+    fn foreign_tunnel_error(adapters: &[AdapterState], routes: &[RouteState]) -> Option<RuntimeError> {
+        let adapter = foreign_full_tunnels(adapters, routes).next()?;
+        Some(RuntimeError::new(
+            TUN_ROUTE_CONFLICT_STAGE,
+            describe_tun_adapter(adapter),
+        ))
+    }
+
+    pub(crate) fn foreign_tun_conflicts() -> Option<Vec<String>> {
+        Some(describe_foreign_tun_conflicts(
+            &adapter_states().ok()?,
+            &route_states().ok()?,
+        ))
+    }
+
+    fn describe_foreign_tun_conflicts(adapters: &[AdapterState], routes: &[RouteState]) -> Vec<String> {
+        let redactor = Redactor::default();
+        foreign_full_tunnels(adapters, routes)
+            .take(32)
+            .map(|adapter| redactor.redact(&describe_tun_adapter(adapter)))
+            .collect()
+    }
+
+    fn route_conflict_from_helper() -> RuntimeError {
+        let detail = foreign_tun_conflicts().and_then(|details| details.into_iter().next());
+        RuntimeError::new(
+            TUN_ROUTE_CONFLICT_STAGE,
+            detail.unwrap_or_else(|| {
+                "Откройте диагностику, чтобы снова проверить маршруты Windows.".into()
+            }),
+        )
+    }
+
     pub(crate) fn select_physical_upstream() -> Result<TunUpstreamIdentity, RuntimeError> {
         let adapters = adapter_states()?;
         let routes = route_states()?;
-        if foreign_full_tunnel(&adapters, &routes).is_some() {
-            return Err(RuntimeError::new(
-                "tun_preflight",
-                "another full-tunnel VPN is active; turn it off before starting RouteDeck TUN",
-            ));
+        if let Some(error) = foreign_tunnel_error(&adapters, &routes) {
+            return Err(error);
         }
         let best_luid = best_route_luid_v4([1, 1, 1, 1])?;
         physical_upstream_from(&adapters, best_luid).ok_or_else(|| {
@@ -2900,11 +2982,8 @@ mod windows {
         routes: &[RouteState],
         best_route: impl FnOnce() -> Result<u64, RuntimeError>,
     ) -> Result<String, RuntimeError> {
-        if foreign_full_tunnel(adapters, routes).is_some() {
-            return Err(RuntimeError::new(
-                "tun_preflight",
-                "another full-tunnel VPN is active; turn it off before starting RouteDeck TUN",
-            ));
+        if let Some(error) = foreign_tunnel_error(adapters, routes) {
+            return Err(error);
         }
         if exact_upstream_adapter(adapters, upstream, true).is_none()
             || best_route()? != upstream.interface_luid
@@ -3070,7 +3149,7 @@ mod windows {
             ));
         }
         let routes = route_states()?;
-        if foreign_full_tunnel(&adapters, &routes).is_some() {
+        if foreign_full_tunnels(&adapters, &routes).next().is_some() {
             return Err(RuntimeError::new(
                 "tun_capture",
                 "another full-tunnel VPN became active during the RouteDeck TUN session",
@@ -3850,7 +3929,9 @@ mod windows {
 
     fn safe_helper_detail(stage: &str) -> &'static str {
         match stage {
-            "tun_preflight" => "TUN could not start because the adapter state is not ready",
+            TUN_ROUTE_CONFLICT_STAGE | "tun_preflight" => {
+                "TUN could not start because the adapter state is not ready"
+            }
             "tun_capture" => {
                 "TUN started but did not obtain every enabled address-family capture route"
             }
@@ -3866,6 +3947,7 @@ mod windows {
 
     fn helper_failure_code(stage: &str) -> HelperFailureCode {
         match stage {
+            TUN_ROUTE_CONFLICT_STAGE => HelperFailureCode::RouteConflict,
             "tun_preflight" => HelperFailureCode::PreflightConflict,
             "tun_capture" | "tun_upstream" => HelperFailureCode::CaptureInvalid,
             _ => HelperFailureCode::StartFailed,
@@ -5147,6 +5229,7 @@ mod windows {
             AdapterState {
                 luid,
                 if_index: luid as u32,
+                ipv6_if_index: 0,
                 friendly_name: name.into(),
                 description: name.into(),
                 if_type,
@@ -5266,9 +5349,14 @@ mod windows {
                     let result = validate_start_preflight(&request, initial, |upstream| {
                         preflight_route_context_from(upstream, &adapters, &routes, || best.clone())
                     });
+                    let expected = if change == "foreign-tunnel" {
+                        TUN_ROUTE_CONFLICT_STAGE
+                    } else {
+                        "tun_preflight"
+                    };
                     assert_eq!(
                         result.unwrap_err().stage(),
-                        "tun_preflight",
+                        expected,
                         "{change}, initial={initial}"
                     );
                 }
@@ -5305,15 +5393,16 @@ mod windows {
             let xray = adapter(2, "xray_tun", 53, 0);
             let routes = [default_route(1, AF_INET, 25), default_route(2, AF_INET, 0)];
             let adapters = [physical.clone(), xray];
-            assert_eq!(foreign_full_tunnel(&adapters, &routes).unwrap().luid, 2);
-            assert!(foreign_full_tunnel(&[physical], &routes[..1]).is_none());
+            assert_eq!(foreign_full_tunnels(&adapters, &routes).next().unwrap().luid, 2);
+            assert!(foreign_full_tunnels(&[physical], &routes[..1]).next().is_none());
 
             let mut lower_half = default_route(2, AF_INET, 0);
             lower_half.prefix_len = 1;
             let mut upper_half = lower_half;
             upper_half.prefix[0] = 128;
             assert_eq!(
-                foreign_full_tunnel(&adapters, &[lower_half, upper_half])
+                foreign_full_tunnels(&adapters, &[lower_half, upper_half])
+                    .next()
                     .unwrap()
                     .luid,
                 2
@@ -5322,14 +5411,64 @@ mod windows {
             let mut host_only = default_route(2, AF_INET, 0);
             host_only.prefix = [172, 30, 205, 53, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
             host_only.prefix_len = 32;
-            assert!(foreign_full_tunnel(&adapters, &[host_only]).is_none());
+            assert!(foreign_full_tunnels(&adapters, &[host_only]).next().is_none());
 
             let tap = adapter(3, "TAP-Windows Adapter", IF_TYPE_ETHERNET_CSMACD, 6);
             assert_eq!(
-                foreign_full_tunnel(&[tap], &[default_route(3, AF_INET, 25)])
+                foreign_full_tunnels(&[tap], &[default_route(3, AF_INET, 25)])
+                    .next()
                     .unwrap()
                     .luid,
                 3
+            );
+        }
+
+        #[test]
+        fn foreign_tunnel_error_identifies_adapter_and_omits_unsafe_display_labels() {
+            let mut adapter = adapter(2, "Fixture VPN", IF_TYPE_TUNNEL, 0);
+            adapter.description = "WireGuard Tunnel".into();
+            let routes = [default_route(2, AF_INET6, 0)];
+            let error = foreign_tunnel_error(std::slice::from_ref(&adapter), &routes).unwrap();
+            assert_eq!(error.stage(), TUN_ROUTE_CONFLICT_STAGE);
+            assert_eq!(
+                error.message(),
+                "Интерфейс Windows «Fixture VPN» (индекс 2). Описание: WireGuard Tunnel."
+            );
+            assert_eq!(
+                helper_failure_code(error.stage()),
+                HelperFailureCode::RouteConflict
+            );
+            assert!(!safe_helper_detail(error.stage()).contains("Fixture VPN"));
+
+            adapter.friendly_name = "Fixture VPN\nmisleading second line".into();
+            adapter.description = "WireGuard\u{202e}Tunnel".into();
+            adapter.if_index = 0;
+            adapter.ipv6_if_index = 8;
+            let error = foreign_tunnel_error(&[adapter], &routes).unwrap();
+            assert_eq!(error.message(), "Индекс интерфейса Windows: 8.");
+        }
+
+        #[test]
+        fn tun_diagnostics_lists_only_foreign_interfaces_with_matching_routes() {
+            let adapters = [
+                adapter(1, "Ethernet", IF_TYPE_ETHERNET_CSMACD, 6),
+                adapter(2, TUN_INTERFACE_NAME, IF_TYPE_TUNNEL, 0),
+                adapter(3, "Fixture IPv4 VPN", IF_TYPE_TUNNEL, 0),
+                adapter(4, "Fixture IPv6 VPN", IF_TYPE_TUNNEL, 0),
+                adapter(5, "Fixture unused VPN", IF_TYPE_TUNNEL, 0),
+            ];
+            let routes = [
+                default_route(1, AF_INET, 20),
+                default_route(2, AF_INET, 0),
+                default_route(3, AF_INET, 5),
+                default_route(4, AF_INET6, 5),
+            ];
+            assert_eq!(
+                describe_foreign_tun_conflicts(&adapters, &routes),
+                [
+                    "Интерфейс Windows «Fixture IPv4 VPN» (индекс 3).",
+                    "Интерфейс Windows «Fixture IPv6 VPN» (индекс 4).",
+                ]
             );
         }
 
@@ -5777,7 +5916,12 @@ mod windows {
 }
 
 #[cfg(windows)]
-pub(crate) use windows::TunHelperLauncher;
+pub(crate) use windows::{foreign_tun_conflicts, TunHelperLauncher};
+
+#[cfg(not(windows))]
+pub(crate) fn foreign_tun_conflicts() -> Option<Vec<String>> {
+    None
+}
 
 #[cfg(windows)]
 pub(crate) fn select_physical_upstream(

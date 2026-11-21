@@ -14,6 +14,7 @@ const fixture = {
   failUpdateDownload: true, failUpdateInstall: false, portableUpdate: { phase: "downloading", downloaded: 50, total: 100, version: "0.2.0", error: null },
   updateResponse: { currentVersion: "0.1.0", latestVersion: "0.1.0", status: "upToDate", releaseUrl: null },
   systemProxy: { state: "stale", endpoint: "127.0.0.1:24080", detail: "Локальный порт не отвечает.", cleanupToken: "e".repeat(64) },
+  tunConflicts: [],
   nodes: Array.from({ length: 130 }, (_, index) => ({
     id: `${group}-${index}`, displayName: `Европа ${String(index + 1).padStart(3, "0")}`,
     protocol: "vless", insecureTls: false, sourceId: group,
@@ -47,7 +48,7 @@ const transport = {
   listen: async (_name, callback) => { listener = callback; return () => { listener = undefined; }; },
   invoke: async (command, args) => {
     // Never include supplied URLs/share contents in even this synthetic log.
-    fixture.calls.push({ command, nodeId: args?.nodeId, sourceId: args?.sourceId, ...(command.startsWith("start_") ? { routing: structuredClone(args?.routing) } : {}) });
+    fixture.calls.push({ command, nodeId: args?.nodeId, sourceId: args?.sourceId, ...(command.startsWith("start_") ? { routing: structuredClone(args?.routing) } : {}), ...(command === "open_network_settings" ? { page: args?.page } : {}) });
     if (command === "runtime_status") return current ?? (current = status());
     if (command === "retry_session_recovery") {
       if (fixture.failRecovery) throw { code: "runtime_failure", stage: "session_recovery", message: "fixture recovery failed" };
@@ -66,16 +67,25 @@ const transport = {
     if (command === "portable_update_status") return structuredClone(fixture.portableUpdate);
     if (command === "install_app_update") { if (fixture.failUpdateInstall) throw "portable_update_failed"; if (fixture.snapshot().phase !== "disconnected" || fixture.snapshot().connectionRequested) throw "portable_update_disconnect_first"; return null; }
     if (command === "confirmed_nodes") return structuredClone(fixture.nodes);
-    if (command === "runtime_diagnostics") return { status: current, lines: ["Fixture diagnostics"], systemProxy: structuredClone(fixture.systemProxy) };
+    if (command === "runtime_diagnostics") return { status: current, lines: ["Fixture diagnostics"], systemProxy: structuredClone(fixture.systemProxy), tunConflicts: fixture.tunConflicts };
+    if (command === "open_network_settings") {
+      if (fixture.failOpenNetworkSettings) throw { code: "command_failed", stage: "command", message: "Fixture launcher failed" };
+      return null;
+    }
     if (command === "clear_stale_system_proxy") {
       if (fixture.proxyCleanupDelay) await sleep(fixture.proxyCleanupDelay);
       if (args?.token !== fixture.systemProxy.cleanupToken) throw { code: "runtime_failure", stage: "system_proxy_restore", message: "stale observation" };
       if (fixture.failProxyCleanup) throw { code: "runtime_failure", stage: "system_proxy_restore", message: "fixture cleanup failed" };
       fixture.systemProxy = { state: "disabled", endpoint: null, detail: "Прокси Windows отключён.", cleanupToken: null };
-      return { status: current, lines: ["Fixture diagnostics"], systemProxy: structuredClone(fixture.systemProxy) };
+      return { status: current, lines: ["Fixture diagnostics"], systemProxy: structuredClone(fixture.systemProxy), tunConflicts: fixture.tunConflicts };
     }
     if (command.startsWith("start_")) {
       const mode = command === "start_tun" ? "tun" : "system_proxy";
+      if (mode === "tun" && fixture.tunConflicts.length) {
+        const error = { code: "tun_route_conflict", stage: "start", message: "TUN route conflict", detail: fixture.tunConflicts[0] };
+        emit({ ...status("disconnected"), phase: "disconnected_with_error", mode, scope: mode, connectionRequested: true, reconnectPaused: true, error });
+        throw error;
+      }
       emit(status("starting_core", mode, args.nodeId));
       await sleep(fixture.startDelay);
       return emit(status(mode === "tun" ? "tun_ready" : "system_proxy_ready", mode, args.nodeId));

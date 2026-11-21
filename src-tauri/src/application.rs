@@ -45,7 +45,10 @@ use crate::{
     system_proxy::{
         SystemProxyControl, SystemProxyDiagnostics, SystemProxyManager, SystemProxyRestoreOutcome,
     },
-    tun_helper::{reconcile_stale_tun_sessions, select_physical_upstream, TunUpstreamIdentity},
+    tun_helper::{
+        foreign_tun_conflicts, reconcile_stale_tun_sessions, select_physical_upstream,
+        TunUpstreamIdentity, TUN_ROUTE_CONFLICT_STAGE,
+    },
     xray_config::{generate_xray_bridge_config, XrayBridgeRequest},
 };
 
@@ -191,6 +194,7 @@ pub enum PublicErrorCode {
     ActiveSessionConflict,
     SessionChanged,
     NodeNotFound,
+    TunRouteConflict,
     RuntimeFailure,
     CommandFailed,
 }
@@ -280,6 +284,7 @@ pub struct Diagnostics {
     pub status: RuntimeStatus,
     pub lines: Vec<String>,
     pub system_proxy: SystemProxyDiagnostics,
+    pub tun_conflicts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -395,6 +400,10 @@ impl TunPrivilegeControl for PlatformTunPrivilege {
 pub(crate) trait EngineProvider: Send + Sync {
     fn create(&self, kind: EngineKind) -> Result<Box<dyn EngineLauncher>, RuntimeError>;
 
+    fn tun_conflicts(&self) -> Option<Vec<String>> {
+        None
+    }
+
     fn select_tun_upstream(&self) -> Result<TunUpstreamIdentity, RuntimeError> {
         #[cfg(test)]
         {
@@ -429,6 +438,10 @@ struct FixedEngineProvider {
 impl EngineProvider for FixedEngineProvider {
     fn create(&self, kind: EngineKind) -> Result<Box<dyn EngineLauncher>, RuntimeError> {
         Ok(Box::new(VerifiedEngineLauncher::resolve_for(kind)?))
+    }
+
+    fn tun_conflicts(&self) -> Option<Vec<String>> {
+        foreign_tun_conflicts()
     }
 
     fn select_tun_upstream(&self) -> Result<TunUpstreamIdentity, RuntimeError> {
@@ -2389,7 +2402,13 @@ impl ApplicationController {
     }
 
     fn record_runtime_failure(&self, error: &RuntimeError, redactor: &Redactor) {
-        let line = format!("{}: {}", error.stage(), error.message());
+        // Windows interface labels can contain user-chosen text. Keep them out of exported logs.
+        let message = if error.stage() == TUN_ROUTE_CONFLICT_STAGE {
+            "Windows routes conflict with RouteDeck TUN"
+        } else {
+            error.message()
+        };
+        let line = format!("{}: {}", error.stage(), message);
         let safe = redactor.redact(&line);
         self.diagnostics
             .lock()
@@ -3066,6 +3085,7 @@ impl ApplicationController {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .snapshot(),
             system_proxy: self.services.system_proxy.diagnostics(),
+            tun_conflicts: self.services.engine.tun_conflicts(),
         }
     }
 
@@ -3285,7 +3305,8 @@ impl ApplicationController {
             if let Err(error) = restart.as_ref() {
                 let must_pause = matches!(
                     error.stage(),
-                    "tun_preflight"
+                    TUN_ROUTE_CONFLICT_STAGE
+                        | "tun_preflight"
                         | "config_check"
                         | "engine_integrity"
                         | "tun_helper_protocol"
@@ -4070,6 +4091,14 @@ fn prove_tun_capture(
 
 fn public_runtime_error(error: RuntimeError, redactor: &Redactor) -> PublicError {
     let stage = public_stage(error.stage());
+    if error.stage() == TUN_ROUTE_CONFLICT_STAGE {
+        return PublicError {
+            code: PublicErrorCode::TunRouteConflict,
+            stage,
+            message: "Windows routes conflict with RouteDeck TUN".into(),
+            detail: Some(redactor.redact(error.message())),
+        };
+    }
     let detail = (is_safe_helper_start_stage(error.stage())
         || matches!(
             stage,
@@ -4111,7 +4140,7 @@ fn public_stage(stage: &str) -> PublicErrorStage {
     match stage {
         stage if is_safe_helper_start_stage(stage) => PublicErrorStage::StartEngine,
         "session_recovery" => PublicErrorStage::SessionRecovery,
-        "tun_uac_cancelled" | "tun_preflight" => PublicErrorStage::Start,
+        TUN_ROUTE_CONFLICT_STAGE | "tun_uac_cancelled" | "tun_preflight" => PublicErrorStage::Start,
         "generate_config" => PublicErrorStage::GenerateConfig,
         "engine_layout" => PublicErrorStage::EngineLayout,
         "engine_integrity" => PublicErrorStage::EngineIntegrity,
@@ -8607,6 +8636,28 @@ mod tests {
         assert_eq!(
             public.detail.as_deref(),
             Some("TUN permission request was cancelled")
+        );
+    }
+
+    #[test]
+    fn tun_route_conflict_keeps_redacted_adapter_detail_local() {
+        let (controller, _, _) = controller_with_tun(true, true, false);
+        let redactor = Redactor::default().with_secret("fixture-secret");
+        let error = RuntimeError::new(
+            TUN_ROUTE_CONFLICT_STAGE,
+            "Fixture VPN fixture-secret (index 4)",
+        );
+        controller.record_runtime_failure(&error, &redactor);
+        let public = public_runtime_error(error, &redactor);
+        assert_eq!(public.code, PublicErrorCode::TunRouteConflict);
+        assert_eq!(public.stage, PublicErrorStage::Start);
+        assert_eq!(
+            public.detail.as_deref(),
+            Some("Fixture VPN [REDACTED] (index 4)")
+        );
+        assert_eq!(
+            controller.diagnostics().lines,
+            ["tun_route_conflict: Windows routes conflict with RouteDeck TUN"]
         );
     }
 

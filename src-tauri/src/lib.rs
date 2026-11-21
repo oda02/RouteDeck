@@ -76,6 +76,7 @@ pub fn run(
             commands::retry_session_recovery,
             commands::runtime_diagnostics,
             commands::clear_stale_system_proxy,
+            commands::open_network_settings,
             commands::list_running_applications,
             commands::get_app_version,
             commands::check_app_update,

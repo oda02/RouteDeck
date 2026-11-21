@@ -51,6 +51,7 @@ class BackendUnavailableController implements RouteDeckController {
       steps: baseProofs().map((proof) => ({ ...proof, state: "skipped", summary: "Backend недоступен" })),
       sanitizedLog: ["Tauri adapter is not bound; production actions are disabled."],
       systemProxy: { state: "unavailable", endpoint: null, detail: "Диагностика недоступна.", cleanupToken: null },
+      tunConflicts: null,
     },
   };
   private readonly listeners = new Set<() => void>();
@@ -82,6 +83,7 @@ class BackendUnavailableController implements RouteDeckController {
   saveSettings = async () => this.unavailable();
   runDiagnostics = async () => this.unavailable();
   clearStaleSystemProxy = async () => this.unavailable();
+  openNetworkSettings = async () => this.unavailable();
   resetLocalState = async () => this.unavailable();
   getSanitizedReport = () => "RouteDeck production report\nbackend=unavailable\nstatus=fail-closed";
 }

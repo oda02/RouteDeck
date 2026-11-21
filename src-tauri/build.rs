@@ -22,6 +22,7 @@ fn main() {
         "retry_session_recovery",
         "runtime_diagnostics",
         "clear_stale_system_proxy",
+        "open_network_settings",
         "list_running_applications",
         "get_app_version",
         "check_app_update",

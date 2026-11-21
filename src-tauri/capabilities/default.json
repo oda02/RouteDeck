@@ -26,6 +26,7 @@
     "allow-retry-session-recovery",
     "allow-runtime-diagnostics",
     "allow-clear-stale-system-proxy",
+    "allow-open-network-settings",
     "allow-list-running-applications",
     "allow-get-app-version",
     "allow-check-app-update",

@@ -1361,6 +1361,48 @@ test("runtime detail is available only as expandable detail while the main error
   controller.dispose();
 });
 
+test("a TUN route conflict explains the block and exposes the Windows interface in details", async () => {
+  const { controller, calls, hooks } = await lifecycleFixture(false);
+  const detail = "Интерфейс Windows «Fixture VPN» (индекс 4).";
+  await controller.setMode("tun");
+  hooks.start = async () => {
+    throw {
+      code: "tun_route_conflict",
+      stage: "start",
+      message: "Windows routes conflict with RouteDeck TUN",
+      detail,
+    };
+  };
+  await assert.rejects(controller.connect(), (error: unknown) => {
+    assert.ok(error instanceof RouteDeckError);
+    assert.equal(error.code, "tun-route-conflict");
+    const publicError = toPublicActionError(error);
+    assert.match(publicError.message, /Маршруты через VPN-адаптер в Windows мешают запуску TUN/);
+    assert.doesNotMatch(publicError.message, /Fixture VPN/);
+    assert.equal(publicError.redactedDetail, detail);
+    return true;
+  });
+  assert.ok(calls.some(({ command }) => command === "start_tun"));
+  assert.doesNotMatch(controller.getSanitizedReport(), /Fixture VPN/);
+  controller.dispose();
+});
+
+test("diagnostics accepts bounded TUN adapter labels and refuses a live proxy cleanup token", () => {
+  const diagnostics = {
+    status: runtimeStatus(1, "disconnected"),
+    lines: [],
+    systemProxy: { state: "foreignActive", endpoint: "127.0.0.1:24081", detail: "Fixture listener", cleanupToken: null },
+    tunConflicts: ["Интерфейс Windows «Fixture VPN» (индекс 4)."],
+  };
+  assert.deepEqual(parseDiagnostics(diagnostics).tunConflicts, diagnostics.tunConflicts);
+  assert.throws(() => parseDiagnostics({ ...diagnostics, tunConflicts: ["label\nspoof"] }), ContractViolation);
+  assert.throws(() => parseDiagnostics({ ...diagnostics, tunConflicts: Array(33).fill("VPN") }), ContractViolation);
+  assert.throws(() => parseDiagnostics({
+    ...diagnostics,
+    systemProxy: { ...diagnostics.systemProxy, cleanupToken: "a".repeat(64) },
+  }), ContractViolation);
+});
+
 test("malformed diagnostics always clears the running flag and fails closed", async () => {
   const transport: TauriTransport = {
     listen: async () => () => undefined,
